@@ -1,0 +1,16 @@
+[package]
+name = "legatofs"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+legato-client-core = { path = "../legato-client-core" }
+legato-fs-macos = { path = "../legato-fs-macos" }
+legato-fs-windows = { path = "../legato-fs-windows" }
+
+[lints]
+workspace = true
+
