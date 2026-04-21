@@ -1,7 +1,7 @@
 //! Shared runtime state for native Legato clients.
 
 use legato_client_cache::CacheConfig;
-use legato_proto::{AttachRequest, PROTOCOL_VERSION};
+use legato_proto::{AttachRequest, PROTOCOL_VERSION, default_capabilities};
 
 /// Immutable settings used to bootstrap a client runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +40,7 @@ impl ClientRuntime {
         AttachRequest {
             protocol_version: PROTOCOL_VERSION,
             client_name: client_name.to_owned(),
+            desired_capabilities: default_capabilities(),
         }
     }
 

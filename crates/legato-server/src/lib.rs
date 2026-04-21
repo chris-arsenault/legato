@@ -1,6 +1,6 @@
 //! Server-side bootstrap types for the Legato daemon.
 
-use legato_proto::{AttachResponse, PROTOCOL_VERSION};
+use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 
 /// Immutable bootstrap configuration for the server daemon.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +36,8 @@ impl Server {
         let _ = &self.config;
         AttachResponse {
             protocol_version: PROTOCOL_VERSION,
+            negotiated_capabilities: default_capabilities(),
+            server_name: String::from("legato-server"),
         }
     }
 }

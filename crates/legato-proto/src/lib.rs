@@ -1,48 +1,60 @@
 //! Shared protocol-facing types and compatibility helpers.
 
-use legato_types::PrefetchRequest;
-
 /// Initial wire compatibility version for the Legato RPC surface.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Minimal client/server attach information used during early bootstrap.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttachRequest {
-    /// Version of the protocol the caller expects to speak.
-    pub protocol_version: u32,
-    /// Human-readable component name for diagnostics.
-    pub client_name: String,
+/// Canonical protobuf namespace for the current major protocol version.
+pub const PROTOCOL_NAMESPACE: &str = "legato.v1";
+
+/// Generated protobuf types and gRPC stubs for the `legato.v1` namespace.
+pub mod legato {
+    /// Generated items for version 1 of the Legato protocol.
+    #[allow(missing_docs)]
+    pub mod v1 {
+        tonic::include_proto!("legato.v1");
+    }
 }
 
-/// Server response describing negotiated compatibility.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttachResponse {
-    /// Protocol version the server accepted for the connection.
-    pub protocol_version: u32,
-}
+pub use legato::v1::*;
 
-/// Local control command forwarded from the planner to the mounted client.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutePrefetch {
-    /// Planner-derived request to make local cache entries resident.
-    pub request: PrefetchRequest,
+/// Returns the default client capability set expected during bootstrap.
+#[must_use]
+pub fn default_capabilities() -> Vec<i32> {
+    vec![
+        Capability::Metadata as i32,
+        Capability::BlockStreaming as i32,
+        Capability::Prefetch as i32,
+        Capability::Invalidations as i32,
+    ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachRequest, AttachResponse, PROTOCOL_VERSION};
+    use super::{
+        AttachRequest, AttachResponse, Capability, PROTOCOL_NAMESPACE, PROTOCOL_VERSION,
+        default_capabilities,
+    };
 
     #[test]
     fn attach_round_trip_uses_workspace_protocol_version() {
         let request = AttachRequest {
             protocol_version: PROTOCOL_VERSION,
             client_name: String::from("legatofs"),
+            desired_capabilities: default_capabilities(),
         };
         let response = AttachResponse {
             protocol_version: request.protocol_version,
+            negotiated_capabilities: request.desired_capabilities.clone(),
+            server_name: String::from("legato-server"),
         };
 
         assert_eq!(response.protocol_version, PROTOCOL_VERSION);
         assert_eq!(request.client_name, "legatofs");
+        assert_eq!(PROTOCOL_NAMESPACE, "legato.v1");
+        assert!(
+            response
+                .negotiated_capabilities
+                .contains(&(Capability::Prefetch as i32))
+        );
     }
 }
