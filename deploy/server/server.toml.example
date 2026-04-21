@@ -1,0 +1,13 @@
+[common.tracing]
+json = true
+level = "info"
+
+[common.metrics]
+bind_address = "0.0.0.0:9464"
+prefix = "legato_server"
+
+[server]
+bind_address = "0.0.0.0:7823"
+library_root = "/srv/libraries"
+state_dir = "/var/lib/legato"
+tls_dir = "/etc/legato/certs"
