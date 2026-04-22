@@ -1,5 +1,7 @@
 # Legatofs Client Packaging And Installation
 
+This is a focused client-packaging note. For the top-level project index, start at [README.md](../../README.md) or [docs/INDEX.md](../../docs/INDEX.md).
+
 This document defines the installation and upgrade shape for the native Legato client on macOS and Windows.
 
 ## Common Layout

@@ -1,5 +1,7 @@
 # Legato Operations Runbook
 
+This is a focused operations document. For the top-level project index, start at [README.md](../README.md) or [docs/INDEX.md](../docs/INDEX.md).
+
 This document is the MVP deployment and recovery guide for running Legato as a Dockerized server on the TrueNAS side, with native clients mounting the library on macOS or Windows.
 
 ## Topology

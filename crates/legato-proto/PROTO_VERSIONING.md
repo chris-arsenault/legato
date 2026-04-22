@@ -1,5 +1,7 @@
 # Protocol Versioning
 
+This is a focused wire-compatibility note. For the top-level project index, start at [README.md](../../README.md) or [docs/INDEX.md](../../docs/INDEX.md).
+
 Legato uses protobuf package versioning for wire compatibility.
 
 Current namespace:
