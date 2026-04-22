@@ -17,8 +17,12 @@ This directory is the short-form map of the repository documentation.
   Common build, test, lint, and benchmark commands plus a brief workflow summary.
 - [architecture/SYSTEM_SHAPE.md](architecture/SYSTEM_SHAPE.md)
   Final system shape, technology choices, deployment model, and deliberate non-goals.
+- [architecture/TARGET_V1_ARCHITECTURE.md](architecture/TARGET_V1_ARCHITECTURE.md)
+  Reset architecture for the intended v1 end-state after moving beyond the provisional fixed-block cache model.
 - [design/PROTOCOL_AND_BEHAVIOR.md](design/PROTOCOL_AND_BEHAVIOR.md)
   Final behavioral contract for protocol, caching, prefetch, and failure handling.
+- [design/V1_RESET_WORKPLAN.md](design/V1_RESET_WORKPLAN.md)
+  Release-oriented implementation tracks for the architecture reset.
 
 ## Focused Reference Docs
 
