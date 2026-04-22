@@ -1,11 +1,15 @@
 //! Transfer-layout policy for semantic file classification.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use legato_proto::{ExtentDescriptor, FileLayout, TransferClass};
 use serde::Deserialize;
 
-const DEFAULT_POLICY_FILE: &str = ".legato-layout.toml";
+/// Reserved file name for per-library layout policy overrides.
+pub const DEFAULT_POLICY_FILE: &str = ".legato-layout.toml";
 
 /// Server-side transfer-layout policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +69,7 @@ enum TransferClassToml {
 impl LayoutPolicy {
     /// Loads a layout policy from the library root if present, otherwise returns defaults.
     pub fn load(library_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let policy_path = library_root.join(DEFAULT_POLICY_FILE);
+        let policy_path = policy_path(library_root);
         if !policy_path.exists() {
             return Ok(Self::default());
         }
@@ -129,9 +133,23 @@ impl LayoutPolicy {
     #[must_use]
     pub fn file_layout(&self, path: &str, size: u64, is_dir: bool) -> FileLayout {
         let decision = self.classify(path, size, is_dir);
-        let extent_length = match decision.transfer_class {
+        decision.file_layout(size, is_dir)
+    }
+
+    /// Returns the stored layout decision for a file path.
+    #[must_use]
+    pub fn file_decision(&self, path: &str, size: u64, is_dir: bool) -> LayoutDecision {
+        self.classify(path, size, is_dir)
+    }
+}
+
+impl LayoutDecision {
+    /// Builds one file layout from a stored decision.
+    #[must_use]
+    pub fn file_layout(&self, size: u64, is_dir: bool) -> FileLayout {
+        let extent_length = match self.transfer_class {
             TransferClass::Unitary => size.max(1),
-            _ => decision.extent_bytes.max(1),
+            _ => self.extent_bytes.max(1),
         };
         let extent_count = if size == 0 {
             1
@@ -155,11 +173,27 @@ impl LayoutPolicy {
         }
 
         FileLayout {
-            transfer_class: decision.transfer_class as i32,
+            transfer_class: if is_dir {
+                TransferClass::Unitary as i32
+            } else {
+                self.transfer_class as i32
+            },
             extents,
         }
     }
 
+    /// Returns the preferred extent size for storage and transfer metadata.
+    #[must_use]
+    pub fn stored_extent_bytes(&self, size: u64, is_dir: bool) -> u64 {
+        if is_dir || self.transfer_class == TransferClass::Unitary {
+            size.max(1)
+        } else {
+            self.extent_bytes.max(1)
+        }
+    }
+}
+
+impl LayoutPolicy {
     fn default_extent_bytes(&self, transfer_class: TransferClass, size: u64) -> u64 {
         match transfer_class {
             TransferClass::Unitary => size.max(1),
@@ -208,6 +242,18 @@ fn infer_transfer_class(path: &str, size: u64, unitary_max_bytes: u64) -> Transf
 
 fn has_suffix(path: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| path.ends_with(suffix))
+}
+
+/// Returns the reserved policy file path for one library root.
+#[must_use]
+pub fn policy_path(library_root: &Path) -> PathBuf {
+    library_root.join(DEFAULT_POLICY_FILE)
+}
+
+/// Returns whether a path refers to the reserved policy file.
+#[must_use]
+pub fn is_policy_path(library_root: &Path, path: &Path) -> bool {
+    path == policy_path(library_root)
 }
 
 fn glob_matches(pattern: &str, path: &str) -> bool {

@@ -10,7 +10,7 @@ use std::{
 use legato_proto::{
     BlockResponse, CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, InvalidationEvent,
     ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, ReadBlocksRequest,
-    ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse,
+    ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse, TransferClass,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -25,6 +25,17 @@ pub struct MetadataService {
     connection: Connection,
     next_handle: u64,
     open_handles: HashMap<u64, OpenHandle>,
+}
+
+/// Catalog-backed metadata for one resolved path.
+#[derive(Clone, Debug)]
+pub struct CatalogEntry {
+    /// Base metadata exposed to legacy metadata callers.
+    pub metadata: FileMetadata,
+    /// Persisted layout classification for file content.
+    pub transfer_class: Option<TransferClass>,
+    /// Persisted preferred extent size for file content.
+    pub extent_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -59,11 +70,16 @@ impl MetadataService {
         &self,
         request: ResolvePathRequest,
     ) -> rusqlite::Result<Option<ResolvePathResponse>> {
-        lookup_metadata(&self.connection, &request.path).map(|metadata| {
-            metadata.map(|metadata| ResolvePathResponse {
-                metadata: Some(metadata),
+        lookup_catalog_entry(&self.connection, &request.path).map(|entry| {
+            entry.map(|entry| ResolvePathResponse {
+                metadata: Some(entry.metadata),
             })
         })
+    }
+
+    /// Resolves a path to catalog-backed metadata and persisted layout values.
+    pub fn resolve_catalog_path(&self, path: &str) -> rusqlite::Result<Option<CatalogEntry>> {
+        lookup_catalog_entry(&self.connection, path)
     }
 
     /// Lists the direct children of a directory path.
@@ -135,19 +151,19 @@ impl MetadataService {
         self.open_handles.insert(
             file_handle,
             OpenHandle {
-                file_id: metadata.file_id,
-                path: metadata.path.clone(),
-                block_size: metadata.block_size,
+                file_id: metadata.metadata.file_id,
+                path: metadata.metadata.path.clone(),
+                block_size: metadata.metadata.block_size,
             },
         );
 
         Ok(Some(OpenResponse {
             file_handle,
-            file_id: metadata.file_id,
-            size: metadata.size,
-            mtime_ns: metadata.mtime_ns,
-            content_hash: metadata.content_hash,
-            block_size: metadata.block_size,
+            file_id: metadata.metadata.file_id,
+            size: metadata.metadata.size,
+            mtime_ns: metadata.metadata.mtime_ns,
+            content_hash: metadata.metadata.content_hash,
+            block_size: metadata.metadata.block_size,
         }))
     }
 
@@ -239,17 +255,16 @@ impl MetadataService {
 }
 
 fn lookup_metadata(connection: &Connection, path: &str) -> rusqlite::Result<Option<FileMetadata>> {
-    if let Some(metadata) = lookup_directory_metadata(connection, path)? {
-        return Ok(Some(metadata));
+    if let Some(entry) = lookup_catalog_entry(connection, path)? {
+        return Ok(Some(entry.metadata));
     }
-
-    lookup_file_only_metadata(connection, path)
+    Ok(None)
 }
 
 fn lookup_directory_metadata(
     connection: &Connection,
     path: &str,
-) -> rusqlite::Result<Option<FileMetadata>> {
+) -> rusqlite::Result<Option<CatalogEntry>> {
     connection
         .query_row(
             "SELECT directory_id, path, mtime_ns FROM directories WHERE path = ?1",
@@ -258,27 +273,42 @@ fn lookup_directory_metadata(
                 let directory_id: i64 = row.get(0)?;
                 let path: String = row.get(1)?;
                 let mtime_ns: i64 = row.get(2)?;
-                Ok(FileMetadata {
-                    file_id: directory_id as u64,
-                    path,
-                    size: 0,
-                    mtime_ns: mtime_ns as u64,
-                    content_hash: Vec::new(),
-                    is_dir: true,
-                    block_size: 0,
+                Ok(CatalogEntry {
+                    metadata: FileMetadata {
+                        file_id: directory_id as u64,
+                        path,
+                        size: 0,
+                        mtime_ns: mtime_ns as u64,
+                        content_hash: Vec::new(),
+                        is_dir: true,
+                        block_size: 0,
+                    },
+                    transfer_class: None,
+                    extent_bytes: None,
                 })
             },
         )
         .optional()
 }
 
+fn lookup_catalog_entry(
+    connection: &Connection,
+    path: &str,
+) -> rusqlite::Result<Option<CatalogEntry>> {
+    if let Some(metadata) = lookup_directory_metadata(connection, path)? {
+        return Ok(Some(metadata));
+    }
+    lookup_file_only_metadata(connection, path)
+}
+
 fn lookup_file_only_metadata(
     connection: &Connection,
     path: &str,
-) -> rusqlite::Result<Option<FileMetadata>> {
+) -> rusqlite::Result<Option<CatalogEntry>> {
     connection
         .query_row(
-            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''), block_size
+            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''), block_size,
+                    transfer_class, extent_bytes
              FROM files
              WHERE path = ?1",
             [path],
@@ -289,14 +319,20 @@ fn lookup_file_only_metadata(
                 let mtime_ns: i64 = row.get(3)?;
                 let content_hash: Vec<u8> = row.get(4)?;
                 let block_size: i64 = row.get(5)?;
-                Ok(FileMetadata {
-                    file_id: file_id as u64,
-                    path,
-                    size: size as u64,
-                    mtime_ns: mtime_ns as u64,
-                    content_hash,
-                    is_dir: false,
-                    block_size: block_size as u32,
+                let transfer_class: i64 = row.get(6)?;
+                let extent_bytes: i64 = row.get(7)?;
+                Ok(CatalogEntry {
+                    metadata: FileMetadata {
+                        file_id: file_id as u64,
+                        path,
+                        size: size as u64,
+                        mtime_ns: mtime_ns as u64,
+                        content_hash,
+                        is_dir: false,
+                        block_size: block_size as u32,
+                    },
+                    transfer_class: TransferClass::try_from(transfer_class as i32).ok(),
+                    extent_bytes: Some(extent_bytes as u64),
                 })
             },
         )
@@ -335,7 +371,7 @@ mod tests {
 
     use legato_proto::{
         CloseRequest, ListDirRequest, OpenRequest, ReadBlocksRequest, ResolvePathRequest,
-        StatRequest,
+        StatRequest, TransferClass,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -361,6 +397,20 @@ mod tests {
 
         assert_eq!(stat.metadata.expect("metadata").path, sample_path);
         assert!(resolved.metadata.expect("metadata").is_dir);
+    }
+
+    #[test]
+    fn resolve_catalog_path_returns_persisted_layout_metadata() {
+        let (_library_dir, _db_dir, _library_root, service, sample_path) = build_service_fixture();
+
+        let entry = service
+            .resolve_catalog_path(&sample_path)
+            .expect("resolve should succeed")
+            .expect("sample file should exist");
+
+        assert_eq!(entry.metadata.path, sample_path);
+        assert_eq!(entry.transfer_class, Some(TransferClass::Unitary));
+        assert_eq!(entry.extent_bytes, Some(10));
     }
 
     #[test]

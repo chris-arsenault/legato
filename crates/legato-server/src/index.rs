@@ -2,13 +2,16 @@
 
 use std::{
     collections::HashSet,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
+use legato_proto::TransferClass;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use walkdir::WalkDir;
+
+use crate::{LayoutPolicy, is_policy_path};
 
 /// Summary of changes observed during a reconciliation run.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -41,20 +44,35 @@ pub fn reconcile_paths(
     library_root: &Path,
     paths: &[PathBuf],
 ) -> rusqlite::Result<ReconcileStats> {
+    let layout_policy = LayoutPolicy::load(library_root).map_err(|error| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            error.to_string(),
+        )))
+    })?;
     let root = fs::canonicalize(library_root)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let transaction = connection.transaction()?;
 
     let mut stats = ReconcileStats::default();
 
-    let scope_roots = if paths.is_empty() {
+    let policy_changed = paths.iter().any(|path| {
+        let candidate = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        is_policy_path(&root, &candidate)
+    });
+
+    let scope_roots = if paths.is_empty() || policy_changed {
         vec![root.clone()]
     } else {
         normalize_scope_roots(&root, paths)?
     };
 
     for scope_root in &scope_roots {
-        reconcile_scope(&transaction, &root, scope_root, &mut stats)?;
+        reconcile_scope(&transaction, &root, scope_root, &layout_policy, &mut stats)?;
     }
 
     transaction.commit()?;
@@ -75,6 +93,8 @@ struct FileObservation<'a> {
     mtime_ns: i64,
     device_id: i64,
     inode: i64,
+    transfer_class: TransferClass,
+    extent_bytes: u64,
 }
 
 #[cfg(target_family = "unix")]
@@ -148,15 +168,38 @@ fn reconcile_scope(
     transaction: &Transaction<'_>,
     library_root: &Path,
     scope_root: &Path,
+    layout_policy: &LayoutPolicy,
     stats: &mut ReconcileStats,
 ) -> rusqlite::Result<()> {
     if scope_root.exists() {
         let metadata = fs::metadata(scope_root)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         if metadata.is_dir() {
-            reconcile_existing_directory(transaction, library_root, scope_root, stats)?;
+            reconcile_existing_directory(
+                transaction,
+                library_root,
+                scope_root,
+                layout_policy,
+                stats,
+            )?;
         } else if metadata.is_file() {
-            reconcile_existing_file(transaction, library_root, scope_root, stats)?;
+            if is_policy_path(library_root, scope_root) {
+                reconcile_existing_directory(
+                    transaction,
+                    library_root,
+                    library_root,
+                    layout_policy,
+                    stats,
+                )?;
+            } else {
+                reconcile_existing_file(
+                    transaction,
+                    library_root,
+                    scope_root,
+                    layout_policy,
+                    stats,
+                )?;
+            }
         }
     } else {
         prune_missing_scope(transaction, scope_root, library_root, stats)?;
@@ -173,7 +216,7 @@ fn reconcile_scope(
 
         if entry.file_type().is_dir() {
             seen_directories.insert(path_string);
-        } else if entry.file_type().is_file() {
+        } else if entry.file_type().is_file() && !is_policy_path(library_root, entry.path()) {
             seen_files.insert(path_string);
         }
     }
@@ -187,6 +230,7 @@ fn reconcile_existing_directory(
     transaction: &Transaction<'_>,
     library_root: &Path,
     directory_root: &Path,
+    layout_policy: &LayoutPolicy,
     stats: &mut ReconcileStats,
 ) -> rusqlite::Result<()> {
     ensure_directory_chain(transaction, library_root, directory_root, stats)?;
@@ -217,12 +261,16 @@ fn reconcile_existing_directory(
                 stats,
             )?;
         } else if metadata.is_file() {
+            if is_policy_path(library_root, path) {
+                continue;
+            }
             let directory_path = normalize_path(
                 path.parent()
                     .expect("walked file entries always have a parent directory"),
             );
             let directory_id = lookup_directory_id(transaction, &directory_path)?
                 .ok_or_else(|| rusqlite::Error::InvalidParameterName(directory_path.clone()))?;
+            let decision = layout_policy.file_decision(&path_string, metadata.len(), false);
             upsert_file(
                 transaction,
                 FileObservation {
@@ -232,6 +280,8 @@ fn reconcile_existing_directory(
                     mtime_ns,
                     device_id: identity.device_id,
                     inode: identity.inode,
+                    transfer_class: decision.transfer_class,
+                    extent_bytes: decision.stored_extent_bytes(metadata.len(), false),
                 },
                 stats,
             )?;
@@ -245,8 +295,19 @@ fn reconcile_existing_file(
     transaction: &Transaction<'_>,
     library_root: &Path,
     file_path: &Path,
+    layout_policy: &LayoutPolicy,
     stats: &mut ReconcileStats,
 ) -> rusqlite::Result<()> {
+    if is_policy_path(library_root, file_path) {
+        return reconcile_existing_directory(
+            transaction,
+            library_root,
+            library_root,
+            layout_policy,
+            stats,
+        );
+    }
+
     let parent = file_path
         .parent()
         .expect("reconciled file paths always have a parent directory");
@@ -260,6 +321,7 @@ fn reconcile_existing_file(
     let parent_string = normalize_path(parent);
     let directory_id = lookup_directory_id(transaction, &parent_string)?
         .ok_or_else(|| rusqlite::Error::InvalidParameterName(parent_string.clone()))?;
+    let decision = layout_policy.file_decision(&file_string, metadata.len(), false);
 
     upsert_file(
         transaction,
@@ -270,6 +332,8 @@ fn reconcile_existing_file(
             mtime_ns,
             device_id: identity.device_id,
             inode: identity.inode,
+            transfer_class: decision.transfer_class,
+            extent_bytes: decision.stored_extent_bytes(metadata.len(), false),
         },
         stats,
     )?;
@@ -429,7 +493,8 @@ fn upsert_file(
     {
         transaction.execute(
             "UPDATE files
-             SET directory_id = ?2, size = ?3, mtime_ns = ?4, device_id = ?5, inode = ?6, updated_at_ns = ?4
+             SET directory_id = ?2, size = ?3, mtime_ns = ?4, device_id = ?5, inode = ?6,
+                 transfer_class = ?7, extent_bytes = ?8, updated_at_ns = ?4
              WHERE file_id = ?1",
             params![
                 file_id,
@@ -437,7 +502,9 @@ fn upsert_file(
                 observation.size as i64,
                 observation.mtime_ns,
                 observation.device_id,
-                observation.inode
+                observation.inode,
+                observation.transfer_class as i64,
+                observation.extent_bytes as i64
             ],
         )?;
         stats.files_updated += 1;
@@ -454,14 +521,17 @@ fn upsert_file(
     {
         transaction.execute(
             "UPDATE files
-             SET directory_id = ?2, path = ?3, size = ?4, mtime_ns = ?5, updated_at_ns = ?5
+             SET directory_id = ?2, path = ?3, size = ?4, mtime_ns = ?5,
+                 transfer_class = ?6, extent_bytes = ?7, updated_at_ns = ?5
              WHERE file_id = ?1",
             params![
                 file_id,
                 observation.directory_id,
                 observation.path,
                 observation.size as i64,
-                observation.mtime_ns
+                observation.mtime_ns,
+                observation.transfer_class as i64,
+                observation.extent_bytes as i64
             ],
         )?;
         stats.files_updated += 1;
@@ -469,15 +539,20 @@ fn upsert_file(
     }
 
     transaction.execute(
-        "INSERT INTO files (directory_id, path, size, mtime_ns, device_id, inode, created_at_ns, updated_at_ns)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4, ?4)",
+        "INSERT INTO files (
+             directory_id, path, size, mtime_ns, device_id, inode, transfer_class, extent_bytes,
+             created_at_ns, updated_at_ns
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?4, ?4)",
         params![
             observation.directory_id,
             observation.path,
             observation.size as i64,
             observation.mtime_ns,
             observation.device_id,
-            observation.inode
+            observation.inode,
+            observation.transfer_class as i64,
+            observation.extent_bytes as i64
         ],
     )?;
     stats.files_created += 1;
@@ -551,6 +626,7 @@ fn collect_paths(
 mod tests {
     use std::{fs, io::Write, path::Path};
 
+    use legato_proto::TransferClass;
     use rusqlite::{Connection, OptionalExtension};
     use tempfile::tempdir;
 
@@ -611,6 +687,51 @@ mod tests {
 
         assert_eq!(original_id, renamed_id);
         assert!(old_path_exists.is_none());
+    }
+
+    #[test]
+    fn reconcile_persists_layout_metadata_and_ignores_policy_file_content() {
+        let fixture = tempdir().expect("fixture tempdir should be created");
+        let library_root = fixture.path().join("libraries");
+        fs::create_dir_all(library_root.join("Samples")).expect("library tree should be created");
+        let sample_path = library_root.join("Samples").join("legato.wav");
+        fs::write(&sample_path, vec![0_u8; 8 * 1024 * 1024]).expect("sample file should exist");
+        fs::write(
+            library_root.join(".legato-layout.toml"),
+            r#"
+[[rule]]
+pattern = "*legato.wav"
+transfer_class = "random"
+extent_bytes = 2097152
+"#,
+        )
+        .expect("policy file should be written");
+
+        let db_dir = tempdir().expect("db tempdir should be created");
+        let mut connection =
+            open_metadata_database(&db_dir.path().join("server.sqlite")).expect("db should open");
+
+        reconcile_library_root(&mut connection, &library_root).expect("scan should succeed");
+
+        let (file_count, transfer_class, extent_bytes): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM files),
+                    transfer_class,
+                    extent_bytes
+                 FROM files
+                 WHERE path = ?1",
+                [sample_path.to_string_lossy().into_owned()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("catalog entry should be readable");
+
+        assert_eq!(
+            file_count, 1,
+            "policy file should not be cataloged as content"
+        );
+        assert_eq!(transfer_class, TransferClass::Random as i64);
+        assert_eq!(extent_bytes, 2 * 1024 * 1024);
     }
 
     fn file_id_for_path(connection: &Connection, path: &Path) -> Option<i64> {

@@ -11,10 +11,10 @@ mod watcher;
 
 use std::{fs, path::Path};
 
-pub use api::MetadataService;
+pub use api::{CatalogEntry, MetadataService};
 pub use index::{ReconcileStats, reconcile_library_root, reconcile_paths};
 pub use invalidation::{InvalidationHub, InvalidationSubscription, subtree_invalidation};
-pub use layout::{LayoutDecision, LayoutPolicy};
+pub use layout::{DEFAULT_POLICY_FILE, LayoutDecision, LayoutPolicy, is_policy_path, policy_path};
 use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 pub use rpc::{BoundServer, LiveServer, RuntimeTlsConfig, load_runtime_tls, parse_bind_address};
 use rusqlite::Connection;

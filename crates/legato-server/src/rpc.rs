@@ -30,7 +30,7 @@ use legato_proto::{
 };
 
 use crate::{
-    InvalidationHub, LayoutPolicy, MetadataService, Server, ServerConfig, WatchBackend,
+    CatalogEntry, InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend,
     create_poll_watcher, create_recommended_watcher, open_metadata_database,
     reconcile_library_root, subtree_invalidation,
 };
@@ -92,7 +92,6 @@ impl BoundServer {
 pub struct LiveServer {
     shell: Server,
     config: ServerConfig,
-    layout_policy: LayoutPolicy,
     metadata: Arc<Mutex<MetadataService>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
 }
@@ -105,12 +104,10 @@ impl LiveServer {
         reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
         let metadata = MetadataService::new(connection);
         let invalidations = InvalidationHub::new(config.library_root.clone());
-        let layout_policy = LayoutPolicy::load(Path::new(&config.library_root))?;
 
         Ok(Self {
             shell: Server::new(config.clone()),
             config,
-            layout_policy,
             metadata: Arc::new(Mutex::new(metadata)),
             invalidations: Arc::new(Mutex::new(invalidations)),
         })
@@ -247,19 +244,14 @@ impl Legato for LiveServer {
         request: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
         let path = request.into_inner().path;
-        let metadata = self
+        let inode = self
             .metadata
             .lock()
             .await
-            .resolve_path(ResolvePathRequest { path: path.clone() })
+            .resolve_catalog_path(&path)
             .map_err(map_storage_error)?
-            .ok_or_else(|| Status::not_found("path not found"))?;
-        let inode = metadata_to_inode(
-            metadata
-                .metadata
-                .ok_or_else(|| Status::internal("resolve response missing metadata"))?,
-            &self.layout_policy,
-        );
+            .ok_or_else(|| Status::not_found("path not found"))
+            .map(metadata_to_inode)?;
         Ok(Response::new(ResolveResponse { inode: Some(inode) }))
     }
 
@@ -448,18 +440,25 @@ fn map_storage_error(error: rusqlite::Error) -> Status {
     }
 }
 
-fn metadata_to_inode(
-    metadata: legato_proto::FileMetadata,
-    layout_policy: &LayoutPolicy,
-) -> InodeMetadata {
-    let layout = layout_policy.file_layout(&metadata.path, metadata.size, metadata.is_dir);
+fn metadata_to_inode(entry: CatalogEntry) -> InodeMetadata {
+    let layout =
+        entry
+            .transfer_class
+            .zip(entry.extent_bytes)
+            .map(|(transfer_class, extent_bytes)| {
+                crate::LayoutDecision {
+                    transfer_class,
+                    extent_bytes,
+                }
+                .file_layout(entry.metadata.size, entry.metadata.is_dir)
+            });
     InodeMetadata {
-        file_id: metadata.file_id,
-        path: metadata.path,
-        size: metadata.size,
-        mtime_ns: metadata.mtime_ns,
-        is_dir: metadata.is_dir,
-        layout: Some(layout),
+        file_id: entry.metadata.file_id,
+        path: entry.metadata.path,
+        size: entry.metadata.size,
+        mtime_ns: entry.metadata.mtime_ns,
+        is_dir: entry.metadata.is_dir,
+        layout,
     }
 }
 
@@ -481,7 +480,7 @@ mod tests {
 
     use super::{LiveServer, load_runtime_tls, metadata_to_inode, spawn_watch_task};
     use crate::{
-        InvalidationHub, LayoutPolicy, MetadataService, ServerConfig, ensure_server_tls_materials,
+        CatalogEntry, InvalidationHub, MetadataService, ServerConfig, ensure_server_tls_materials,
         open_metadata_database, reconcile_library_root,
     };
 
@@ -614,10 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_to_inode_uses_policy_driven_transfer_classes() {
-        let policy = LayoutPolicy::default();
-        let unitary = metadata_to_inode(
-            legato_proto::FileMetadata {
+    fn metadata_to_inode_uses_catalog_persisted_transfer_classes() {
+        let unitary = metadata_to_inode(CatalogEntry {
+            metadata: legato_proto::FileMetadata {
                 file_id: 1,
                 path: String::from("/srv/libraries/Kontakt/piano.nki"),
                 size: 512 * 1024,
@@ -626,14 +624,15 @@ mod tests {
                 is_dir: false,
                 block_size: 1 << 20,
             },
-            &policy,
-        );
+            transfer_class: Some(TransferClass::Unitary),
+            extent_bytes: Some(512 * 1024),
+        });
         let unitary_layout = unitary.layout.expect("layout should be present");
         assert_eq!(unitary_layout.transfer_class, TransferClass::Unitary as i32);
         assert_eq!(unitary_layout.extents.len(), 1);
 
-        let streamed = metadata_to_inode(
-            legato_proto::FileMetadata {
+        let streamed = metadata_to_inode(CatalogEntry {
+            metadata: legato_proto::FileMetadata {
                 file_id: 2,
                 path: String::from("/srv/libraries/Samples/legato.wav"),
                 size: 32 * 1024 * 1024,
@@ -642,8 +641,9 @@ mod tests {
                 is_dir: false,
                 block_size: 1 << 20,
             },
-            &policy,
-        );
+            transfer_class: Some(TransferClass::Streamed),
+            extent_bytes: Some(4 * 1024 * 1024),
+        });
         let streamed_layout = streamed.layout.expect("layout should be present");
         assert_eq!(
             streamed_layout.transfer_class,
@@ -651,8 +651,8 @@ mod tests {
         );
         assert_eq!(streamed_layout.extents.len(), 8);
 
-        let random = metadata_to_inode(
-            legato_proto::FileMetadata {
+        let random = metadata_to_inode(CatalogEntry {
+            metadata: legato_proto::FileMetadata {
                 file_id: 3,
                 path: String::from("/srv/libraries/Containers/library.bin"),
                 size: 512 * 1024 * 1024,
@@ -661,8 +661,9 @@ mod tests {
                 is_dir: false,
                 block_size: 1 << 20,
             },
-            &policy,
-        );
+            transfer_class: Some(TransferClass::Random),
+            extent_bytes: Some(1024 * 1024),
+        });
         let random_layout = random.layout.expect("layout should be present");
         assert_eq!(random_layout.transfer_class, TransferClass::Random as i32);
         assert_eq!(random_layout.extents[0].length, 1024 * 1024);
