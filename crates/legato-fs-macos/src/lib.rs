@@ -1,10 +1,22 @@
 //! macOS-specific adapter wrappers over the shared Legato filesystem service.
 
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
 use legato_proto::DirectoryEntry;
 use legato_types::{
     ClientPlatform, FilesystemAttributes, FilesystemError, FilesystemOperation,
     FilesystemSemantics, PlatformErrorCode, platform_error_code,
+};
+use tokio::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+use unifuse::{
+    DirEntry as MountDirEntry, FileAttr as MountFileAttr, FileHandle as MountFileHandle,
+    FileType as MountFileType, FsError as MountFsError, MountOptions, OpenFlags, StatFs,
+    UniFuseFilesystem, UniFuseHost,
 };
 
 /// Adapter wrapper for the macOS filesystem surface.
@@ -12,6 +24,14 @@ use legato_types::{
 pub struct MacosFilesystem {
     mount_point: String,
     semantics: FilesystemSemantics,
+}
+
+/// Shared mount state used by the macOS runtime adapter.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub struct MacosMountService {
+    service: Mutex<FilesystemService>,
+    library_root: String,
 }
 
 /// Adapter-local directory entry representation for macOS mount bindings.
@@ -165,6 +185,146 @@ impl MacosFilesystem {
     }
 }
 
+impl MacosMountService {
+    /// Creates one shared mount service around the connected filesystem runtime.
+    #[must_use]
+    pub fn new(service: FilesystemService, library_root: impl Into<String>) -> Self {
+        Self {
+            service: Mutex::new(service),
+            library_root: library_root.into(),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn canonical_path(&self, virtual_path: &Path) -> String {
+        map_virtual_path(&self.library_root, virtual_path)
+    }
+}
+
+/// Returns whether the current macOS host appears able to mount the filesystem.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn mount_runtime_available() -> bool {
+    UniFuseHost::<MacosMountService>::is_available()
+}
+
+/// Mounts the Legato filesystem on macOS and blocks until the mount exits.
+#[cfg(target_os = "macos")]
+pub async fn mount(
+    service: FilesystemService,
+    mount_point: impl AsRef<Path>,
+    library_root: impl Into<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mount_point = mount_point.as_ref().to_path_buf();
+    std::fs::create_dir_all(&mount_point)?;
+
+    let host = UniFuseHost::new(MacosMountService::new(service, library_root));
+    let options = MountOptions {
+        fs_name: String::from("legato"),
+        allow_other: false,
+        read_only: true,
+    };
+
+    host.mount(&mount_point, &options)
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+}
+
+#[cfg(target_os = "macos")]
+impl UniFuseFilesystem for MacosMountService {
+    async fn getattr(&self, path: &Path) -> Result<MountFileAttr, MountFsError> {
+        let attributes = self
+            .service
+            .lock()
+            .await
+            .lookup(&self.canonical_path(path))
+            .await
+            .map_err(map_mount_error)?;
+        Ok(attributes_to_mount_attr(&attributes))
+    }
+
+    async fn lookup(
+        &self,
+        parent: &Path,
+        name: &std::ffi::OsStr,
+    ) -> Result<MountFileAttr, MountFsError> {
+        let path = if parent == Path::new("/") {
+            PathBuf::from("/").join(name)
+        } else {
+            parent.join(name)
+        };
+        self.getattr(&path).await
+    }
+
+    async fn open(&self, path: &Path, flags: OpenFlags) -> Result<MountFileHandle, MountFsError> {
+        if flags.write {
+            return Err(MountFsError::NotSupported);
+        }
+
+        let handle = self
+            .service
+            .lock()
+            .await
+            .open(&self.canonical_path(path))
+            .await
+            .map_err(map_mount_error)?;
+        Ok(MountFileHandle(handle.local_handle))
+    }
+
+    async fn read(
+        &self,
+        _path: &Path,
+        fh: MountFileHandle,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, MountFsError> {
+        self.service
+            .lock()
+            .await
+            .read(fh.0, offset, size)
+            .await
+            .map_err(map_mount_error)
+    }
+
+    async fn release(&self, _path: &Path, fh: MountFileHandle) -> Result<(), MountFsError> {
+        self.service
+            .lock()
+            .await
+            .release(fh.0)
+            .await
+            .map_err(map_mount_error)
+    }
+
+    async fn readdir(&self, path: &Path) -> Result<Vec<MountDirEntry>, MountFsError> {
+        let entries = self
+            .service
+            .lock()
+            .await
+            .read_dir(&self.canonical_path(path))
+            .await
+            .map_err(map_mount_error)?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| MountDirEntry {
+                name: entry.name,
+                kind: entry_kind(entry.is_dir),
+            })
+            .collect())
+    }
+
+    async fn statfs(&self, _path: &Path) -> Result<StatFs, MountFsError> {
+        Ok(StatFs {
+            blocks: 1_048_576,
+            bfree: 0,
+            bavail: 0,
+            files: 1_000_000,
+            ffree: 0,
+            bsize: 1 << 20,
+            namelen: 255,
+        })
+    }
+}
+
 fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
     let kind = match error {
         FilesystemServiceError::NotFound(_) => FilesystemError::NotFound,
@@ -175,6 +335,50 @@ fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
         }
     };
     platform_error_code(ClientPlatform::Macos, kind)
+}
+
+#[cfg(target_os = "macos")]
+fn map_mount_error(error: FilesystemServiceError) -> MountFsError {
+    match error {
+        FilesystemServiceError::NotFound(_) => MountFsError::NotFound,
+        FilesystemServiceError::UnknownHandle(_) => {
+            MountFsError::Other(String::from("stale handle"))
+        }
+        FilesystemServiceError::InvalidRead { .. } => {
+            MountFsError::Other(String::from("invalid read"))
+        }
+        FilesystemServiceError::Transport(error) => MountFsError::Other(error.to_string()),
+        FilesystemServiceError::Cache(error) => MountFsError::Other(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn attributes_to_mount_attr(attributes: &FilesystemAttributes) -> MountFileAttr {
+    let timestamp = timestamp_from_ns(attributes.mtime_ns);
+    MountFileAttr {
+        size: attributes.size,
+        blocks: attributes.size.div_ceil(512),
+        atime: timestamp,
+        mtime: timestamp,
+        ctime: timestamp,
+        crtime: timestamp,
+        kind: entry_kind(attributes.is_dir),
+        perm: if attributes.is_dir { 0o555 } else { 0o444 },
+        nlink: if attributes.is_dir { 2 } else { 1 },
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        flags: 0,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn entry_kind(is_dir: bool) -> MountFileType {
+    if is_dir {
+        MountFileType::Directory
+    } else {
+        MountFileType::RegularFile
+    }
 }
 
 fn translate_directory_entry(entry: DirectoryEntry) -> MacosDirectoryEntry {
@@ -198,6 +402,22 @@ fn attributes_from_open_handle(handle: &FilesystemOpenHandle) -> FilesystemAttri
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn map_virtual_path(library_root: &str, virtual_path: &Path) -> String {
+    let mut mapped = PathBuf::from(library_root);
+    for component in virtual_path.components() {
+        if let std::path::Component::Normal(segment) = component {
+            mapped.push(segment);
+        }
+    }
+    mapped.to_string_lossy().into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn timestamp_from_ns(nanoseconds: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_nanos(nanoseconds)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path};
@@ -211,7 +431,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
-    use super::MacosFilesystem;
+    use super::{MacosFilesystem, map_virtual_path};
 
     fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
         ClientConfig {
@@ -260,6 +480,18 @@ mod tests {
         assert_eq!(attrs.inode, 7);
         assert_eq!(attrs.size, 4096);
         assert!(attrs.read_only);
+    }
+
+    #[test]
+    fn virtual_root_maps_into_library_root() {
+        assert_eq!(
+            map_virtual_path("/srv/libraries", Path::new("/")),
+            "/srv/libraries"
+        );
+        assert_eq!(
+            map_virtual_path("/srv/libraries", Path::new("/Kontakt/piano.nki")),
+            "/srv/libraries/Kontakt/piano.nki"
+        );
     }
 
     #[tokio::test]

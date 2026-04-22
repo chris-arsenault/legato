@@ -10,6 +10,10 @@ version.workspace = true
 legato-client-core = { path = "../legato-client-core" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
+tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+unifuse = "0.1"
 
 [dev-dependencies]
 legato-server = { path = "../legato-server" }

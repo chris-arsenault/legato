@@ -27,6 +27,7 @@ pub use filesystem::{
 };
 pub use transport::{
     ClientAttachSession, ClientTransportError, GrpcClientTransport, GrpcInvalidationSubscription,
+    InvalidationPoll,
 };
 
 /// Immutable settings used to bootstrap a client runtime.

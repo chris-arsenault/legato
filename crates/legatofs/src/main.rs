@@ -85,29 +85,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         let adapter = legato_fs_macos::MacosFilesystem::new(startup.mount_point.clone());
-        let _ = service;
         let _ = &mut control;
+        if !legato_fs_macos::mount_runtime_available() {
+            return Err("macFUSE runtime not detected on this host".into());
+        }
         telemetry.set_lifecycle_state("ready", 1);
         println!(
-            "legatofs connected to {} and bootstrap ready for {}",
+            "legatofs connected to {} and mounting on {} for {}",
             server_name,
+            adapter.mount_point(),
             adapter.platform_name()
         );
-        return Ok(());
+        return legato_fs_macos::mount(
+            service,
+            Path::new(adapter.mount_point()),
+            process_config.mount.library_root.clone(),
+        )
+        .await;
     }
 
     #[cfg(target_os = "windows")]
     {
         let adapter = legato_fs_windows::WindowsFilesystem::new(startup.mount_point.clone());
-        let _ = service;
         let _ = &mut control;
+        if !legato_fs_windows::mount_runtime_available() {
+            return Err("WinFSP runtime not detected on this host".into());
+        }
         telemetry.set_lifecycle_state("ready", 1);
         println!(
-            "legatofs connected to {} and bootstrap ready for {}",
+            "legatofs connected to {} and mounting on {} for {}",
             server_name,
+            adapter.mount_point(),
             adapter.platform_name()
         );
-        return Ok(());
+        return legato_fs_windows::mount(
+            service,
+            Path::new(adapter.mount_point()),
+            process_config.mount.library_root.clone(),
+        )
+        .await;
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

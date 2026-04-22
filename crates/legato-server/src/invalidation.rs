@@ -49,6 +49,11 @@ impl InvalidationHub {
         self.subscribers.remove(&subscriber_id);
     }
 
+    /// Removes every active subscriber.
+    pub fn clear_subscribers(&mut self) {
+        self.subscribers.clear();
+    }
+
     /// Publishes an invalidation to every active subscriber.
     pub fn publish(&mut self, event: InvalidationEvent) {
         for queue in self.subscribers.values_mut() {

@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::{
@@ -11,9 +11,11 @@ use legato_client_cache::{
 };
 use legato_proto::{BlockRequest, DirectoryEntry, FileMetadata, InvalidationEvent};
 use legato_types::{FileId, FilesystemAttributes};
-use tokio::time::timeout;
 
-use crate::{ClientConfig, GrpcClientTransport, GrpcInvalidationSubscription, LocalControlPlane};
+use crate::{
+    ClientConfig, GrpcClientTransport, GrpcInvalidationSubscription, LocalControlPlane,
+    transport::InvalidationPoll,
+};
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -296,25 +298,25 @@ impl FilesystemService {
             return Ok(false);
         };
 
-        match timeout(Duration::from_millis(10), subscription.recv_next()).await {
-            Err(_elapsed) => {
+        match subscription.try_recv_next() {
+            Ok(InvalidationPoll::Empty) => {
                 self.invalidations = Some(subscription);
                 Ok(false)
             }
-            Ok(Ok(Some(event))) => {
+            Ok(InvalidationPoll::Event(event)) => {
                 self.apply_invalidation(&event)?;
                 self.invalidations = Some(subscription);
                 Ok(true)
             }
-            Ok(Ok(None)) => {
+            Ok(InvalidationPoll::Closed) => {
                 self.reconnect_and_resubscribe().await?;
                 Ok(false)
             }
-            Ok(Err(error)) if should_retry_after_reconnect(&error) => {
+            Err(error) if should_retry_after_reconnect(&error) => {
                 self.reconnect_and_resubscribe().await?;
                 Ok(false)
             }
-            Ok(Err(error)) => Err(FilesystemServiceError::Transport(error)),
+            Err(error) => Err(FilesystemServiceError::Transport(error)),
         }
     }
 

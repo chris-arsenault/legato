@@ -2,7 +2,7 @@
 
 use std::{fs, time::Duration};
 
-use tokio::time::sleep;
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tonic::{
     Status,
     transport::{
@@ -30,13 +30,53 @@ pub struct ClientAttachSession {
 /// Streaming invalidation subscription tied to one live gRPC session.
 #[derive(Debug)]
 pub struct GrpcInvalidationSubscription {
-    stream: tonic::Streaming<InvalidationEvent>,
+    receiver: mpsc::Receiver<InvalidationDelivery>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum InvalidationDelivery {
+    Event(InvalidationEvent),
+    Closed,
+    Error(ClientTransportError),
+}
+
+/// Non-blocking invalidation poll result.
+#[derive(Debug)]
+pub enum InvalidationPoll {
+    /// One invalidation event is ready.
+    Event(InvalidationEvent),
+    /// The stream is still open but currently idle.
+    Empty,
+    /// The remote side closed the subscription.
+    Closed,
 }
 
 impl GrpcInvalidationSubscription {
     /// Receives the next invalidation from the remote stream.
     pub async fn recv_next(&mut self) -> Result<Option<InvalidationEvent>, ClientTransportError> {
-        self.stream.message().await.map_err(Into::into)
+        match self.receiver.recv().await {
+            Some(InvalidationDelivery::Event(event)) => Ok(Some(event)),
+            Some(InvalidationDelivery::Closed) | None => Ok(None),
+            Some(InvalidationDelivery::Error(error)) => Err(error),
+        }
+    }
+
+    /// Polls the next invalidation without waiting.
+    pub fn try_recv_next(&mut self) -> Result<InvalidationPoll, ClientTransportError> {
+        match self.receiver.try_recv() {
+            Ok(InvalidationDelivery::Event(event)) => Ok(InvalidationPoll::Event(event)),
+            Ok(InvalidationDelivery::Closed) => Ok(InvalidationPoll::Closed),
+            Ok(InvalidationDelivery::Error(error)) => Err(error),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(InvalidationPoll::Empty),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(InvalidationPoll::Closed),
+        }
+    }
+}
+
+impl Drop for GrpcInvalidationSubscription {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -267,13 +307,41 @@ impl GrpcClientTransport {
     pub async fn subscribe_invalidations(
         &mut self,
     ) -> Result<GrpcInvalidationSubscription, ClientTransportError> {
-        let stream = self
+        let mut stream = self
             .client
             .subscribe(SubscribeRequest {})
             .await?
             .into_inner();
         self.runtime.mark_subscription_active();
-        Ok(GrpcInvalidationSubscription { stream })
+        let (sender, receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            loop {
+                match stream.message().await {
+                    Ok(Some(event)) => {
+                        if sender
+                            .send(InvalidationDelivery::Event(event))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = sender.send(InvalidationDelivery::Closed).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender
+                            .send(InvalidationDelivery::Error(ClientTransportError::from(
+                                error,
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(GrpcInvalidationSubscription { receiver, task })
     }
 
     /// Closes one remote file handle.

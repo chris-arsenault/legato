@@ -55,6 +55,7 @@ pub struct BoundServer {
     task: JoinHandle<Result<(), tonic::transport::Error>>,
     watch_task: JoinHandle<()>,
     watcher: ActiveWatcher,
+    invalidations: Arc<Mutex<InvalidationHub>>,
 }
 
 impl BoundServer {
@@ -65,10 +66,12 @@ impl BoundServer {
             mut task,
             watch_task,
             watcher,
+            invalidations,
         } = self;
         let _ = shutdown_signal.send(());
         watch_task.abort();
         drop(watcher);
+        invalidations.lock().await.clear_subscribers();
         match timeout(Duration::from_secs(5), &mut task).await {
             Ok(task_result) => task_result??,
             Err(_elapsed) => {
@@ -137,6 +140,7 @@ impl LiveServer {
             )?;
         }
 
+        let invalidations = Arc::clone(&self.invalidations);
         let task = tokio::spawn(async move {
             builder
                 .add_service(LegatoServer::new(self))
@@ -151,6 +155,7 @@ impl LiveServer {
             task,
             watch_task,
             watcher,
+            invalidations,
         })
     }
 }
