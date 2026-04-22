@@ -10,7 +10,11 @@ version.workspace = true
 legato-client-cache = { path = "../legato-client-cache" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 
 [lints]
 workspace = true
 
+[dev-dependencies]
+tempfile = "3"
