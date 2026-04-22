@@ -103,6 +103,7 @@ pub struct FilesystemService {
     transport: GrpcClientTransport,
     control: LocalControlPlane,
     store: ExtentCacheStore,
+    max_cache_bytes: u64,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
     invalidations: Option<GrpcInvalidationSubscription>,
@@ -115,8 +116,10 @@ impl FilesystemService {
         client_name: impl Into<String>,
         state_dir: &Path,
     ) -> Result<Self, FilesystemServiceError> {
+        let max_cache_bytes = config.cache.max_bytes;
         let cache_db = open_cache_database(&state_dir.join("client.sqlite"))?;
-        let store = ExtentCacheStore::new(&state_dir.join("extents"), cache_db)?;
+        let mut store = ExtentCacheStore::new(&state_dir.join("extents"), cache_db)?;
+        store.recover(max_cache_bytes, now_monotonic_ns())?;
         let mut transport = GrpcClientTransport::connect(config, client_name).await?;
         let invalidations = Some(transport.subscribe_invalidations().await?);
         let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 0);
@@ -125,6 +128,7 @@ impl FilesystemService {
             transport,
             control,
             store,
+            max_cache_bytes,
             next_handle: 1,
             open_handles: HashMap::new(),
             invalidations,
@@ -269,6 +273,7 @@ impl FilesystemService {
     ) -> Result<(), FilesystemServiceError> {
         self.control.apply_invalidation(event);
         self.store.apply_invalidation(event)?;
+        let _ = self.store.checkpoint(now_monotonic_ns())?;
         Ok(())
     }
 
@@ -381,7 +386,18 @@ impl FilesystemService {
     ) -> Result<(), FilesystemServiceError> {
         for extent in extents {
             let _ = self.store.put_extent(extent, 0, now_ns)?;
+            self.store.record_extent_fetch_state(
+                &ExtentKey {
+                    file_id: FileId(extent.file_id),
+                    extent_index: extent.extent_index,
+                },
+                i32::MAX,
+                "resident",
+                now_ns,
+            )?;
         }
+        let _ = self.store.evict_to_limit(self.max_cache_bytes)?;
+        let _ = self.store.checkpoint(now_ns)?;
         Ok(())
     }
 

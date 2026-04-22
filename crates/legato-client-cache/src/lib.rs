@@ -17,6 +17,10 @@ pub use schema::{CLIENT_CACHE_SCHEMA_VERSION, cache_migrations};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+const EXTENT_STORE_DIRTY_STATE_KEY: &str = "extent_store.dirty";
+const EXTENT_STORE_CHECKPOINT_KEY: &str = "extent_store.checkpoint";
+const EXTENT_STORE_PIN_GENERATION_KEY: &str = "extent_store.pin_generation";
+
 /// Identity for a single block cache entry.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CacheKey {
@@ -223,6 +227,49 @@ pub struct CacheMaintenanceReport {
     pub orphan_files_removed: usize,
     /// Total bytes reclaimed across removed entries and orphan files.
     pub reclaimed_bytes: u64,
+}
+
+/// Durable checkpoint summary for the local extent store.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExtentStoreCheckpoint {
+    /// Monotonic checkpoint format version for future upgrades.
+    pub version: u32,
+    /// Timestamp at which the checkpoint was committed.
+    pub updated_at_ns: u64,
+    /// Current logical bytes tracked by the extent catalog.
+    pub total_bytes: u64,
+    /// Number of extent entries present in the local residency catalog.
+    pub extent_entries: u64,
+    /// Highest pin generation allocated by the local store.
+    pub pin_generation: u64,
+}
+
+/// Summary of one extent-store compaction pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExtentStoreCompactionReport {
+    /// Number of stale extent fetch-state rows removed.
+    pub stale_fetch_rows_removed: usize,
+    /// Number of unreferenced pin rows removed.
+    pub stale_pins_removed: usize,
+    /// Number of empty directories removed from the extent root.
+    pub empty_directories_removed: usize,
+}
+
+/// Summary of one restart or startup recovery pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtentStoreRecoveryReport {
+    /// Whether the store was marked dirty before recovery began.
+    pub recovered_dirty_store: bool,
+    /// Checkpoint observed before recovery, when present.
+    pub checkpoint_before: Option<ExtentStoreCheckpoint>,
+    /// Checkpoint committed after recovery completed.
+    pub checkpoint_after: ExtentStoreCheckpoint,
+    /// Repair report executed during recovery.
+    pub repair: CacheMaintenanceReport,
+    /// Compaction report executed during recovery.
+    pub compaction: ExtentStoreCompactionReport,
+    /// Eviction report executed during recovery.
+    pub eviction: CacheMaintenanceReport,
 }
 
 /// Persistent client-side block cache backed by the cache SQLite DB and block files.
@@ -581,6 +628,30 @@ impl ExtentCacheStore {
         })
     }
 
+    /// Returns the current highest pin generation known to the extent store.
+    pub fn current_pin_generation(&self) -> rusqlite::Result<u64> {
+        if let Some(value) = self.client_state_value(EXTENT_STORE_PIN_GENERATION_KEY)? {
+            return Ok(value.parse::<u64>().unwrap_or(0));
+        }
+
+        self.connection
+            .query_row("SELECT COALESCE(MAX(generation), 0) FROM pins", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|value| value.max(0) as u64)
+    }
+
+    /// Allocates and persists the next pin generation for eviction-sensitive residency.
+    pub fn begin_pin_generation(
+        &mut self,
+        reason: &str,
+        created_at_ns: u64,
+    ) -> rusqlite::Result<u64> {
+        let generation = self.current_pin_generation()?.saturating_add(1);
+        self.record_pin(generation, reason, created_at_ns)?;
+        Ok(generation)
+    }
+
     /// Inserts or replaces one verified extent in the local store.
     pub fn put_extent(
         &mut self,
@@ -588,6 +659,7 @@ impl ExtentCacheStore {
         pin_generation: u64,
         now_ns: u64,
     ) -> rusqlite::Result<CachedExtent> {
+        self.mark_dirty()?;
         let transfer_class =
             TransferClass::try_from(record.transfer_class).unwrap_or(TransferClass::Unspecified);
         let content_hash = blake3::hash(&record.data).as_bytes().to_vec();
@@ -682,6 +754,7 @@ impl ExtentCacheStore {
                 params![key.file_id.0 as i64, key.extent_index as i64],
             )?;
             let _ = fs::remove_file(&absolute_path);
+            self.mark_dirty()?;
             return Ok(None);
         }
 
@@ -703,6 +776,7 @@ impl ExtentCacheStore {
 
     /// Removes all cached extents for one file.
     pub fn invalidate_file(&mut self, file_id: FileId) -> rusqlite::Result<usize> {
+        self.mark_dirty()?;
         let paths = collect_extent_storage_paths_for_file(&self.connection, file_id)?;
         let deleted = self.connection.execute(
             "DELETE FROM extent_entries WHERE file_id = ?1",
@@ -735,6 +809,7 @@ impl ExtentCacheStore {
         state: &str,
         now_ns: u64,
     ) -> rusqlite::Result<()> {
+        self.mark_dirty()?;
         self.connection.execute(
             "INSERT INTO extent_fetch_state (file_id, extent_index, priority, state, updated_at_ns)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -760,11 +835,19 @@ impl ExtentCacheStore {
         reason: &str,
         created_at_ns: u64,
     ) -> rusqlite::Result<()> {
+        self.mark_dirty()?;
         self.connection.execute(
             "INSERT OR REPLACE INTO pins (generation, reason, created_at_ns) VALUES (?1, ?2, ?3)",
             params![generation as i64, reason, created_at_ns as i64],
         )?;
+        self.set_client_state_value(EXTENT_STORE_PIN_GENERATION_KEY, &generation.to_string())?;
         Ok(())
+    }
+
+    /// Exposes the underlying SQLite connection for higher-level orchestration tests.
+    #[must_use]
+    pub fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// Returns the logical size of all tracked extent entries.
@@ -795,9 +878,16 @@ impl ExtentCacheStore {
             ..CacheMaintenanceReport::default()
         };
         let mut statement = self.connection.prepare(
-            "SELECT file_id, extent_index, content_size, storage_relative_path
+            "SELECT extent_entries.file_id, extent_entries.extent_index, extent_entries.content_size,
+                    extent_entries.storage_relative_path
              FROM extent_entries
-             ORDER BY pin_generation ASC, last_access_ns ASC, extent_index ASC",
+             LEFT JOIN extent_fetch_state
+               ON extent_fetch_state.file_id = extent_entries.file_id
+              AND extent_fetch_state.extent_index = extent_entries.extent_index
+             ORDER BY extent_entries.pin_generation ASC,
+                      COALESCE(extent_fetch_state.priority, 10_000) DESC,
+                      extent_entries.last_access_ns ASC,
+                      extent_entries.extent_index ASC",
         )?;
         let victims = statement
             .query_map([], |row| {
@@ -829,6 +919,36 @@ impl ExtentCacheStore {
 
         report.bytes_after = self.total_size_bytes()?;
         Ok(report)
+    }
+
+    /// Compacts stale extent metadata and trims empty directories from the extent root.
+    pub fn compact(&mut self) -> rusqlite::Result<ExtentStoreCompactionReport> {
+        let stale_fetch_rows_removed = self.connection.execute(
+            "DELETE FROM extent_fetch_state
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM extent_entries
+                 WHERE extent_entries.file_id = extent_fetch_state.file_id
+                   AND extent_entries.extent_index = extent_fetch_state.extent_index
+             )",
+            [],
+        )?;
+        let stale_pins_removed = self.connection.execute(
+            "DELETE FROM pins
+             WHERE generation NOT IN (
+                 SELECT DISTINCT pin_generation
+                 FROM extent_entries
+                 WHERE pin_generation > 0
+             )",
+            [],
+        )?;
+        let empty_directories_removed = trim_empty_directories(&self.root_dir)?;
+
+        Ok(ExtentStoreCompactionReport {
+            stale_fetch_rows_removed,
+            stale_pins_removed,
+            empty_directories_removed,
+        })
     }
 
     /// Removes corrupt, missing, and orphaned extent artifacts from the local store.
@@ -905,6 +1025,99 @@ impl ExtentCacheStore {
 
         report.bytes_after = self.total_size_bytes()?;
         Ok(report)
+    }
+
+    /// Returns the latest committed extent-store checkpoint when one exists.
+    pub fn checkpoint(&mut self, now_ns: u64) -> rusqlite::Result<ExtentStoreCheckpoint> {
+        let checkpoint = ExtentStoreCheckpoint {
+            version: 1,
+            updated_at_ns: now_ns,
+            total_bytes: self.total_size_bytes()?,
+            extent_entries: self
+                .connection
+                .query_row("SELECT COUNT(*) FROM extent_entries", [], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .max(0) as u64,
+            pin_generation: self.current_pin_generation()?,
+        };
+        let json = serde_json::to_string(&checkpoint)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.set_client_state_value(EXTENT_STORE_CHECKPOINT_KEY, &json)?;
+        self.set_client_state_value(EXTENT_STORE_DIRTY_STATE_KEY, "0")?;
+        Ok(checkpoint)
+    }
+
+    /// Loads the most recent extent-store checkpoint from durable client state.
+    pub fn load_checkpoint(&self) -> rusqlite::Result<Option<ExtentStoreCheckpoint>> {
+        self.client_state_value(EXTENT_STORE_CHECKPOINT_KEY)?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+            })
+            .transpose()
+    }
+
+    /// Returns whether the extent store was left dirty by a prior uncheckpointed mutation.
+    pub fn is_dirty(&self) -> rusqlite::Result<bool> {
+        Ok(self
+            .client_state_value(EXTENT_STORE_DIRTY_STATE_KEY)?
+            .is_some_and(|value| value == "1"))
+    }
+
+    /// Repairs, compacts, evicts, and checkpoints the local extent store for startup recovery.
+    pub fn recover(
+        &mut self,
+        max_bytes: u64,
+        now_ns: u64,
+    ) -> rusqlite::Result<ExtentStoreRecoveryReport> {
+        let checkpoint_before = self.load_checkpoint()?;
+        let recovered_dirty_store = self.is_dirty()? || checkpoint_before.is_none();
+        let repair = if recovered_dirty_store {
+            self.repair()?
+        } else {
+            let bytes = self.total_size_bytes()?;
+            CacheMaintenanceReport {
+                bytes_before: bytes,
+                bytes_after: bytes,
+                ..CacheMaintenanceReport::default()
+            }
+        };
+        let compaction = self.compact()?;
+        let eviction = self.evict_to_limit(max_bytes)?;
+        let checkpoint_after = self.checkpoint(now_ns)?;
+
+        Ok(ExtentStoreRecoveryReport {
+            recovered_dirty_store,
+            checkpoint_before,
+            checkpoint_after,
+            repair,
+            compaction,
+            eviction,
+        })
+    }
+
+    fn mark_dirty(&self) -> rusqlite::Result<()> {
+        self.set_client_state_value(EXTENT_STORE_DIRTY_STATE_KEY, "1")
+    }
+
+    fn client_state_value(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT value FROM client_state WHERE key = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+    }
+
+    fn set_client_state_value(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO client_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -1020,6 +1233,32 @@ fn hex_char(value: u8) -> char {
         10..=15 => (b'a' + (value - 10)) as char,
         _ => '0',
     }
+}
+
+fn trim_empty_directories(root_dir: &Path) -> rusqlite::Result<usize> {
+    let mut removed = 0;
+    let mut directories = WalkDir::new(root_dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_dir())
+        .map(walkdir::DirEntry::into_path)
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+
+    for directory in directories {
+        if fs::read_dir(&directory)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+            .next()
+            .is_none()
+        {
+            fs::remove_dir(&directory)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -1260,6 +1499,219 @@ mod tests {
         assert_eq!(loaded.data, b"fixture-extent");
         assert_eq!(loaded.file_offset, 4096);
         assert_eq!(loaded.transfer_class, TransferClass::Streamed);
+    }
+
+    #[test]
+    fn extent_cache_store_evicts_low_utility_and_older_pin_generations_first() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
+            .expect("store should open");
+
+        let older_generation = store
+            .begin_pin_generation("prefetch", 100)
+            .expect("older generation should allocate");
+        let newer_generation = store
+            .begin_pin_generation("prefetch", 200)
+            .expect("newer generation should allocate");
+
+        for (extent_index, pin_generation, priority, last_access_ns) in [
+            (0_u32, older_generation, 3_i32, 110_u64),
+            (1_u32, older_generation, 0_i32, 120_u64),
+            (2_u32, newer_generation, 0_i32, 130_u64),
+        ] {
+            let key = ExtentKey {
+                file_id: FileId(7),
+                extent_index,
+            };
+            let _ = store
+                .put_extent(
+                    &ExtentRecord {
+                        file_id: 7,
+                        extent_index,
+                        file_offset: u64::from(extent_index) * 4096,
+                        data: format!("extent-{extent_index}").into_bytes(),
+                        extent_hash: Vec::new(),
+                        transfer_class: TransferClass::Streamed as i32,
+                    },
+                    pin_generation,
+                    last_access_ns,
+                )
+                .expect("extent should be inserted");
+            store
+                .record_extent_fetch_state(&key, priority, "resident", last_access_ns)
+                .expect("fetch state should be recorded");
+            let _ = store
+                .get_extent(&key, last_access_ns)
+                .expect("extent should load")
+                .expect("extent should exist");
+        }
+
+        let report = store
+            .evict_to_limit(("extent-1".len() + "extent-2".len()) as u64)
+            .expect("eviction should succeed");
+
+        assert_eq!(report.entries_removed, 1);
+        assert!(
+            store
+                .get_extent(
+                    &ExtentKey {
+                        file_id: FileId(7),
+                        extent_index: 0,
+                    },
+                    500,
+                )
+                .expect("lookup should succeed")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_extent(
+                    &ExtentKey {
+                        file_id: FileId(7),
+                        extent_index: 1,
+                    },
+                    500,
+                )
+                .expect("lookup should succeed")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_extent(
+                    &ExtentKey {
+                        file_id: FileId(7),
+                        extent_index: 2,
+                    },
+                    500,
+                )
+                .expect("lookup should succeed")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn extent_cache_store_compacts_stale_state_and_empty_directories() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
+            .expect("store should open");
+        let generation = store
+            .begin_pin_generation("prefetch", 100)
+            .expect("generation should allocate");
+        let _ = store
+            .put_extent(
+                &ExtentRecord {
+                    file_id: 7,
+                    extent_index: 1,
+                    file_offset: 0,
+                    data: b"fixture".to_vec(),
+                    extent_hash: Vec::new(),
+                    transfer_class: TransferClass::Streamed as i32,
+                },
+                generation,
+                101,
+            )
+            .expect("extent should be inserted");
+
+        store
+            .record_extent_fetch_state(
+                &ExtentKey {
+                    file_id: FileId(9),
+                    extent_index: 3,
+                },
+                3,
+                "queued",
+                102,
+            )
+            .expect("stale fetch state should insert");
+        store
+            .record_pin(generation + 1, "orphan", 103)
+            .expect("orphan pin should insert");
+
+        let empty_dir = temp.path().join("extents").join("ff").join("empty");
+        std::fs::create_dir_all(&empty_dir).expect("empty directory should exist");
+
+        let report = store.compact().expect("compaction should succeed");
+
+        assert_eq!(report.stale_fetch_rows_removed, 1);
+        assert_eq!(report.stale_pins_removed, 1);
+        assert!(report.empty_directories_removed >= 1);
+        assert!(
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM extent_fetch_state WHERE file_id = 9 AND extent_index = 3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("fetch-state count should load")
+                == 0
+        );
+        assert!(!empty_dir.exists());
+    }
+
+    #[test]
+    fn extent_cache_store_recovery_repairs_dirty_state_and_writes_checkpoint() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
+            .expect("store should open");
+
+        let generation = store
+            .begin_pin_generation("prefetch", 100)
+            .expect("generation should allocate");
+        let _ = store
+            .put_extent(
+                &ExtentRecord {
+                    file_id: 7,
+                    extent_index: 0,
+                    file_offset: 0,
+                    data: b"fixture".to_vec(),
+                    extent_hash: Vec::new(),
+                    transfer_class: TransferClass::Streamed as i32,
+                },
+                generation,
+                101,
+            )
+            .expect("extent should be inserted");
+
+        let relative_path: String = store
+            .connection()
+            .query_row(
+                "SELECT storage_relative_path FROM extent_entries WHERE file_id = 7 AND extent_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("storage path should load");
+        std::fs::write(temp.path().join("extents").join(&relative_path), b"corrupt")
+            .expect("extent file should be corrupted");
+
+        let orphan = temp.path().join("extents").join("aa").join("orphan.bin");
+        std::fs::create_dir_all(orphan.parent().expect("orphan parent should exist"))
+            .expect("orphan directory should be created");
+        std::fs::write(&orphan, b"orphan").expect("orphan file should be created");
+
+        assert!(store.is_dirty().expect("dirty state should load"));
+
+        let report = store.recover(1024, 300).expect("recovery should succeed");
+
+        assert!(report.recovered_dirty_store);
+        assert_eq!(report.repair.repaired_entries, 1);
+        assert_eq!(report.repair.orphan_files_removed, 1);
+        assert!(!store.is_dirty().expect("dirty state should load"));
+        assert_eq!(
+            store
+                .load_checkpoint()
+                .expect("checkpoint should load")
+                .expect("checkpoint should exist")
+                .updated_at_ns,
+            300
+        );
+        assert!(!orphan.exists());
     }
 
     #[test]
