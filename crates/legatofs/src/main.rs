@@ -7,7 +7,7 @@ use std::{
 };
 
 use legato_client_cache::{BlockCacheStore, open_cache_database};
-use legato_client_core::{ClientConfig, GrpcClientTransport, LocalControlPlane};
+use legato_client_core::{ClientConfig, FilesystemService, LocalControlPlane};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
@@ -70,21 +70,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup = startup_context(&process_config.mount);
     let control = control_plane_for_mount(&process_config.mount, startup.semantics)?;
     let client_name = default_client_name();
-    let transport =
-        GrpcClientTransport::connect(process_config.client.clone(), &client_name).await?;
-    let attach = transport.attach_session().clone();
+    let service = FilesystemService::connect(
+        process_config.client.clone(),
+        &client_name,
+        Path::new(&process_config.mount.state_dir),
+    )
+    .await?;
+    let server_name = service.server_name().to_owned();
 
     #[cfg(target_os = "macos")]
     {
-        let adapter = legato_fs_macos::MacosFilesystem::new(
-            transport.runtime().clone(),
-            startup.mount_point.clone(),
-        );
+        let adapter = legato_fs_macos::MacosFilesystem::new(startup.mount_point.clone());
+        let _ = service;
         let _ = &mut control;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and bootstrap ready for {}",
-            attach.server_name,
+            server_name,
             adapter.platform_name()
         );
         return Ok(());
@@ -92,15 +94,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(target_os = "windows")]
     {
-        let adapter = legato_fs_windows::WindowsFilesystem::new(
-            transport.runtime().clone(),
-            startup.mount_point.clone(),
-        );
+        let adapter = legato_fs_windows::WindowsFilesystem::new(startup.mount_point.clone());
+        let _ = service;
         let _ = &mut control;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and bootstrap ready for {}",
-            attach.server_name,
+            server_name,
             adapter.platform_name()
         );
         return Ok(());
@@ -108,12 +108,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = transport;
+        let _ = service;
         let _ = control;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and bootstrap ready for unsupported-host development",
-            attach.server_name
+            server_name
         );
         Ok(())
     }

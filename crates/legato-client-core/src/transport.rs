@@ -137,6 +137,11 @@ impl GrpcClientTransport {
         &self.runtime
     }
 
+    /// Returns mutable access to the current runtime shell.
+    pub fn runtime_mut(&mut self) -> &mut ClientRuntime {
+        &mut self.runtime
+    }
+
     /// Re-establishes the channel, re-attaches, and re-opens stale handles.
     pub async fn reconnect(&mut self) -> Result<RecoveryCompletion, ClientTransportError> {
         let delay_ms = self.runtime.mark_transport_unavailable();

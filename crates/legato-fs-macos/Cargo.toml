@@ -8,7 +8,13 @@ version.workspace = true
 
 [dependencies]
 legato-client-core = { path = "../legato-client-core" }
+legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
+
+[dev-dependencies]
+legato-server = { path = "../legato-server" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

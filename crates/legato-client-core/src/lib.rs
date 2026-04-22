@@ -1,5 +1,6 @@
 //! Shared runtime state for native Legato clients.
 
+mod filesystem;
 mod transport;
 
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
@@ -8,8 +9,9 @@ use legato_client_cache::{
     BlockCacheStore, CacheConfig, CacheKey, CachedBlock, MetadataCache, MetadataCacheLookup,
 };
 use legato_proto::{
-    AttachRequest, FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse,
-    PROTOCOL_VERSION, PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
+    AttachRequest, DirectoryEntry, FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest,
+    OpenResponse, PROTOCOL_VERSION, PrefetchPriority as ProtoPrefetchPriority,
+    default_capabilities,
 };
 use legato_types::{
     BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
@@ -20,6 +22,9 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use filesystem::{
+    FilesystemOpenHandle, FilesystemService, FilesystemServiceError, now_monotonic_ns,
+};
 pub use transport::{ClientAttachSession, ClientTransportError, GrpcClientTransport};
 
 /// Immutable settings used to bootstrap a client runtime.
@@ -284,6 +289,11 @@ impl ClientRuntime {
     /// Updates the tracked handle after a successful reopen.
     pub fn refresh_open_handle(&mut self, path: &str, response: &OpenResponse) {
         self.record_open_handle(path, response);
+    }
+
+    /// Stops tracking an open handle after the client releases it locally.
+    pub fn close_open_handle(&mut self, path: &str) {
+        self.open_files.remove(path);
     }
 
     /// Marks the transport unavailable and returns the next reconnect delay.
@@ -665,6 +675,7 @@ impl PrefetchExecutor {
 pub struct LocalControlPlane {
     metadata_cache: MetadataCache,
     canonical_paths: HashMap<String, FileMetadata>,
+    canonical_directories: HashMap<String, Vec<DirectoryEntry>>,
     fetch_coordinator: FetchCoordinator,
     prefetch_executor: PrefetchExecutor,
 }
@@ -676,6 +687,7 @@ impl LocalControlPlane {
         Self {
             metadata_cache,
             canonical_paths: HashMap::new(),
+            canonical_directories: HashMap::new(),
             fetch_coordinator: FetchCoordinator::new(block_size),
             prefetch_executor: PrefetchExecutor::new(),
         }
@@ -688,10 +700,19 @@ impl LocalControlPlane {
         self.canonical_paths.insert(metadata.path.clone(), metadata);
     }
 
+    /// Registers a canonical directory listing for later local read-dir requests.
+    pub fn register_dir(&mut self, path: &str, entries: Vec<DirectoryEntry>, now_ns: u64) {
+        self.metadata_cache
+            .put_dir(path, Some(entries.clone()), now_ns);
+        self.canonical_directories.insert(path.to_owned(), entries);
+    }
+
     /// Applies an invalidation to the cached metadata state.
     pub fn apply_invalidation(&mut self, event: &InvalidationEvent) {
         self.metadata_cache.apply_invalidation(event);
         self.canonical_paths
+            .retain(|path, _| !path_is_invalidated(path, &event.path));
+        self.canonical_directories
             .retain(|path, _| !path_is_invalidated(path, &event.path));
     }
 
@@ -703,6 +724,18 @@ impl LocalControlPlane {
                 let metadata = self.canonical_paths.get(path).cloned();
                 self.metadata_cache.put_stat(path, metadata.clone(), now_ns);
                 metadata
+            }
+        }
+    }
+
+    /// Resolves a directory listing through the local metadata cache.
+    pub fn list_dir(&mut self, path: &str, now_ns: u64) -> Option<Vec<DirectoryEntry>> {
+        match self.metadata_cache.list_dir(path, now_ns) {
+            MetadataCacheLookup::Hit(entries) => entries,
+            MetadataCacheLookup::Miss => {
+                let entries = self.canonical_directories.get(path).cloned();
+                self.metadata_cache.put_dir(path, entries.clone(), now_ns);
+                entries
             }
         }
     }
