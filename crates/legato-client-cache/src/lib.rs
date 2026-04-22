@@ -12,6 +12,7 @@ use legato_proto::{DirectoryEntry, FileMetadata, InvalidationEvent, Invalidation
 use legato_types::{BlockRange, FileId};
 use rusqlite::{Connection, OptionalExtension, params};
 pub use schema::{CLIENT_CACHE_SCHEMA_VERSION, cache_migrations};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 /// Identity for a single block cache entry.
@@ -33,7 +34,8 @@ impl From<&BlockRange> for CacheKey {
 }
 
 /// Minimal cache configuration used by the shared client runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct CacheConfig {
     /// Total maximum size of the cache in bytes.
     pub max_bytes: u64,

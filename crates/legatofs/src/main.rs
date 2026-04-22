@@ -22,6 +22,8 @@ struct ClientProcessConfig {
     #[serde(default)]
     common: CommonProcessConfig,
     #[serde(default)]
+    client: ClientConfig,
+    #[serde(default)]
     mount: MountConfig,
 }
 
@@ -53,8 +55,9 @@ struct StartupContext {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let process_config = load_config::<ClientProcessConfig>(None, "LEGATO_FS")
-        .unwrap_or_else(|_| ClientProcessConfig::default());
+    let process_config =
+        load_config::<ClientProcessConfig>(Some(default_config_path()), "LEGATO_FS")
+            .unwrap_or_else(|_| ClientProcessConfig::default());
     init_tracing("legatofs", &process_config.common.tracing)?;
     let shutdown = ShutdownController::new();
     let telemetry = ProcessTelemetry::new("legatofs", &process_config.common.metrics);
@@ -62,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
 
-    let runtime = ClientRuntime::new(ClientConfig::default());
+    let runtime = ClientRuntime::new(process_config.client.clone());
     let startup = startup_context(&process_config.mount);
     let control = control_plane_for_mount(&process_config.mount, startup.semantics)?;
 
@@ -167,6 +170,21 @@ fn default_mount_point() -> String {
     }
 }
 
+fn default_config_path() -> &'static Path {
+    #[cfg(target_os = "macos")]
+    {
+        return Path::new("/Library/Application Support/Legato/legatofs.toml");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return Path::new("C:\\ProgramData\\Legato\\legatofs.toml");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Path::new("/tmp/legatofs.toml")
+    }
+}
+
 fn default_library_root() -> String {
     String::from("/srv/libraries")
 }
@@ -189,8 +207,8 @@ fn default_state_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientProcessConfig, MountConfig, default_mount_point, mount_root_attributes,
-        startup_context,
+        ClientProcessConfig, MountConfig, default_config_path, default_mount_point,
+        mount_root_attributes, startup_context,
     };
     use legato_types::{FilesystemOperation, FilesystemSemantics};
 
@@ -217,5 +235,10 @@ mod tests {
 
         assert!(metadata.is_dir);
         assert_eq!(metadata.file_id, 1);
+    }
+
+    #[test]
+    fn default_config_path_is_present_for_platform() {
+        assert!(!default_config_path().as_os_str().is_empty());
     }
 }

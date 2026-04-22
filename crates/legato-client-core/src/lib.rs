@@ -16,9 +16,11 @@ use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
+use serde::{Deserialize, Serialize};
 
 /// Immutable settings used to bootstrap a client runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ClientConfig {
     /// Logical endpoint name used for diagnostics.
     pub endpoint: String,
@@ -42,7 +44,8 @@ impl Default for ClientConfig {
 }
 
 /// TLS settings used by the client transport.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ClientTlsConfig {
     /// PEM-encoded CA bundle that verifies the server certificate.
     pub ca_cert_path: String,
@@ -85,7 +88,8 @@ impl ClientTlsConfig {
 }
 
 /// Exponential reconnect policy for the client transport.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct RetryPolicy {
     /// Base reconnect delay after the first transient failure.
     pub initial_delay_ms: u64,

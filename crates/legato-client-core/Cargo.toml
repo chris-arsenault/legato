@@ -13,6 +13,7 @@ legato-types = { path = "../legato-types" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

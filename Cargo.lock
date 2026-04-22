@@ -726,6 +726,7 @@ dependencies = [
  "legato-proto",
  "legato-types",
  "rusqlite",
+ "serde",
  "tempfile",
  "walkdir",
 ]
@@ -740,6 +741,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "serde",
  "tempfile",
 ]
 

@@ -25,26 +25,34 @@ This document defines the installation and upgrade shape for the native Legato c
 - Packaging format: signed `.pkg`
 - Installed binary target: `/usr/local/bin/legatofs`
 - Config root: `/Library/Application Support/Legato`
-- Startup model: `launchd` agent or daemon that brings up the mount on login/system boot, depending on deployment preference
+- Default installed config: `/Library/Application Support/Legato/legatofs.toml`
+- Installer build script: `deploy/client/package-macos.sh`
+- Installer output: `artifacts/macos/*.pkg`
+- Startup model: packaged binary and config assets today; service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
-  - stop the mount service
   - replace the binary in place
   - preserve `client.sqlite`, `blocks/`, and cert material
-  - restart the service and allow the client runtime to reconnect and reopen stale handles
+  - preserve an existing `legatofs.toml` if already configured
 
 ## Windows
 
-- Packaging format: MSI
+- Packaging format: installer `.exe` built with Inno Setup
 - Installed binary target: `C:\Program Files\Legato\legatofs.exe`
 - Config root: `C:\ProgramData\Legato`
-- Startup model: Windows service with mount lifecycle managed at service start/stop
+- Default installed config: `C:\ProgramData\Legato\legatofs.toml`
+- Installer build script: `deploy/client/package-windows.ps1`
+- Installer output: `artifacts/windows/*.exe`
+- Installer configuration prompts:
+  - server endpoint
+  - TLS server name
+  - mount point
+- Startup model: packaged binary and config assets today; service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
-  - stop the service and unmount the filesystem
   - replace the binary in place
   - preserve `client.sqlite`, `blocks\`, and cert material
-  - restart the service and allow the client runtime to reconnect and rebuild server-local handles
+  - preserve an existing `legatofs.toml` if already configured
 
 ## Cache Integrity Rules
 

@@ -16,3 +16,38 @@ jobs:
   ci:
     uses: chris-arsenault/ahara/.github/workflows/ci.yml@main
     secrets: inherit
+
+  package-macos-client:
+    name: Package macOS Client
+    needs: [ci]
+    runs-on: macos-latest
+    if: ${{ needs.ci.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build legatofs
+        run: cargo build --release -p legatofs
+      - name: Package macOS installer
+        run: ./deploy/client/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: legatofs-macos-installer
+          path: artifacts/macos/*.pkg
+
+  package-windows-client:
+    name: Package Windows Client
+    needs: [ci]
+    runs-on: windows-latest
+    if: ${{ needs.ci.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build legatofs
+        run: cargo build --release -p legatofs
+      - name: Package Windows installer
+        shell: pwsh
+        run: .\deploy\client\package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: legatofs-windows-installer
+          path: artifacts/windows/*.exe

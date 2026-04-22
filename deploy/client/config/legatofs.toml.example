@@ -1,0 +1,29 @@
+[common.tracing]
+json = false
+level = "info"
+
+[common.metrics]
+prefix = "legatofs"
+
+[client]
+endpoint = "legato.lan:7823"
+
+[client.cache]
+max_bytes = 1610612736000
+block_size = 1048576
+
+[client.tls]
+ca_cert_path = "__CERT_DIR__/server-ca.pem"
+client_cert_path = "__CERT_DIR__/client.pem"
+client_key_path = "__CERT_DIR__/client-key.pem"
+server_name = "legato.lan"
+
+[client.retry]
+initial_delay_ms = 250
+max_delay_ms = 5000
+multiplier = 2
+
+[mount]
+mount_point = "__MOUNT_POINT__"
+library_root = "/srv/libraries"
+state_dir = "__STATE_DIR__"
