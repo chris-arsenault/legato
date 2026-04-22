@@ -15,9 +15,7 @@ permissions:
 jobs:
   ci:
     uses: chris-arsenault/ahara/.github/workflows/ci.yml@main
-    secrets:
-      OIDC_ROLE: ${{ secrets.OIDC_ROLE }}
-      STATE_BUCKET: ${{ secrets.STATE_BUCKET }}
+    secrets: inherit
 
   package-macos-client:
     name: Package macOS Client
