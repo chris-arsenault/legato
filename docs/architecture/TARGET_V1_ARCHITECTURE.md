@@ -66,6 +66,15 @@ transfer layout for each file. The starting model is:
 The exact thresholds are implementation policy, not protocol constants. They
 should be tunable and overrideable by path or vendor-specific rules.
 
+The classification exists because the sample-library workload is not uniform:
+
+- small instrument and metadata files are usually read whole
+- large sample payloads are usually consumed sequentially
+- random-access container cases are the minority but still need explicit
+  support
+
+The protocol and local store should reflect those facts directly.
+
 ### Legato-Managed Stores
 
 Legato owns its own extent store and catalog format, but uses the host
@@ -77,6 +86,11 @@ The client-side store lives on top of the client host filesystem on NVMe.
 Legato is therefore more filesystem-native than a SQLite-plus-blobs cache, but
 less operationally extreme than building a fully custom block allocator and disk
 filesystem for each platform.
+
+This is an intentional narrowing of scope:
+
+- more coherent than a generic cache shim
+- much less extreme than building a bespoke kernel or raw-disk filesystem
 
 ### Read Path Optimized For Playback
 
@@ -91,6 +105,9 @@ Implications:
   warming in the background
 - the mount layer should serve cached reads locally without requiring a server
   round-trip on the hot path
+
+The system should optimize for "first bytes quickly, then continue warming"
+rather than "one generic cache strategy for every file."
 
 ### Residency Is First-Class State
 
@@ -122,6 +139,9 @@ The store should support:
 - recovery by replay from a recent checkpoint
 - integrity verification per extent
 - compaction and eviction without rewriting the whole store
+
+The client and server stores should therefore converge on the same semantic
+model even if their operational roles differ.
 
 This does not require the repository to implement a full custom disk
 filesystem. It does require replacing the current "SQLite metadata plus opaque
@@ -168,6 +188,10 @@ The protocol should stop depending on:
 - server-local open handles as a core correctness mechanism
 - one global fixed block size
 - block alignment as the primary semantic unit
+
+The protocol should also stop treating server-local open handles as the main
+anchor for correctness. Stable logical identity plus layout metadata should be
+the primary contract.
 
 ## Server Runtime Shape
 
@@ -246,10 +270,12 @@ verification and recovery, not necessarily the primary addressing scheme.
 The target architecture intentionally excludes:
 
 - a bespoke kernel filesystem implementation
+- a custom disk filesystem below the host filesystem
 - general-purpose writable distributed filesystem semantics
 - multi-writer coordination for library mutation
 - shared cache coherence between clients beyond ordered server change streams
 - a requirement that the current SQLite block cache model be preserved
+- content-addressed deduplication as the primary storage design center
 
 ## Repository Consequences
 

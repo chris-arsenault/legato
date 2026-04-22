@@ -24,6 +24,8 @@ Deliverables:
 - server catalog with stable file identity and layout metadata
 - extent fetch service over the new protocol
 - ordered change-record stream
+- override support for vendor/path-specific layout rules where heuristics are
+  insufficient
 
 ## Track 3: Client Store And Residency
 
@@ -48,6 +50,7 @@ Deliverables:
 - head-biased first-touch fetch
 - invalidation-driven metadata refresh
 - removal of assumptions tied to current open-handle behavior
+- extent-residency-aware read behavior rather than generic fixed-block warming
 
 ## Track 5: Prefetch Rework
 
@@ -77,5 +80,7 @@ Deliverables:
 This workplan does not include:
 
 - building a custom kernel driver
+- building a custom disk filesystem below the host filesystem
 - preserving the current cache schema for compatibility
 - pretending the old protocol is the long-term contract
+- broadening scope into a general-purpose writable filesystem

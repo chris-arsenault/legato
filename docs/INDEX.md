@@ -21,6 +21,8 @@ This directory is the short-form map of the repository documentation.
   Reset architecture for the intended v1 end-state after moving beyond the provisional fixed-block cache model.
 - [design/PROTOCOL_AND_BEHAVIOR.md](design/PROTOCOL_AND_BEHAVIOR.md)
   Final behavioral contract for protocol, caching, prefetch, and failure handling.
+- [design/TRANSFER_LAYOUT_AND_STORE_MODEL.md](design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
+  Forward-looking transfer classification, extent model, and store-shape rules for the architecture reset.
 - [design/V1_RESET_WORKPLAN.md](design/V1_RESET_WORKPLAN.md)
   Release-oriented implementation tracks for the architecture reset.
 
