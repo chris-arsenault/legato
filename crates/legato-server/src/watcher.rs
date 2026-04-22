@@ -5,9 +5,7 @@ use std::{
     time::Duration,
 };
 
-use notify::{
-    Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Result, Watcher,
-};
+use notify::{Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Result, Watcher};
 use rusqlite::Connection;
 
 use crate::{ReconcileStats, reconcile_library_root, reconcile_paths};
