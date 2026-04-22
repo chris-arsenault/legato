@@ -22,18 +22,17 @@ use tonic::{
 
 use legato_proto::{
     AttachRequest, AttachResponse, BlockResponse, ChangeKind, ChangeRecord, CloseRequest,
-    CloseResponse, ExtentRecord, FetchRequest, FileLayout, HintRequest, HintResponse,
-    InodeMetadata, ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest,
-    PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, ResolveRequest,
-    ResolveResponse, StatRequest, StatResponse, SubscribeChangesRequest, SubscribeRequest,
-    TransferClass,
+    CloseResponse, ExtentRecord, FetchRequest, HintRequest, HintResponse, InodeMetadata,
+    ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest, PrefetchResponse,
+    ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, ResolveRequest, ResolveResponse,
+    StatRequest, StatResponse, SubscribeChangesRequest, SubscribeRequest,
     legato_server::{Legato, LegatoServer},
 };
 
 use crate::{
-    InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend, create_poll_watcher,
-    create_recommended_watcher, open_metadata_database, reconcile_library_root,
-    subtree_invalidation,
+    InvalidationHub, LayoutPolicy, MetadataService, Server, ServerConfig, WatchBackend,
+    create_poll_watcher, create_recommended_watcher, open_metadata_database,
+    reconcile_library_root, subtree_invalidation,
 };
 
 type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockResponse, Status>> + Send + 'static>>;
@@ -93,6 +92,7 @@ impl BoundServer {
 pub struct LiveServer {
     shell: Server,
     config: ServerConfig,
+    layout_policy: LayoutPolicy,
     metadata: Arc<Mutex<MetadataService>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
 }
@@ -105,10 +105,12 @@ impl LiveServer {
         reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
         let metadata = MetadataService::new(connection);
         let invalidations = InvalidationHub::new(config.library_root.clone());
+        let layout_policy = LayoutPolicy::load(Path::new(&config.library_root))?;
 
         Ok(Self {
             shell: Server::new(config.clone()),
             config,
+            layout_policy,
             metadata: Arc::new(Mutex::new(metadata)),
             invalidations: Arc::new(Mutex::new(invalidations)),
         })
@@ -256,6 +258,7 @@ impl Legato for LiveServer {
             metadata
                 .metadata
                 .ok_or_else(|| Status::internal("resolve response missing metadata"))?,
+            &self.layout_policy,
         );
         Ok(Response::new(ResolveResponse { inode: Some(inode) }))
     }
@@ -445,8 +448,11 @@ fn map_storage_error(error: rusqlite::Error) -> Status {
     }
 }
 
-fn metadata_to_inode(metadata: legato_proto::FileMetadata) -> InodeMetadata {
-    let layout = infer_file_layout(&metadata);
+fn metadata_to_inode(
+    metadata: legato_proto::FileMetadata,
+    layout_policy: &LayoutPolicy,
+) -> InodeMetadata {
+    let layout = layout_policy.file_layout(&metadata.path, metadata.size, metadata.is_dir);
     InodeMetadata {
         file_id: metadata.file_id,
         path: metadata.path,
@@ -454,47 +460,6 @@ fn metadata_to_inode(metadata: legato_proto::FileMetadata) -> InodeMetadata {
         mtime_ns: metadata.mtime_ns,
         is_dir: metadata.is_dir,
         layout: Some(layout),
-    }
-}
-
-fn infer_file_layout(metadata: &legato_proto::FileMetadata) -> FileLayout {
-    let transfer_class = if metadata.is_dir || metadata.size <= 4 * 1024 * 1024 {
-        TransferClass::Unitary
-    } else if metadata.size <= 128 * 1024 * 1024 {
-        TransferClass::Streamed
-    } else {
-        TransferClass::Random
-    };
-    let extent_length = match transfer_class {
-        TransferClass::Unitary => metadata.size.max(1),
-        TransferClass::Streamed => 4 * 1024 * 1024,
-        TransferClass::Random => 1024 * 1024,
-        TransferClass::Unspecified => metadata.block_size.max(1) as u64,
-    };
-    let extent_count = if metadata.size == 0 {
-        1
-    } else {
-        metadata.size.div_ceil(extent_length)
-    };
-    let mut extents = Vec::with_capacity(extent_count as usize);
-    for extent_index in 0..extent_count {
-        let file_offset = extent_index * extent_length;
-        let length = if metadata.size == 0 {
-            0
-        } else {
-            std::cmp::min(extent_length, metadata.size - file_offset)
-        };
-        extents.push(legato_proto::ExtentDescriptor {
-            extent_index: extent_index as u32,
-            file_offset,
-            length,
-            extent_hash: Vec::new(),
-        });
-    }
-
-    FileLayout {
-        transfer_class: transfer_class as i32,
-        extents,
     }
 }
 
@@ -514,9 +479,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{LiveServer, infer_file_layout, load_runtime_tls, spawn_watch_task};
+    use super::{LiveServer, load_runtime_tls, metadata_to_inode, spawn_watch_task};
     use crate::{
-        InvalidationHub, MetadataService, ServerConfig, ensure_server_tls_materials,
+        InvalidationHub, LayoutPolicy, MetadataService, ServerConfig, ensure_server_tls_materials,
         open_metadata_database, reconcile_library_root,
     };
 
@@ -649,42 +614,58 @@ mod tests {
     }
 
     #[test]
-    fn infer_file_layout_uses_reset_transfer_classes() {
-        let unitary = infer_file_layout(&legato_proto::FileMetadata {
-            file_id: 1,
-            path: String::from("/srv/libraries/Kontakt/piano.nki"),
-            size: 512 * 1024,
-            mtime_ns: 0,
-            content_hash: Vec::new(),
-            is_dir: false,
-            block_size: 1 << 20,
-        });
-        assert_eq!(unitary.transfer_class, TransferClass::Unitary as i32);
-        assert_eq!(unitary.extents.len(), 1);
+    fn metadata_to_inode_uses_policy_driven_transfer_classes() {
+        let policy = LayoutPolicy::default();
+        let unitary = metadata_to_inode(
+            legato_proto::FileMetadata {
+                file_id: 1,
+                path: String::from("/srv/libraries/Kontakt/piano.nki"),
+                size: 512 * 1024,
+                mtime_ns: 0,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 1 << 20,
+            },
+            &policy,
+        );
+        let unitary_layout = unitary.layout.expect("layout should be present");
+        assert_eq!(unitary_layout.transfer_class, TransferClass::Unitary as i32);
+        assert_eq!(unitary_layout.extents.len(), 1);
 
-        let streamed = infer_file_layout(&legato_proto::FileMetadata {
-            file_id: 2,
-            path: String::from("/srv/libraries/Samples/legato.wav"),
-            size: 32 * 1024 * 1024,
-            mtime_ns: 0,
-            content_hash: Vec::new(),
-            is_dir: false,
-            block_size: 1 << 20,
-        });
-        assert_eq!(streamed.transfer_class, TransferClass::Streamed as i32);
-        assert_eq!(streamed.extents.len(), 8);
+        let streamed = metadata_to_inode(
+            legato_proto::FileMetadata {
+                file_id: 2,
+                path: String::from("/srv/libraries/Samples/legato.wav"),
+                size: 32 * 1024 * 1024,
+                mtime_ns: 0,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 1 << 20,
+            },
+            &policy,
+        );
+        let streamed_layout = streamed.layout.expect("layout should be present");
+        assert_eq!(
+            streamed_layout.transfer_class,
+            TransferClass::Streamed as i32
+        );
+        assert_eq!(streamed_layout.extents.len(), 8);
 
-        let random = infer_file_layout(&legato_proto::FileMetadata {
-            file_id: 3,
-            path: String::from("/srv/libraries/Containers/library.bin"),
-            size: 512 * 1024 * 1024,
-            mtime_ns: 0,
-            content_hash: Vec::new(),
-            is_dir: false,
-            block_size: 1 << 20,
-        });
-        assert_eq!(random.transfer_class, TransferClass::Random as i32);
-        assert_eq!(random.extents[0].length, 1 << 20);
+        let random = metadata_to_inode(
+            legato_proto::FileMetadata {
+                file_id: 3,
+                path: String::from("/srv/libraries/Containers/library.bin"),
+                size: 512 * 1024 * 1024,
+                mtime_ns: 0,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 1 << 20,
+            },
+            &policy,
+        );
+        let random_layout = random.layout.expect("layout should be present");
+        assert_eq!(random_layout.transfer_class, TransferClass::Random as i32);
+        assert_eq!(random_layout.extents[0].length, 1024 * 1024);
     }
 
     #[tokio::test]
