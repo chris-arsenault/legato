@@ -8,11 +8,16 @@ use std::{
 };
 
 use legato_proto::{
-    BlockResponse, CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, ListDirRequest,
-    ListDirResponse, OpenRequest, OpenResponse, ReadBlocksRequest, ResolvePathRequest,
-    ResolvePathResponse, StatRequest, StatResponse,
+    BlockResponse, CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, InvalidationEvent,
+    ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, ReadBlocksRequest,
+    ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse,
 };
 use rusqlite::{Connection, OptionalExtension};
+
+use crate::{
+    NotificationAction, ReconcileStats, invalidation_events_for_action, plan_notification_result,
+    reconcile_library_root, reconcile_paths,
+};
 
 /// Server-side implementation of the non-block metadata RPC surface.
 #[derive(Debug)]
@@ -210,6 +215,26 @@ impl MetadataService {
         self.open_handles
             .get(&file_handle)
             .map(|handle| handle.file_id)
+    }
+
+    /// Applies one filesystem notification result and returns the resulting stats and invalidations.
+    pub fn apply_notification(
+        &mut self,
+        library_root: &Path,
+        result: notify::Result<notify::Event>,
+    ) -> rusqlite::Result<(ReconcileStats, Vec<InvalidationEvent>)> {
+        let action = plan_notification_result(library_root, result);
+        let stats = match &action {
+            NotificationAction::FullRescan => {
+                reconcile_library_root(&mut self.connection, library_root)?
+            }
+            NotificationAction::Paths(paths) => {
+                reconcile_paths(&mut self.connection, library_root, paths)?
+            }
+        };
+        let invalidations =
+            invalidation_events_for_action(&self.connection, library_root, &action)?;
+        Ok((stats, invalidations))
     }
 }
 

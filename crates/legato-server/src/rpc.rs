@@ -1,10 +1,16 @@
 //! gRPC runtime wiring for the Legato server daemon.
 
-use std::{net::SocketAddr, path::Path, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use tokio::{
     net::TcpListener,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
     task::JoinHandle,
     time::{MissedTickBehavior, interval},
 };
@@ -23,8 +29,8 @@ use legato_proto::{
 };
 
 use crate::{
-    InvalidationHub, MetadataService, Server, ServerConfig, open_metadata_database,
-    reconcile_library_root,
+    InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend, create_poll_watcher,
+    create_recommended_watcher, open_metadata_database, reconcile_library_root,
 };
 
 type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockResponse, Status>> + Send + 'static>>;
@@ -47,12 +53,16 @@ pub struct RuntimeTlsConfig {
 pub struct BoundServer {
     shutdown_signal: tokio::sync::oneshot::Sender<()>,
     task: JoinHandle<Result<(), tonic::transport::Error>>,
+    watch_task: JoinHandle<()>,
+    watcher: ActiveWatcher,
 }
 
 impl BoundServer {
     /// Signals shutdown and waits for the underlying transport task to exit.
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.shutdown_signal.send(());
+        self.watch_task.abort();
+        drop(self.watcher);
         self.task.await??;
         Ok(())
     }
@@ -62,6 +72,7 @@ impl BoundServer {
 #[derive(Debug)]
 pub struct LiveServer {
     shell: Server,
+    config: ServerConfig,
     metadata: Arc<Mutex<MetadataService>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
 }
@@ -76,7 +87,8 @@ impl LiveServer {
         let invalidations = InvalidationHub::new(config.library_root.clone());
 
         Ok(Self {
-            shell: Server::new(config),
+            shell: Server::new(config.clone()),
+            config,
             metadata: Arc::new(Mutex::new(metadata)),
             invalidations: Arc::new(Mutex::new(invalidations)),
         })
@@ -90,6 +102,19 @@ impl LiveServer {
     ) -> Result<BoundServer, Box<dyn std::error::Error>> {
         let incoming = TcpListenerStream::new(listener);
         let (shutdown_signal, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        let (watch_sender, watch_receiver) = mpsc::unbounded_channel();
+
+        let watcher = ActiveWatcher::create(
+            Path::new(&self.config.library_root),
+            WatchBackend::Recommended,
+            watch_sender,
+        )?;
+        let watch_task = spawn_watch_task(
+            watch_receiver,
+            PathBuf::from(&self.config.library_root),
+            Arc::clone(&self.metadata),
+            Arc::clone(&self.invalidations),
+        );
 
         let mut builder = TransportServer::builder();
         if let Some(tls) = tls {
@@ -112,8 +137,71 @@ impl LiveServer {
         Ok(BoundServer {
             shutdown_signal,
             task,
+            watch_task,
+            watcher,
         })
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ActiveWatcher {
+    Recommended(notify::RecommendedWatcher),
+    Poll(notify::PollWatcher),
+}
+
+impl ActiveWatcher {
+    fn create(
+        library_root: &Path,
+        backend: WatchBackend,
+        sender: mpsc::UnboundedSender<notify::Result<notify::Event>>,
+    ) -> notify::Result<Self> {
+        match backend {
+            WatchBackend::Recommended => {
+                let recommended_sender = sender.clone();
+                create_recommended_watcher(library_root, move |event| {
+                    let _ = recommended_sender.send(event);
+                })
+                .map(Self::Recommended)
+                .or_else(|_| {
+                    create_poll_watcher(library_root, Duration::from_secs(2), move |event| {
+                        let _ = sender.send(event);
+                    })
+                    .map(Self::Poll)
+                })
+            }
+            WatchBackend::Poll { interval } => {
+                create_poll_watcher(library_root, interval, move |event| {
+                    let _ = sender.send(event);
+                })
+                .map(Self::Poll)
+            }
+        }
+    }
+}
+
+fn spawn_watch_task(
+    mut receiver: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    library_root: PathBuf,
+    metadata: Arc<Mutex<MetadataService>>,
+    invalidations: Arc<Mutex<InvalidationHub>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(result) = receiver.recv().await {
+            let invalidation_events = {
+                let mut metadata = metadata.lock().await;
+                match metadata.apply_notification(&library_root, result) {
+                    Ok((_stats, invalidation_events)) => invalidation_events,
+                    Err(_error) => continue,
+                }
+            };
+
+            if !invalidation_events.is_empty() {
+                let mut hub = invalidations.lock().await;
+                hub.publish_all(invalidation_events);
+            }
+        }
+    })
 }
 
 #[tonic::async_trait]
@@ -272,9 +360,10 @@ fn map_storage_error(error: rusqlite::Error) -> Status {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{fs, path::Path, sync::Arc, time::Duration};
 
     use tokio::net::TcpListener;
+    use tokio::sync::{Mutex, mpsc};
     use tokio_stream::StreamExt;
     use tonic::transport::{Channel, ClientTlsConfig};
 
@@ -284,8 +373,11 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{LiveServer, load_runtime_tls};
-    use crate::{ServerConfig, ensure_server_tls_materials};
+    use super::{LiveServer, load_runtime_tls, spawn_watch_task};
+    use crate::{
+        InvalidationHub, MetadataService, ServerConfig, ensure_server_tls_materials,
+        open_metadata_database, reconcile_library_root,
+    };
 
     #[tokio::test]
     async fn grpc_runtime_serves_attach_and_metadata_requests() {
@@ -413,5 +505,82 @@ mod tests {
             .shutdown()
             .await
             .expect("server should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn watch_task_reconciles_new_file_and_publishes_invalidation() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        let existing_path = library_root.join("Kontakt").join("existing.nki");
+        fs::write(&existing_path, b"existing").expect("existing file should be written");
+
+        let mut connection =
+            open_metadata_database(&fixture.path().join("server.sqlite")).expect("db should open");
+        reconcile_library_root(&mut connection, &library_root)
+            .expect("initial reconcile should succeed");
+
+        let metadata = Arc::new(Mutex::new(MetadataService::new(connection)));
+        let invalidations = Arc::new(Mutex::new(InvalidationHub::new(
+            library_root.to_string_lossy().into_owned(),
+        )));
+        let subscription = invalidations.lock().await.subscribe();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let watch_task = spawn_watch_task(
+            receiver,
+            library_root.clone(),
+            Arc::clone(&metadata),
+            Arc::clone(&invalidations),
+        );
+
+        let new_path = library_root.join("Kontakt").join("new.nki");
+        fs::write(&new_path, b"new file").expect("new file should be written");
+        sender
+            .send(Ok(notify::Event {
+                kind: notify::EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![new_path.clone()],
+                attrs: Default::default(),
+            }))
+            .expect("event should be sent");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let metadata = metadata.lock().await;
+                    if metadata
+                        .stat(StatRequest {
+                            path: new_path.to_string_lossy().into_owned(),
+                        })
+                        .expect("stat should succeed")
+                        .is_some()
+                    {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("watch task should reconcile the new path");
+
+        let queued = invalidations
+            .lock()
+            .await
+            .drain(subscription.subscriber_id)
+            .expect("subscriber should exist");
+        let expected_invalidation_path = new_path
+            .parent()
+            .expect("new file should have a parent directory")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            queued
+                .iter()
+                .any(|event| event.path == expected_invalidation_path),
+            "expected invalidation for {}",
+            expected_invalidation_path
+        );
+
+        watch_task.abort();
     }
 }
