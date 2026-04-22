@@ -10,6 +10,7 @@ version.workspace = true
 legato-client-cache = { path = "../legato-client-cache" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 

@@ -501,6 +501,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 name = "legato-client-cache"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "legato-proto",
  "legato-types",
  "rusqlite",
  "tempfile",
@@ -513,6 +515,7 @@ dependencies = [
  "legato-client-cache",
  "legato-proto",
  "legato-types",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "tempfile",
@@ -549,7 +552,10 @@ dependencies = [
 name = "legato-prefetch"
 version = "0.1.0"
 dependencies = [
+ "legato-client-cache",
+ "legato-client-core",
  "legato-foundation",
+ "legato-proto",
  "legato-types",
  "serde",
 ]

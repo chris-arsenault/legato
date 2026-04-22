@@ -2,9 +2,15 @@
 
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
 
-use legato_client_cache::CacheConfig;
+use legato_client_cache::{
+    BlockCacheStore, CacheConfig, CacheKey, CachedBlock, MetadataCache, MetadataCacheLookup,
+};
 use legato_proto::{
-    AttachRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION, default_capabilities,
+    AttachRequest, FileMetadata, InvalidationEvent, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+    PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
+};
+use legato_types::{
+    BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
 };
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore,
@@ -396,15 +402,346 @@ fn backoff_delay_ms(policy: &RetryPolicy, failure_count: u32) -> u64 {
     delay_ms.min(policy.max_delay_ms)
 }
 
+/// Result of one coordinated read or prefetch planning step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchPlan {
+    /// Blocks already resident in the local cache.
+    pub cached: Vec<CachedBlock>,
+    /// Blocks that still require a server-side transfer.
+    pub missing: Vec<CacheKey>,
+    /// Number of active waiters now attached to the requested keys.
+    pub waiter_count: usize,
+}
+
+/// In-memory coordinator that deduplicates overlapping block fetches.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FetchCoordinator {
+    block_size: u32,
+    inflight_waiters: HashMap<CacheKey, usize>,
+}
+
+impl FetchCoordinator {
+    /// Creates a fetch coordinator for the provided fixed client block size.
+    #[must_use]
+    pub fn new(block_size: u32) -> Self {
+        Self {
+            block_size,
+            inflight_waiters: HashMap::new(),
+        }
+    }
+
+    /// Plans the cache lookups and remote fetches required for one range.
+    pub fn prepare_range(
+        &mut self,
+        store: &mut BlockCacheStore,
+        range: &BlockRange,
+        now_ns: u64,
+    ) -> rusqlite::Result<FetchPlan> {
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        let mut waiter_count = 0;
+
+        for key in self.block_keys(range) {
+            if let Some(block) = store.get_block(&key, now_ns)? {
+                cached.push(block);
+                continue;
+            }
+
+            let waiters = self.inflight_waiters.entry(key.clone()).or_insert(0);
+            *waiters += 1;
+            waiter_count += *waiters;
+            if *waiters == 1 {
+                missing.push(key);
+            }
+        }
+
+        Ok(FetchPlan {
+            cached,
+            missing,
+            waiter_count,
+        })
+    }
+
+    /// Completes one fetched block and records it in the local cache.
+    pub fn complete_block(
+        &mut self,
+        store: &mut BlockCacheStore,
+        key: &CacheKey,
+        data: &[u8],
+        pin_generation: u64,
+        now_ns: u64,
+    ) -> rusqlite::Result<CachedBlock> {
+        self.inflight_waiters.remove(key);
+        store.put_block(key, 1, data, pin_generation, now_ns)
+    }
+
+    fn block_keys(&self, range: &BlockRange) -> Vec<CacheKey> {
+        (0..range.block_count)
+            .map(|index| CacheKey {
+                file_id: range.file_id,
+                start_offset: range.start_offset + u64::from(index) * u64::from(self.block_size),
+            })
+            .collect()
+    }
+}
+
+/// Outcome of one synchronous client-side prefetch execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefetchExecution {
+    /// Ranges accepted by the local executor.
+    pub accepted: Vec<BlockRange>,
+    /// Ranges guaranteed resident for the requested wait-through priority.
+    pub completed: Vec<BlockRange>,
+}
+
+/// Tracks cache residency and executes prefetch requests through the local cache store.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrefetchExecutor {
+    residency: HashMap<CacheKey, PrefetchPriority>,
+    pin_generation: u64,
+}
+
+impl PrefetchExecutor {
+    /// Creates an empty executor.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            residency: HashMap::new(),
+            pin_generation: 0,
+        }
+    }
+
+    /// Executes a prefetch request synchronously using the provided fetch source.
+    pub fn execute_with_source<F>(
+        &mut self,
+        request: &PrefetchRequest,
+        coordinator: &mut FetchCoordinator,
+        store: &mut BlockCacheStore,
+        now_ns: u64,
+        mut source: F,
+    ) -> rusqlite::Result<PrefetchExecution>
+    where
+        F: FnMut(FileId, u64) -> Vec<u8>,
+    {
+        self.pin_generation += 1;
+        store.record_pin(self.pin_generation, "prefetch", now_ns)?;
+
+        let mut accepted = Vec::new();
+        let mut completed = Vec::new();
+
+        for entry in &request.ranges {
+            accepted.push(entry.range.clone());
+            store.record_fetch_state(
+                &entry.range,
+                prefetch_priority_rank(entry.priority),
+                "queued",
+                now_ns,
+            )?;
+
+            let plan = coordinator.prepare_range(store, &entry.range, now_ns)?;
+            for key in plan.missing {
+                let data = source(key.file_id, key.start_offset);
+                let _ =
+                    coordinator.complete_block(store, &key, &data, self.pin_generation, now_ns)?;
+                self.residency.insert(key, entry.priority);
+            }
+
+            for block in plan.cached {
+                self.residency.insert(block.key, entry.priority);
+            }
+
+            store.record_fetch_state(
+                &entry.range,
+                prefetch_priority_rank(entry.priority),
+                "resident",
+                now_ns,
+            )?;
+            if priority_satisfies_wait(entry.priority, request.wait_through) {
+                completed.push(entry.range.clone());
+            }
+        }
+
+        Ok(PrefetchExecution {
+            accepted,
+            completed,
+        })
+    }
+
+    /// Returns whether every block in the range is resident at or above the required priority.
+    #[must_use]
+    pub fn is_range_resident(
+        &self,
+        range: &BlockRange,
+        required_priority: PrefetchPriority,
+        block_size: u32,
+    ) -> bool {
+        (0..range.block_count).all(|index| {
+            let key = CacheKey {
+                file_id: range.file_id,
+                start_offset: range.start_offset + u64::from(index) * u64::from(block_size),
+            };
+            self.residency
+                .get(&key)
+                .is_some_and(|priority| priority_satisfies_wait(*priority, required_priority))
+        })
+    }
+}
+
+/// Local control-plane facade used by `legato-prefetch` and the client runtime.
+#[derive(Clone, Debug)]
+pub struct LocalControlPlane {
+    metadata_cache: MetadataCache,
+    canonical_paths: HashMap<String, FileMetadata>,
+    fetch_coordinator: FetchCoordinator,
+    prefetch_executor: PrefetchExecutor,
+}
+
+impl LocalControlPlane {
+    /// Creates a local control plane with the provided metadata cache and block size.
+    #[must_use]
+    pub fn new(metadata_cache: MetadataCache, block_size: u32) -> Self {
+        Self {
+            metadata_cache,
+            canonical_paths: HashMap::new(),
+            fetch_coordinator: FetchCoordinator::new(block_size),
+            prefetch_executor: PrefetchExecutor::new(),
+        }
+    }
+
+    /// Registers a canonical resolved path for later local prefetch requests.
+    pub fn register_path(&mut self, metadata: FileMetadata, now_ns: u64) {
+        self.metadata_cache
+            .put_stat(&metadata.path, Some(metadata.clone()), now_ns);
+        self.canonical_paths.insert(metadata.path.clone(), metadata);
+    }
+
+    /// Applies an invalidation to the cached metadata state.
+    pub fn apply_invalidation(&mut self, event: &InvalidationEvent) {
+        self.metadata_cache.apply_invalidation(event);
+        self.canonical_paths
+            .retain(|path, _| !path_is_invalidated(path, &event.path));
+    }
+
+    /// Resolves a path through the local metadata cache.
+    pub fn resolve_path(&mut self, path: &str, now_ns: u64) -> Option<FileMetadata> {
+        match self.metadata_cache.stat(path, now_ns) {
+            MetadataCacheLookup::Hit(metadata) => metadata,
+            MetadataCacheLookup::Miss => {
+                let metadata = self.canonical_paths.get(path).cloned();
+                self.metadata_cache.put_stat(path, metadata.clone(), now_ns);
+                metadata
+            }
+        }
+    }
+
+    /// Resolves hint paths and executes prefetch through the local client runtime.
+    pub fn prefetch_paths<F>(
+        &mut self,
+        hints: &[PrefetchHintPath],
+        wait_through: PrefetchPriority,
+        store: &mut BlockCacheStore,
+        now_ns: u64,
+        source: F,
+    ) -> rusqlite::Result<PrefetchExecution>
+    where
+        F: FnMut(FileId, u64) -> Vec<u8>,
+    {
+        let request = PrefetchRequest {
+            ranges: hints
+                .iter()
+                .filter_map(|hint| {
+                    self.resolve_path(hint.path.to_string_lossy().as_ref(), now_ns)
+                        .map(|metadata| PrefetchPlanEntry {
+                            range: BlockRange {
+                                file_id: FileId(metadata.file_id),
+                                start_offset: hint.start_offset,
+                                block_count: hint.block_count,
+                            },
+                            priority: hint.priority,
+                        })
+                })
+                .collect(),
+            wait_through,
+        };
+
+        self.prefetch_executor.execute_with_source(
+            &request,
+            &mut self.fetch_coordinator,
+            store,
+            now_ns,
+            source,
+        )
+    }
+
+    /// Returns whether the supplied range is already resident locally.
+    #[must_use]
+    pub fn is_range_resident(
+        &self,
+        range: &BlockRange,
+        required_priority: PrefetchPriority,
+    ) -> bool {
+        self.prefetch_executor.is_range_resident(
+            range,
+            required_priority,
+            self.fetch_coordinator.block_size,
+        )
+    }
+}
+
+/// Converts a local prefetch priority into the protobuf wire representation.
+#[must_use]
+pub fn proto_prefetch_priority(priority: PrefetchPriority) -> i32 {
+    match priority {
+        PrefetchPriority::P0 => ProtoPrefetchPriority::P0 as i32,
+        PrefetchPriority::P1 => ProtoPrefetchPriority::P1 as i32,
+        PrefetchPriority::P2 => ProtoPrefetchPriority::P2 as i32,
+        PrefetchPriority::P3 => ProtoPrefetchPriority::P3 as i32,
+    }
+}
+
+fn prefetch_priority_rank(priority: PrefetchPriority) -> i32 {
+    proto_prefetch_priority(priority)
+}
+
+fn priority_satisfies_wait(priority: PrefetchPriority, wait_through: PrefetchPriority) -> bool {
+    prefetch_priority_ordinal(priority) <= prefetch_priority_ordinal(wait_through)
+}
+
+fn prefetch_priority_ordinal(priority: PrefetchPriority) -> u8 {
+    match priority {
+        PrefetchPriority::P0 => 0,
+        PrefetchPriority::P1 => 1,
+        PrefetchPriority::P2 => 2,
+        PrefetchPriority::P3 => 3,
+    }
+}
+
+fn path_is_invalidated(path: &str, invalidated_root: &str) -> bool {
+    path == invalidated_root
+        || path
+            .strip_prefix(invalidated_root)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::{
-        ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, ReconnectPlan, RetryPolicy,
+        ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, FetchCoordinator,
+        LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RetryPolicy,
         SessionStatus, build_tls_client_config,
     };
-    use legato_proto::{OpenRequest, OpenResponse, PROTOCOL_VERSION};
+    use legato_client_cache::{
+        BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
+    };
+    use legato_proto::{
+        FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse,
+        PROTOCOL_VERSION,
+    };
+    use legato_types::{
+        BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
+    };
     use tempfile::tempdir;
 
     const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIC/zCCAeegAwIBAgIUKWr7nJpAOz9K1vWUN3gheRvIy/8wDQYJKoZIhvcNAQEL\nBQAwDzENMAsGA1UEAwwEdGVzdDAeFw0yNjA0MjIwMDU0MDlaFw0yNzA0MjIwMDU0\nMDlaMA8xDTALBgNVBAMMBHRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK\nAoIBAQDEIfTpZUMQggMrqrDW9DMykuBUtQs7C0MAzs/WZjxTYaPfiONPYOvJ3n+e\nruGti/ypIxNijZPksrINYbh5PQpZ+Vo+bJml2K0S0d3EwDGEfLVEC8JNYUgKbCdZ\nvGuno/2KT4d5NnJNtVkxGZFh4KTFnpwhhbJH7lGt2VbvXLcJtQM+vgHpihz6QZxX\nR+L+LSNmaM8MZxU8MtbdyLKdey745osovkjdi+IKmkXb0ySra1fzgmXDaWMThOXy\nTh5UuD5n0RuUf5U9kRrpNc2/WxKx60mqdVA0BPHpOZyvEH9Nop9ZctVF1WKUGAzf\nvEYfeo2/OVW/+l1owNSb1CGWBcglAgMBAAGjUzBRMB0GA1UdDgQWBBQTHES/FEdh\nBSSzvS3vdZyNTnqunzAfBgNVHSMEGDAWgBQTHES/FEdhBSSzvS3vdZyNTnqunzAP\nBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBnXNfXPXQ8l89Cmy7D\ntoRjdWhPc1auU6U6LmZME5TcrQsDTEUlux2u4C2X+qTygZY/bJT8aum4D9LJlEh2\nY8tr/8yz2+jcoNu+tDmHs/OTTUuJfw03Gztbj/m0+nZBPEhmU2VK+t5SWUuJen+3\nEnE5oP2jByDR9AR/z9QPUqDgvP8wsuAvZ6mSZoP9iF3AGNLY8OF9j0BLBXSwHGkM\ncHJsVQvNJ+BOpn6KxsLxLl8DG4fwQ9RCBdhrSr3gQxYMWNnLmqbpeGDE+wQQWDEM\nPSvoKbrOwJyAO8RYUTTG0shPGm5J7tb1ZBJfITtfS4uNBRU8RLpDXFXk1hTKys+y\nEnAC\n-----END CERTIFICATE-----\n";
@@ -552,6 +889,214 @@ mod tests {
         assert!(
             matches!(error, ClientTlsError::MissingCaBundle(_)),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn fetch_coordinator_deduplicates_overlapping_ranges() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+            .expect("store should open");
+        let mut coordinator = FetchCoordinator::new(4096);
+
+        let first = coordinator
+            .prepare_range(
+                &mut store,
+                &BlockRange {
+                    file_id: FileId(7),
+                    start_offset: 0,
+                    block_count: 2,
+                },
+                100,
+            )
+            .expect("first fetch plan should succeed");
+        assert_eq!(first.missing.len(), 2);
+
+        let second = coordinator
+            .prepare_range(
+                &mut store,
+                &BlockRange {
+                    file_id: FileId(7),
+                    start_offset: 4096,
+                    block_count: 2,
+                },
+                100,
+            )
+            .expect("second fetch plan should succeed");
+        assert_eq!(
+            second.missing,
+            vec![legato_client_cache::CacheKey {
+                file_id: FileId(7),
+                start_offset: 8192,
+            }]
+        );
+
+        let _ = coordinator
+            .complete_block(
+                &mut store,
+                &legato_client_cache::CacheKey {
+                    file_id: FileId(7),
+                    start_offset: 0,
+                },
+                b"abcd",
+                1,
+                100,
+            )
+            .expect("completed block should persist");
+        let cached = coordinator
+            .prepare_range(
+                &mut store,
+                &BlockRange {
+                    file_id: FileId(7),
+                    start_offset: 0,
+                    block_count: 1,
+                },
+                200,
+            )
+            .expect("cached fetch plan should succeed");
+        assert_eq!(cached.cached.len(), 1);
+        assert!(cached.missing.is_empty());
+    }
+
+    #[test]
+    fn prefetch_executor_tracks_residency_by_priority() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+            .expect("store should open");
+        let mut coordinator = FetchCoordinator::new(4096);
+        let mut executor = PrefetchExecutor::new();
+        let request = PrefetchRequest {
+            ranges: vec![
+                PrefetchPlanEntry {
+                    range: BlockRange {
+                        file_id: FileId(7),
+                        start_offset: 0,
+                        block_count: 2,
+                    },
+                    priority: PrefetchPriority::P0,
+                },
+                PrefetchPlanEntry {
+                    range: BlockRange {
+                        file_id: FileId(7),
+                        start_offset: 8192,
+                        block_count: 1,
+                    },
+                    priority: PrefetchPriority::P2,
+                },
+            ],
+            wait_through: PrefetchPriority::P1,
+        };
+
+        let execution = executor
+            .execute_with_source(
+                &request,
+                &mut coordinator,
+                &mut store,
+                100,
+                |_file_id, offset| format!("block-{offset}").into_bytes(),
+            )
+            .expect("prefetch execution should succeed");
+
+        assert_eq!(execution.accepted.len(), 2);
+        assert_eq!(execution.completed.len(), 1);
+        assert!(executor.is_range_resident(
+            &BlockRange {
+                file_id: FileId(7),
+                start_offset: 0,
+                block_count: 2,
+            },
+            PrefetchPriority::P1,
+            4096,
+        ));
+        assert!(!executor.is_range_resident(
+            &BlockRange {
+                file_id: FileId(7),
+                start_offset: 8192,
+                block_count: 1,
+            },
+            PrefetchPriority::P1,
+            4096,
+        ));
+    }
+
+    #[test]
+    fn local_control_plane_resolves_paths_prefetches_and_refreshes_on_invalidation() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+            .expect("store should open");
+        let mut control =
+            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 4096);
+        control.register_path(
+            FileMetadata {
+                file_id: 7,
+                path: String::from("/srv/libraries/Kontakt/piano.nki"),
+                size: 8192,
+                mtime_ns: 10,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 4096,
+            },
+            100,
+        );
+
+        let resolved = control
+            .resolve_path("/srv/libraries/Kontakt/piano.nki", 101)
+            .expect("path should resolve");
+        assert_eq!(resolved.file_id, 7);
+
+        let execution = control
+            .prefetch_paths(
+                &[PrefetchHintPath {
+                    path: "/srv/libraries/Kontakt/piano.nki".into(),
+                    start_offset: 0,
+                    block_count: 2,
+                    priority: PrefetchPriority::P0,
+                }],
+                PrefetchPriority::P1,
+                &mut store,
+                200,
+                |_file_id, offset| format!("prefetch-{offset}").into_bytes(),
+            )
+            .expect("control-plane prefetch should succeed");
+        assert_eq!(
+            execution,
+            PrefetchExecution {
+                accepted: vec![BlockRange {
+                    file_id: FileId(7),
+                    start_offset: 0,
+                    block_count: 2,
+                }],
+                completed: vec![BlockRange {
+                    file_id: FileId(7),
+                    start_offset: 0,
+                    block_count: 2,
+                }],
+            }
+        );
+        assert!(control.is_range_resident(
+            &BlockRange {
+                file_id: FileId(7),
+                start_offset: 0,
+                block_count: 2,
+            },
+            PrefetchPriority::P1,
+        ));
+
+        control.apply_invalidation(&InvalidationEvent {
+            kind: InvalidationKind::File as i32,
+            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+            file_id: 7,
+        });
+        assert!(
+            control
+                .resolve_path("/srv/libraries/Kontakt/piano.nki", 201)
+                .is_none()
         );
     }
 }
