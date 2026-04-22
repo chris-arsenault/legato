@@ -5,8 +5,9 @@ use std::{
     time::Duration,
 };
 
+use legato_proto::{InvalidationEvent, InvalidationKind};
 use notify::{Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Result, Watcher};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{ReconcileStats, reconcile_library_root, reconcile_paths};
 
@@ -90,6 +91,25 @@ pub fn apply_notification_result(
     }
 }
 
+/// Converts a planned notification action into client-facing invalidations.
+pub fn invalidation_events_for_action(
+    connection: &Connection,
+    library_root: &Path,
+    action: &NotificationAction,
+) -> rusqlite::Result<Vec<InvalidationEvent>> {
+    match action {
+        NotificationAction::FullRescan => Ok(vec![build_invalidation(
+            connection,
+            library_root,
+            InvalidationKind::Subtree,
+        )?]),
+        NotificationAction::Paths(paths) => paths
+            .iter()
+            .map(|path| build_invalidation(connection, path, InvalidationKind::Subtree))
+            .collect(),
+    }
+}
+
 fn normalize_event_path(library_root: &Path, path: &Path) -> Option<PathBuf> {
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -111,17 +131,72 @@ fn normalize_event_path(library_root: &Path, path: &Path) -> Option<PathBuf> {
     }
 }
 
+fn build_invalidation(
+    connection: &Connection,
+    path: &Path,
+    fallback_kind: InvalidationKind,
+) -> rusqlite::Result<InvalidationEvent> {
+    let normalized_path = path.to_string_lossy().into_owned();
+    let metadata = lookup_invalidation_metadata(connection, &normalized_path)?;
+
+    Ok(InvalidationEvent {
+        kind: metadata
+            .as_ref()
+            .map_or(fallback_kind as i32, |metadata| metadata.kind as i32),
+        path: normalized_path,
+        file_id: metadata.map_or(0, |metadata| metadata.file_id),
+    })
+}
+
+fn lookup_invalidation_metadata(
+    connection: &Connection,
+    path: &str,
+) -> rusqlite::Result<Option<InvalidationMetadata>> {
+    if let Some(directory_id) = connection
+        .query_row(
+            "SELECT directory_id FROM directories WHERE path = ?1",
+            [path],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(InvalidationMetadata {
+            kind: InvalidationKind::Directory,
+            file_id: directory_id as u64,
+        }));
+    }
+
+    connection
+        .query_row("SELECT file_id FROM files WHERE path = ?1", [path], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map(|metadata| {
+            metadata.map(|file_id| InvalidationMetadata {
+                kind: InvalidationKind::File,
+                file_id: file_id as u64,
+            })
+        })
+}
+
+struct InvalidationMetadata {
+    kind: InvalidationKind,
+    file_id: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path, time::Duration};
 
+    use legato_proto::InvalidationKind;
     use notify::{Event, EventKind};
     use tempfile::tempdir;
 
     use super::{
-        NotificationAction, WatchBackend, apply_notification_result, plan_notification_result,
+        NotificationAction, WatchBackend, apply_notification_result,
+        invalidation_events_for_action, plan_notification_result,
     };
-    use crate::open_metadata_database;
+    use crate::{open_metadata_database, reconcile_library_root};
 
     #[test]
     fn notification_errors_force_full_rescan() {
@@ -192,5 +267,53 @@ mod tests {
                 interval: Duration::from_secs(5)
             }
         );
+    }
+
+    #[test]
+    fn invalidation_actions_expand_to_subtree_and_file_events() {
+        let fixture = tempdir().expect("fixture tempdir should be created");
+        let library_root = fixture.path().join("libraries");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        let file_path = library_root.join("Kontakt").join("piano.nki");
+        fs::write(&file_path, "fixture").expect("fixture file should be written");
+
+        let mut connection =
+            open_metadata_database(&fixture.path().join("server.sqlite")).expect("db should open");
+        reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
+
+        let full_rescan_events = invalidation_events_for_action(
+            &connection,
+            &library_root,
+            &NotificationAction::FullRescan,
+        )
+        .expect("full rescan invalidation should succeed");
+        assert_eq!(full_rescan_events.len(), 1);
+        assert_eq!(
+            full_rescan_events[0].kind,
+            InvalidationKind::Directory as i32
+        );
+        assert_eq!(
+            full_rescan_events[0].path,
+            library_root.to_string_lossy().as_ref()
+        );
+
+        let file_events = invalidation_events_for_action(
+            &connection,
+            &library_root,
+            &NotificationAction::Paths(vec![file_path.clone()]),
+        )
+        .expect("file invalidation should succeed");
+        assert_eq!(file_events.len(), 1);
+        assert_eq!(file_events[0].kind, InvalidationKind::File as i32);
+        assert_eq!(file_events[0].path, file_path.to_string_lossy().as_ref());
+
+        let missing_events = invalidation_events_for_action(
+            &connection,
+            &library_root,
+            &NotificationAction::Paths(vec![library_root.join("Missing")]),
+        )
+        .expect("missing path invalidation should succeed");
+        assert_eq!(missing_events.len(), 1);
+        assert_eq!(missing_events[0].kind, InvalidationKind::Subtree as i32);
     }
 }

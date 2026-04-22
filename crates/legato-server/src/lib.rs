@@ -2,6 +2,7 @@
 
 mod api;
 mod index;
+mod invalidation;
 mod schema;
 mod watcher;
 
@@ -9,13 +10,14 @@ use std::{fs, path::Path};
 
 pub use api::MetadataService;
 pub use index::{ReconcileStats, reconcile_library_root, reconcile_paths};
+pub use invalidation::{InvalidationHub, InvalidationSubscription, subtree_invalidation};
 use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
 use serde::Deserialize;
 pub use watcher::{
     NotificationAction, WatchBackend, apply_notification_result, create_poll_watcher,
-    create_recommended_watcher, plan_notification_result,
+    create_recommended_watcher, invalidation_events_for_action, plan_notification_result,
 };
 
 /// Immutable bootstrap configuration for the server daemon.
