@@ -79,7 +79,9 @@ where
                     "--name" => name = arguments.next(),
                     "--output-dir" => output_dir = arguments.next().map(PathBuf::from),
                     other => {
-                        return Err(format!("unsupported argument for issue-client: {other}").into());
+                        return Err(
+                            format!("unsupported argument for issue-client: {other}").into()
+                        );
                     }
                 }
             }
@@ -119,14 +121,17 @@ mod tests {
 
     use super::{Command, parse_command_impl};
 
-    fn parse_command_from<I, S>(
-        arguments: I,
-    ) -> Result<Option<Command>, Box<dyn std::error::Error>>
+    fn parse_command_from<I, S>(arguments: I) -> Result<Option<Command>, Box<dyn std::error::Error>>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        parse_command_impl(arguments.into_iter().map(Into::into).collect::<Vec<String>>())
+        parse_command_impl(
+            arguments
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<String>>(),
+        )
     }
 
     #[test]

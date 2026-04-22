@@ -117,7 +117,11 @@ impl std::fmt::Display for TlsConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { path, source } => {
-                write!(formatter, "tls file IO failed for {}: {source}", path.display())
+                write!(
+                    formatter,
+                    "tls file IO failed for {}: {source}",
+                    path.display()
+                )
             }
             Self::Pem { path, source } => {
                 write!(
@@ -217,8 +221,8 @@ pub fn issue_client_tls_bundle(
 
     let issuer = load_ca_issuer(&paths.server_ca_cert_path, &paths.server_ca_key_path)?;
     let client_key = KeyPair::generate().map_err(TlsConfigError::Rcgen)?;
-    let mut client_params = CertificateParams::new(vec![client_name.to_owned()])
-        .map_err(TlsConfigError::Rcgen)?;
+    let mut client_params =
+        CertificateParams::new(vec![client_name.to_owned()]).map_err(TlsConfigError::Rcgen)?;
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, client_name);
     distinguished_name.push(DnType::OrganizationName, "Legato");
@@ -227,11 +231,7 @@ pub fn issue_client_tls_bundle(
         .signed_by(&client_key, &issuer)
         .map_err(TlsConfigError::Rcgen)?;
 
-    write_file(
-        &output_dir.join("client.pem"),
-        client_cert.pem(),
-        0o644,
-    )?;
+    write_file(&output_dir.join("client.pem"), client_cert.pem(), 0o644)?;
     write_file(
         &output_dir.join("client-key.pem"),
         client_key.serialize_pem(),
@@ -368,7 +368,10 @@ fn generate_server_tls_materials(
     Ok(())
 }
 
-fn load_ca_issuer(cert_path: &Path, key_path: &Path) -> Result<Issuer<'static, KeyPair>, TlsConfigError> {
+fn load_ca_issuer(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Issuer<'static, KeyPair>, TlsConfigError> {
     let cert_pem = fs::read_to_string(cert_path).map_err(|source| TlsConfigError::Io {
         path: cert_path.to_path_buf(),
         source,
@@ -467,7 +470,11 @@ mod tests {
         let error = build_tls_server_config(&config).expect_err("missing files should fail");
         match error {
             TlsConfigError::Io { path, .. } => {
-                assert!(path.ends_with("server.pem"), "unexpected path: {}", path.display());
+                assert!(
+                    path.ends_with("server.pem"),
+                    "unexpected path: {}",
+                    path.display()
+                );
             }
             other => panic!("unexpected error: {other}"),
         }
