@@ -1,5 +1,7 @@
 //! Shared runtime state for native Legato clients.
 
+mod transport;
+
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
 
 use legato_client_cache::{
@@ -17,6 +19,8 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use serde::{Deserialize, Serialize};
+
+pub use transport::{ClientAttachSession, ClientTransportError, GrpcClientTransport};
 
 /// Immutable settings used to bootstrap a client runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

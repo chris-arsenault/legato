@@ -1,12 +1,13 @@
 //! Binary entrypoint for the native Legato filesystem client.
 
 use std::{
+    env,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::{BlockCacheStore, open_cache_database};
-use legato_client_core::{ClientConfig, ClientRuntime, LocalControlPlane};
+use legato_client_core::{ClientConfig, GrpcClientTransport, LocalControlPlane};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
@@ -54,7 +55,8 @@ struct StartupContext {
     semantics: FilesystemSemantics,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_config =
         load_config::<ClientProcessConfig>(Some(default_config_path()), "LEGATO_FS")
             .unwrap_or_else(|_| ClientProcessConfig::default());
@@ -65,35 +67,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
 
-    let runtime = ClientRuntime::new(process_config.client.clone());
     let startup = startup_context(&process_config.mount);
     let control = control_plane_for_mount(&process_config.mount, startup.semantics)?;
+    let client_name = default_client_name();
+    let transport =
+        GrpcClientTransport::connect(process_config.client.clone(), &client_name).await?;
+    let attach = transport.attach_session().clone();
 
     #[cfg(target_os = "macos")]
     {
-        let adapter = legato_fs_macos::MacosFilesystem::new(runtime, startup.mount_point.clone());
+        let adapter = legato_fs_macos::MacosFilesystem::new(
+            transport.runtime().clone(),
+            startup.mount_point.clone(),
+        );
         let _ = &mut control;
         telemetry.set_lifecycle_state("ready", 1);
-        println!("legatofs bootstrap ready for {}", adapter.platform_name());
+        println!(
+            "legatofs connected to {} and bootstrap ready for {}",
+            attach.server_name,
+            adapter.platform_name()
+        );
         return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        let adapter =
-            legato_fs_windows::WindowsFilesystem::new(runtime, startup.mount_point.clone());
+        let adapter = legato_fs_windows::WindowsFilesystem::new(
+            transport.runtime().clone(),
+            startup.mount_point.clone(),
+        );
         let _ = &mut control;
         telemetry.set_lifecycle_state("ready", 1);
-        println!("legatofs bootstrap ready for {}", adapter.platform_name());
+        println!(
+            "legatofs connected to {} and bootstrap ready for {}",
+            attach.server_name,
+            adapter.platform_name()
+        );
         return Ok(());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = runtime;
+        let _ = transport;
         let _ = control;
         telemetry.set_lifecycle_state("ready", 1);
-        println!("legatofs bootstrap ready for unsupported-host development");
+        println!(
+            "legatofs connected to {} and bootstrap ready for unsupported-host development",
+            attach.server_name
+        );
         Ok(())
     }
 }
@@ -204,11 +225,20 @@ fn default_state_dir() -> String {
     }
 }
 
+fn default_client_name() -> String {
+    env::var("LEGATO_CLIENT_NAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .or_else(|_| env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from("legatofs"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientProcessConfig, MountConfig, default_config_path, default_mount_point,
-        mount_root_attributes, startup_context,
+        ClientProcessConfig, MountConfig, default_client_name, default_config_path,
+        default_mount_point, mount_root_attributes, startup_context,
     };
     use legato_types::{FilesystemOperation, FilesystemSemantics};
 
@@ -240,5 +270,10 @@ mod tests {
     #[test]
     fn default_config_path_is_present_for_platform() {
         assert!(!default_config_path().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn default_client_name_is_present() {
+        assert!(!default_client_name().trim().is_empty());
     }
 }

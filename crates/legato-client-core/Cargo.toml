@@ -14,9 +14,13 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["time"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+legato-server = { path = "../legato-server" }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

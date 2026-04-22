@@ -881,12 +881,15 @@ version = "0.1.0"
 dependencies = [
  "legato-client-cache",
  "legato-proto",
+ "legato-server",
  "legato-types",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
  "serde",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -991,6 +994,7 @@ dependencies = [
  "legato-proto",
  "legato-types",
  "serde",
+ "tokio",
 ]
 
 [[package]]
