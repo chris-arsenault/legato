@@ -26,6 +26,12 @@ This document is the MVP deployment and recovery guide for running Legato as a D
 
 For the current `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`.
 
+The canonical host-to-container mount mapping for that layout is:
+
+- `/mnt/apps/shares/legato` -> `/srv/libraries` (read-only)
+- `/mnt/apps/apps/legato` -> `/var/lib/legato`
+- `/mnt/apps/apps/legato/config` -> `/etc/legato` (read-only)
+
 Run it through `bash` on the TrueNAS host, not as a directly executed file from `/mnt/...`, because SCALE commonly applies execution restrictions to dataset-backed paths:
 
 ```bash

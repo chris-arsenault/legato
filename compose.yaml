@@ -9,6 +9,6 @@ services:
     ports:
       - "7823:7823"
     volumes:
-      - /mnt/pool/libraries:/srv/libraries:ro
-      - /mnt/pool/appdata/legato:/var/lib/legato
-      - /mnt/pool/appdata/legato/config:/etc/legato:ro
+      - /mnt/apps/shares/legato:/srv/libraries:ro
+      - /mnt/apps/apps/legato:/var/lib/legato
+      - /mnt/apps/apps/legato/config:/etc/legato:ro
