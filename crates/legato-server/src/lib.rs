@@ -4,6 +4,7 @@ mod api;
 mod index;
 mod invalidation;
 mod schema;
+mod tls;
 mod watcher;
 
 use std::{fs, path::Path};
@@ -15,6 +16,7 @@ use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
 use serde::Deserialize;
+pub use tls::{ServerTlsConfig, TlsConfigError, build_tls_server_config};
 pub use watcher::{
     NotificationAction, WatchBackend, apply_notification_result, create_poll_watcher,
     create_recommended_watcher, invalidation_events_for_action, plan_notification_result,
@@ -31,6 +33,9 @@ pub struct ServerConfig {
     pub state_dir: String,
     /// Directory containing mounted TLS materials.
     pub tls_dir: String,
+    /// TLS certificate and mTLS trust material used by the listener.
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +45,7 @@ impl Default for ServerConfig {
             library_root: String::from("/srv/libraries"),
             state_dir: String::from("/var/lib/legato"),
             tls_dir: String::from("/etc/legato/certs"),
+            tls: ServerTlsConfig::default(),
         }
     }
 }

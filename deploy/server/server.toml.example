@@ -11,3 +11,8 @@ bind_address = "0.0.0.0:7823"
 library_root = "/srv/libraries"
 state_dir = "/var/lib/legato"
 tls_dir = "/etc/legato/certs"
+
+[server.tls]
+cert_path = "/etc/legato/certs/server.pem"
+key_path = "/etc/legato/certs/server-key.pem"
+client_ca_path = "/etc/legato/certs/client-ca.pem"
