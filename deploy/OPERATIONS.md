@@ -55,7 +55,35 @@ That writes:
 - `client-key.pem`
 - `server-ca.pem`
 
-You can then copy that bundle to the client machine's Legato config root.
+You can then copy that bundle to the client machine and install it with `legatofs` itself instead of manually placing certs and writing config:
+
+```bash
+legatofs install \
+  --bundle-dir /tmp/studio-mac \
+  --endpoint legato.lan:7823 \
+  --server-name legato.lan \
+  --mount-point /Volumes/Legato
+```
+
+For Windows, pass a Windows state or mount path as needed:
+
+```powershell
+legatofs.exe install `
+  --bundle-dir C:\Temp\studio-win `
+  --endpoint legato.lan:7823 `
+  --server-name legato.lan `
+  --mount-point L:\Legato
+```
+
+The install command creates:
+
+- `legatofs.toml`
+- `certs/server-ca.pem`
+- `certs/client.pem`
+- `certs/client-key.pem`
+- `blocks/`
+
+under the platform-default state directory unless `--state-dir` is explicitly provided.
 
 Run it through `bash` on the TrueNAS host, not as a directly executed file from `/mnt/...`, because SCALE commonly applies execution restrictions to dataset-backed paths:
 
@@ -91,10 +119,11 @@ Recommended overrides for production:
 Client validation flow:
 
 1. Install the native binary.
-2. Provide client certificate, key, and server CA.
-3. Start the mount agent.
-4. Verify the mount root appears and resolves indexed paths.
-5. Run `legato-prefetch analyze <project>` against one representative session.
+2. Issue a bundle from the server with `legato-server issue-client`.
+3. Run `legatofs install` with the bundle plus endpoint settings.
+4. Start the mount agent.
+5. Verify the mount root appears and resolves indexed paths.
+6. Run `legato-prefetch analyze <project>` against one representative session.
 
 ## Observability
 

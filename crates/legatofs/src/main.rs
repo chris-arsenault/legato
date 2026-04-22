@@ -1,7 +1,7 @@
 //! Binary entrypoint for the native Legato filesystem client.
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -57,6 +57,10 @@ struct StartupContext {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(command) = parse_command()? {
+        return run_command(command);
+    }
+
     let process_config =
         load_config::<ClientProcessConfig>(Some(default_config_path()), "LEGATO_FS")
             .unwrap_or_else(|_| ClientProcessConfig::default());
@@ -116,6 +120,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_name
         );
         Ok(())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Command {
+    Install {
+        bundle_dir: PathBuf,
+        endpoint: String,
+        server_name: String,
+        mount_point: String,
+        state_dir: PathBuf,
+        library_root: String,
+        force: bool,
+    },
+}
+
+fn parse_command() -> Result<Option<Command>, Box<dyn std::error::Error>> {
+    parse_command_impl(env::args().skip(1))
+}
+
+fn parse_command_impl<I>(arguments: I) -> Result<Option<Command>, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut arguments = arguments.into_iter();
+    let Some(command) = arguments.next() else {
+        return Ok(None);
+    };
+
+    match command.as_str() {
+        "install" => {
+            let mut bundle_dir = None;
+            let mut endpoint = None;
+            let mut server_name = None;
+            let mut mount_point = None;
+            let mut state_dir = None;
+            let mut library_root = None;
+            let mut force = false;
+
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--bundle-dir" => bundle_dir = arguments.next().map(PathBuf::from),
+                    "--endpoint" => endpoint = arguments.next(),
+                    "--server-name" => server_name = arguments.next(),
+                    "--mount-point" => mount_point = arguments.next(),
+                    "--state-dir" => state_dir = arguments.next().map(PathBuf::from),
+                    "--library-root" => library_root = arguments.next(),
+                    "--force" => force = true,
+                    other => {
+                        return Err(format!("unsupported argument for install: {other}").into());
+                    }
+                }
+            }
+
+            Ok(Some(Command::Install {
+                bundle_dir: bundle_dir.ok_or("missing --bundle-dir for install")?,
+                endpoint: endpoint.ok_or("missing --endpoint for install")?,
+                server_name: server_name.ok_or("missing --server-name for install")?,
+                mount_point: mount_point.unwrap_or_else(default_mount_point),
+                state_dir: state_dir.unwrap_or_else(|| PathBuf::from(default_state_dir())),
+                library_root: library_root.unwrap_or_else(default_library_root),
+                force,
+            }))
+        }
+        other => Err(format!("unsupported legatofs command: {other}").into()),
+    }
+}
+
+fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        Command::Install {
+            bundle_dir,
+            endpoint,
+            server_name,
+            mount_point,
+            state_dir,
+            library_root,
+            force,
+        } => {
+            install_client_bundle(
+                &bundle_dir,
+                &state_dir,
+                &endpoint,
+                &server_name,
+                &mount_point,
+                &library_root,
+                force,
+            )?;
+            println!(
+                "installed Legato client config into {}",
+                state_dir.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -225,6 +323,92 @@ fn default_state_dir() -> String {
     }
 }
 
+fn install_client_bundle(
+    bundle_dir: &Path,
+    state_dir: &Path,
+    endpoint: &str,
+    server_name: &str,
+    mount_point: &str,
+    library_root: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cert_dir = state_dir.join("certs");
+    fs::create_dir_all(&cert_dir)?;
+    fs::create_dir_all(state_dir.join("blocks"))?;
+
+    copy_required_bundle_file(bundle_dir, &cert_dir, "server-ca.pem")?;
+    copy_required_bundle_file(bundle_dir, &cert_dir, "client.pem")?;
+    copy_required_bundle_file(bundle_dir, &cert_dir, "client-key.pem")?;
+
+    let config_path = state_dir.join("legatofs.toml");
+    if config_path.exists() && !force {
+        return Err(format!(
+            "config already exists at {}; rerun with --force to overwrite",
+            config_path.display()
+        )
+        .into());
+    }
+
+    fs::write(
+        &config_path,
+        render_client_config(state_dir, endpoint, server_name, mount_point, library_root),
+    )?;
+    Ok(())
+}
+
+fn copy_required_bundle_file(
+    bundle_dir: &Path,
+    cert_dir: &Path,
+    file_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = bundle_dir.join(file_name);
+    if !source.exists() {
+        return Err(format!("bundle file is missing: {}", source.display()).into());
+    }
+    fs::copy(&source, cert_dir.join(file_name))?;
+    Ok(())
+}
+
+fn render_client_config(
+    state_dir: &Path,
+    endpoint: &str,
+    server_name: &str,
+    mount_point: &str,
+    library_root: &str,
+) -> String {
+    let state_dir_path = state_dir.to_path_buf();
+    let state_dir = config_literal_path(&state_dir_path);
+    let ca_cert_path = config_literal_path(&state_dir_path.join("certs").join("server-ca.pem"));
+    let client_cert_path = config_literal_path(&state_dir_path.join("certs").join("client.pem"));
+    let client_key_path = config_literal_path(&state_dir_path.join("certs").join("client-key.pem"));
+    let mount_point = config_literal_string(mount_point);
+    let library_root = config_literal_string(library_root);
+    let server_name = config_literal_string(server_name);
+    let endpoint = config_literal_string(endpoint);
+
+    format!(
+        "[common.tracing]\njson = false\nlevel = \"info\"\n\n\
+         [common.metrics]\nprefix = \"legatofs\"\n\n\
+         [client]\nendpoint = \"{endpoint}\"\n\n\
+         [client.cache]\nmax_bytes = 1610612736000\nblock_size = 1048576\n\n\
+         [client.tls]\nca_cert_path = \"{ca_cert_path}\"\n\
+         client_cert_path = \"{client_cert_path}\"\n\
+         client_key_path = \"{client_key_path}\"\n\
+         server_name = \"{server_name}\"\n\n\
+         [client.retry]\ninitial_delay_ms = 250\nmax_delay_ms = 5000\nmultiplier = 2\n\n\
+         [mount]\nmount_point = \"{mount_point}\"\nlibrary_root = \"{library_root}\"\n\
+         state_dir = \"{state_dir}\"\n"
+    )
+}
+
+fn config_literal_path(path: &Path) -> String {
+    config_literal_string(path.to_string_lossy().as_ref())
+}
+
+fn config_literal_string(value: &str) -> String {
+    value.replace('\\', "\\\\")
+}
+
 fn default_client_name() -> String {
     env::var("LEGATO_CLIENT_NAME")
         .or_else(|_| env::var("HOSTNAME"))
@@ -236,11 +420,15 @@ fn default_client_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::{
-        ClientProcessConfig, MountConfig, default_client_name, default_config_path,
-        default_mount_point, mount_root_attributes, startup_context,
+        ClientProcessConfig, Command, MountConfig, default_client_name, default_config_path,
+        default_mount_point, install_client_bundle, mount_root_attributes, parse_command_impl,
+        startup_context,
     };
     use legato_types::{FilesystemOperation, FilesystemSemantics};
+    use tempfile::tempdir;
 
     #[test]
     fn mount_config_defaults_are_present() {
@@ -275,5 +463,69 @@ mod tests {
     #[test]
     fn default_client_name_is_present() {
         assert!(!default_client_name().trim().is_empty());
+    }
+
+    #[test]
+    fn parse_install_command() {
+        let command = parse_command_impl([
+            String::from("install"),
+            String::from("--bundle-dir"),
+            String::from("/tmp/bundle"),
+            String::from("--endpoint"),
+            String::from("legato.lan:7823"),
+            String::from("--server-name"),
+            String::from("legato.lan"),
+            String::from("--mount-point"),
+            String::from("/Volumes/Legato"),
+            String::from("--state-dir"),
+            String::from("/tmp/legato-state"),
+            String::from("--library-root"),
+            String::from("/srv/libraries"),
+            String::from("--force"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Install {
+                bundle_dir: PathBuf::from("/tmp/bundle"),
+                endpoint: String::from("legato.lan:7823"),
+                server_name: String::from("legato.lan"),
+                mount_point: String::from("/Volumes/Legato"),
+                state_dir: PathBuf::from("/tmp/legato-state"),
+                library_root: String::from("/srv/libraries"),
+                force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn install_command_writes_config_and_cert_materials() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let bundle_dir = fixture.path().join("bundle");
+        let state_dir = fixture.path().join("state");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be created");
+        fs::write(bundle_dir.join("server-ca.pem"), "ca").expect("server ca should be written");
+        fs::write(bundle_dir.join("client.pem"), "client").expect("client cert should be written");
+        fs::write(bundle_dir.join("client-key.pem"), "key").expect("client key should be written");
+
+        install_client_bundle(
+            &bundle_dir,
+            &state_dir,
+            "legato.lan:7823",
+            "legato.lan",
+            "/Volumes/Legato",
+            "/srv/libraries",
+            false,
+        )
+        .expect("install should succeed");
+
+        let config =
+            fs::read_to_string(state_dir.join("legatofs.toml")).expect("config should be readable");
+        assert!(config.contains("endpoint = \"legato.lan:7823\""));
+        assert!(state_dir.join("certs").join("server-ca.pem").exists());
+        assert!(state_dir.join("certs").join("client.pem").exists());
+        assert!(state_dir.join("certs").join("client-key.pem").exists());
+        assert!(state_dir.join("blocks").exists());
     }
 }

@@ -28,7 +28,9 @@ This document defines the installation and upgrade shape for the native Legato c
 - Default installed config: `/Library/Application Support/Legato/legatofs.toml`
 - Installer build script: `deploy/client/package-macos.sh`
 - Installer output: `artifacts/macos/*.pkg`
-- Startup model: packaged binary and config assets today; service registration remains a later step once the runtime is a persistent mount daemon
+- Client-bundle install command:
+  `legatofs install --bundle-dir <bundle> --endpoint <host:port> --server-name <dns-name> --mount-point /Volumes/Legato`
+- Startup model: packaged binary plus install-time bundle/config hydration; persistent service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
   - replace the binary in place
@@ -47,7 +49,9 @@ This document defines the installation and upgrade shape for the native Legato c
   - server endpoint
   - TLS server name
   - mount point
-- Startup model: packaged binary and config assets today; service registration remains a later step once the runtime is a persistent mount daemon
+- Client-bundle install command:
+  `legatofs.exe install --bundle-dir <bundle> --endpoint <host:port> --server-name <dns-name> --mount-point L:\Legato`
+- Startup model: packaged binary plus install-time bundle/config hydration; persistent service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
   - replace the binary in place
@@ -60,3 +64,14 @@ This document defines the installation and upgrade shape for the native Legato c
 - If the cache schema changes, run migrations at startup before mounting.
 - If block integrity verification fails, remove only the affected cached block and refetch it.
 - If cert paths change, fail fast at startup rather than mounting a partially configured filesystem.
+
+## Registration Flow
+
+The current end-to-end client registration flow is:
+
+1. Issue a client bundle on the server with `legato-server issue-client`.
+2. Transfer the resulting bundle directory to the client machine.
+3. Run `legatofs install` against that bundle.
+4. Start `legatofs` with the generated `legatofs.toml`.
+
+`legatofs install` creates the config file, cert layout, and block-cache directory under the chosen state root. Use `--force` only when intentionally replacing an existing client configuration.

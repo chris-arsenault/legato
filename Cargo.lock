@@ -1002,6 +1002,7 @@ dependencies = [
  "legato-proto",
  "legato-types",
  "serde",
+ "tempfile",
  "tokio",
 ]
 
