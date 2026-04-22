@@ -13,9 +13,10 @@ use tonic::{
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
     AttachResponse, BlockRequest, BlockResponse, CloseRequest, CloseResponse, DirectoryEntry,
-    FileMetadata, InvalidationEvent, ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION,
-    PrefetchRequest, PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, StatRequest,
-    SubscribeRequest, legato_client::LegatoClient,
+    ExtentRecord, ExtentRef, FetchRequest, FileMetadata, InodeMetadata, InvalidationEvent,
+    ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION, PrefetchRequest, PrefetchResponse,
+    ReadBlocksRequest, ResolvePathRequest, ResolveRequest, StatRequest, SubscribeRequest,
+    legato_client::LegatoClient,
 };
 
 /// Session metadata returned after a successful attach.
@@ -263,6 +264,21 @@ impl GrpcClientTransport {
             .ok_or(ClientTransportError::MissingField("resolve_path.metadata"))
     }
 
+    /// Resolves one path to semantic inode metadata and layout.
+    pub async fn resolve(
+        &mut self,
+        path: impl Into<String>,
+    ) -> Result<InodeMetadata, ClientTransportError> {
+        let response = self
+            .client
+            .resolve(ResolveRequest { path: path.into() })
+            .await?
+            .into_inner();
+        response
+            .inode
+            .ok_or(ClientTransportError::MissingField("resolve.inode"))
+    }
+
     /// Opens one remote file and records the returned server-local handle.
     pub async fn open(
         &mut self,
@@ -301,6 +317,23 @@ impl GrpcClientTransport {
         request: PrefetchRequest,
     ) -> Result<PrefetchResponse, ClientTransportError> {
         Ok(self.client.prefetch(request).await?.into_inner())
+    }
+
+    /// Fetches one or more semantic extents from the remote server.
+    pub async fn fetch_extents(
+        &mut self,
+        extents: Vec<ExtentRef>,
+    ) -> Result<Vec<ExtentRecord>, ClientTransportError> {
+        let mut stream = self
+            .client
+            .fetch(FetchRequest { extents })
+            .await?
+            .into_inner();
+        let mut records = Vec::new();
+        while let Some(record) = stream.message().await? {
+            records.push(record);
+        }
+        Ok(records)
     }
 
     /// Subscribes to the server invalidation stream for the current transport generation.

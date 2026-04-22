@@ -397,7 +397,10 @@ fn attributes_from_open_handle(handle: &FilesystemOpenHandle) -> FilesystemAttri
         is_dir: false,
         size: handle.size,
         mtime_ns: 0,
-        block_size: handle.block_size,
+        block_size: handle
+            .extents
+            .first()
+            .map_or(0, |extent| extent.length.min(u64::from(u32::MAX)) as u32),
         read_only: true,
     }
 }

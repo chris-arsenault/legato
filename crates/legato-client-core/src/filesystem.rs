@@ -7,9 +7,9 @@ use std::{
 };
 
 use legato_client_cache::{
-    BlockCacheStore, CacheKey, MetadataCache, MetadataCachePolicy, open_cache_database,
+    ExtentCacheStore, ExtentKey, MetadataCache, MetadataCachePolicy, open_cache_database,
 };
-use legato_proto::{BlockRequest, DirectoryEntry, FileMetadata, InvalidationEvent};
+use legato_proto::{DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata, InvalidationEvent};
 use legato_types::{FileId, FilesystemAttributes};
 
 use crate::{
@@ -38,8 +38,8 @@ pub struct FilesystemOpenHandle {
     pub server_handle: u64,
     /// Logical file size in bytes.
     pub size: u64,
-    /// Fixed server-advertised block size.
-    pub block_size: u32,
+    /// Semantic file layout used for extent fetches.
+    pub extents: Vec<ExtentDescriptor>,
 }
 
 /// Errors surfaced by the shared filesystem service.
@@ -102,7 +102,7 @@ impl From<rusqlite::Error> for FilesystemServiceError {
 pub struct FilesystemService {
     transport: GrpcClientTransport,
     control: LocalControlPlane,
-    store: BlockCacheStore,
+    store: ExtentCacheStore,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
     invalidations: Option<GrpcInvalidationSubscription>,
@@ -116,14 +116,10 @@ impl FilesystemService {
         state_dir: &Path,
     ) -> Result<Self, FilesystemServiceError> {
         let cache_db = open_cache_database(&state_dir.join("client.sqlite"))?;
-        let store = BlockCacheStore::new(&state_dir.join("blocks"), cache_db)?;
-        let block_size = config.cache.block_size;
+        let store = ExtentCacheStore::new(&state_dir.join("extents"), cache_db)?;
         let mut transport = GrpcClientTransport::connect(config, client_name).await?;
         let invalidations = Some(transport.subscribe_invalidations().await?);
-        let control = LocalControlPlane::new(
-            MetadataCache::new(MetadataCachePolicy::default()),
-            block_size,
-        );
+        let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 0);
 
         Ok(Self {
             transport,
@@ -195,16 +191,23 @@ impl FilesystemService {
         self.sync_invalidations().await?;
         let response = self
             .transport
+            .resolve(path.to_owned())
+            .await
+            .map_err(map_lookup_error(path))?;
+        let open_response = self
+            .transport
             .open(path.to_owned())
             .await
             .map_err(map_lookup_error(path))?;
         let handle = FilesystemOpenHandle {
             local_handle: self.next_handle,
             path: path.to_owned(),
-            file_id: FileId(response.file_id),
-            server_handle: response.file_handle,
-            size: response.size,
-            block_size: response.block_size,
+            file_id: FileId(open_response.file_id),
+            server_handle: open_response.file_handle,
+            size: open_response.size,
+            extents: response
+                .layout
+                .map_or_else(Vec::new, |layout| layout.extents),
         };
         self.next_handle += 1;
         self.open_handles
@@ -228,29 +231,21 @@ impl FilesystemService {
         if size == 0 || offset >= snapshot.size {
             return Ok(Vec::new());
         }
-        if snapshot.block_size == 0 {
-            return Err(FilesystemServiceError::InvalidRead {
-                local_handle,
-                offset,
-                size,
-            });
-        }
-
-        let aligned_ranges = read_plan(&snapshot, offset, size);
+        let planned_extents = read_plan(&snapshot, offset, size);
         let now_ns = now_monotonic_ns();
-        let mut missing_offsets = Vec::new();
-        for aligned_offset in &aligned_ranges {
-            let key = CacheKey {
+        let mut missing_extents = Vec::new();
+        for descriptor in &planned_extents {
+            let key = ExtentKey {
                 file_id: snapshot.file_id,
-                start_offset: *aligned_offset,
+                extent_index: descriptor.extent_index,
             };
-            if self.store.get_block(&key, now_ns)?.is_none() {
-                missing_offsets.push(*aligned_offset);
+            if self.store.get_extent(&key, now_ns)?.is_none() {
+                missing_extents.push(descriptor.clone());
             }
         }
 
-        if !missing_offsets.is_empty() {
-            self.fetch_missing_blocks(&snapshot, &missing_offsets, now_ns)
+        if !missing_extents.is_empty() {
+            self.fetch_missing_extents(&snapshot, &missing_extents, now_ns)
                 .await?;
         }
 
@@ -329,93 +324,96 @@ impl FilesystemService {
 
     async fn reconnect_and_resubscribe(&mut self) -> Result<(), FilesystemServiceError> {
         self.transport.reconnect().await?;
-        self.refresh_handles_from_runtime();
+        self.refresh_handles_from_runtime().await;
         self.invalidations = Some(self.transport.subscribe_invalidations().await?);
         Ok(())
     }
 
-    async fn fetch_missing_blocks(
+    async fn fetch_missing_extents(
         &mut self,
         handle: &FilesystemOpenHandle,
-        missing_offsets: &[u64],
+        missing_extents: &[ExtentDescriptor],
         now_ns: u64,
     ) -> Result<(), FilesystemServiceError> {
-        let request_ranges =
-            merge_offsets_into_requests(handle.server_handle, handle.block_size, missing_offsets);
-        match self.transport.read_blocks(request_ranges).await {
-            Ok(blocks) => {
-                self.store_blocks(handle.file_id, &blocks, now_ns)?;
+        let request_extents = missing_extents
+            .iter()
+            .map(|extent| ExtentRef {
+                file_id: handle.file_id.0,
+                extent_index: extent.extent_index,
+                file_offset: extent.file_offset,
+                length: extent.length,
+            })
+            .collect::<Vec<_>>();
+        match self.transport.fetch_extents(request_extents).await {
+            Ok(extents) => {
+                self.store_extents(&extents, now_ns)?;
                 Ok(())
             }
             Err(error) if should_retry_after_reconnect(&error) => {
                 self.transport.reconnect().await?;
-                self.refresh_handles_from_runtime();
+                self.refresh_handles_from_runtime().await;
                 let refreshed = self
                     .open_handles
                     .get(&handle.local_handle)
                     .cloned()
                     .ok_or(FilesystemServiceError::UnknownHandle(handle.local_handle))?;
-                let retry_ranges = merge_offsets_into_requests(
-                    refreshed.server_handle,
-                    refreshed.block_size,
-                    missing_offsets,
-                );
-                let blocks = self.transport.read_blocks(retry_ranges).await?;
-                self.store_blocks(refreshed.file_id, &blocks, now_ns)?;
+                let retry_extents = missing_extents
+                    .iter()
+                    .map(|extent| ExtentRef {
+                        file_id: refreshed.file_id.0,
+                        extent_index: extent.extent_index,
+                        file_offset: extent.file_offset,
+                        length: extent.length,
+                    })
+                    .collect::<Vec<_>>();
+                let extents = self.transport.fetch_extents(retry_extents).await?;
+                self.store_extents(&extents, now_ns)?;
                 Ok(())
             }
             Err(error) => Err(FilesystemServiceError::Transport(error)),
         }
     }
 
-    fn store_blocks(
+    fn store_extents(
         &mut self,
-        file_id: FileId,
-        blocks: &[legato_proto::BlockResponse],
+        extents: &[legato_proto::ExtentRecord],
         now_ns: u64,
     ) -> Result<(), FilesystemServiceError> {
-        for block in blocks {
-            let key = CacheKey {
-                file_id,
-                start_offset: block.offset,
-            };
-            let _ = self.store.put_block(&key, 1, &block.data, 0, now_ns)?;
+        for extent in extents {
+            let _ = self.store.put_extent(extent, 0, now_ns)?;
         }
         Ok(())
     }
 
-    fn refresh_handles_from_runtime(&mut self) {
+    async fn refresh_handles_from_runtime(&mut self) {
         for handle in self.open_handles.values_mut() {
             if let Some(open_file) = self.transport.runtime().open_file(&handle.path) {
                 handle.server_handle = open_file.file_handle;
                 handle.file_id = FileId(open_file.file_id);
-                handle.block_size = open_file.block_size;
+            }
+            if let Ok(inode) = self.transport.resolve(handle.path.clone()).await {
+                handle.extents = inode.layout.map_or_else(Vec::new, |layout| layout.extents);
+                handle.size = inode.size;
             }
         }
     }
 }
 
-fn read_plan(handle: &FilesystemOpenHandle, offset: u64, size: u32) -> Vec<u64> {
-    let block_size = u64::from(handle.block_size);
+fn read_plan(handle: &FilesystemOpenHandle, offset: u64, size: u32) -> Vec<ExtentDescriptor> {
     let end = offset.saturating_add(u64::from(size)).min(handle.size);
-    let first_offset = (offset / block_size) * block_size;
-    let last_offset = if end == 0 {
-        first_offset
-    } else {
-        ((end - 1) / block_size) * block_size
-    };
-
-    let mut offsets = Vec::new();
-    let mut current = first_offset;
-    while current <= last_offset {
-        offsets.push(current);
-        current = current.saturating_add(block_size);
-    }
-    offsets
+    handle
+        .extents
+        .iter()
+        .filter(|extent| {
+            let extent_end = extent.file_offset.saturating_add(extent.length);
+            extent.file_offset < end && extent_end > offset
+        })
+        .cloned()
+        .collect()
 }
 
 fn assemble_read(
-    store: &mut BlockCacheStore,
+    store: &mut ExtentCacheStore,
     handle: &FilesystemOpenHandle,
     offset: u64,
     size: u32,
@@ -424,65 +422,26 @@ fn assemble_read(
     let end = offset.saturating_add(u64::from(size)).min(handle.size);
     let mut bytes = Vec::with_capacity(size as usize);
 
-    for aligned_offset in read_plan(handle, offset, size) {
-        let key = CacheKey {
+    for descriptor in read_plan(handle, offset, size) {
+        let key = ExtentKey {
             file_id: handle.file_id,
-            start_offset: aligned_offset,
+            extent_index: descriptor.extent_index,
         };
-        let Some(block) = store.get_block(&key, now_ns)? else {
+        let Some(extent) = store.get_extent(&key, now_ns)? else {
             return Err(FilesystemServiceError::NotFound(handle.path.clone()));
         };
-        let block_end = aligned_offset.saturating_add(block.data.len() as u64);
-        let copy_start = offset.max(aligned_offset);
-        let copy_end = end.min(block_end);
+        let extent_end = extent.file_offset.saturating_add(extent.data.len() as u64);
+        let copy_start = offset.max(extent.file_offset);
+        let copy_end = end.min(extent_end);
         if copy_start >= copy_end {
             continue;
         }
-        let start_index = (copy_start - aligned_offset) as usize;
-        let end_index = (copy_end - aligned_offset) as usize;
-        bytes.extend_from_slice(&block.data[start_index..end_index]);
+        let start_index = (copy_start - extent.file_offset) as usize;
+        let end_index = (copy_end - extent.file_offset) as usize;
+        bytes.extend_from_slice(&extent.data[start_index..end_index]);
     }
 
     Ok(bytes)
-}
-
-fn merge_offsets_into_requests(
-    server_handle: u64,
-    block_size: u32,
-    offsets: &[u64],
-) -> Vec<BlockRequest> {
-    if offsets.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted = offsets.to_vec();
-    sorted.sort_unstable();
-    let step = u64::from(block_size);
-    let mut requests = Vec::new();
-    let mut current_start = sorted[0];
-    let mut current_count = 1_u32;
-
-    for window in sorted.windows(2) {
-        let [left, right] = [window[0], window[1]];
-        if right == left.saturating_add(step) && current_count < u32::MAX {
-            current_count += 1;
-            continue;
-        }
-        requests.push(BlockRequest {
-            file_handle: server_handle,
-            start_offset: current_start,
-            block_count: current_count,
-        });
-        current_start = right;
-        current_count = 1;
-    }
-
-    requests.push(BlockRequest {
-        file_handle: server_handle,
-        start_offset: current_start,
-        block_count: current_count,
-    });
-    requests
 }
 
 fn metadata_to_attributes(metadata: FileMetadata) -> FilesystemAttributes {

@@ -8,7 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use legato_proto::{DirectoryEntry, FileMetadata, InvalidationEvent, InvalidationKind};
+use legato_proto::{
+    DirectoryEntry, ExtentRecord, FileMetadata, InvalidationEvent, InvalidationKind, TransferClass,
+};
 use legato_types::{BlockRange, FileId};
 use rusqlite::{Connection, OptionalExtension, params};
 pub use schema::{CLIENT_CACHE_SCHEMA_VERSION, cache_migrations};
@@ -180,6 +182,32 @@ pub struct CachedBlock {
     pub pin_generation: u64,
 }
 
+/// Identity for one semantic extent in the local store.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ExtentKey {
+    /// Stable identifier of the file containing the extent.
+    pub file_id: FileId,
+    /// Logical extent index within the file layout.
+    pub extent_index: u32,
+}
+
+/// Extent data returned from the local extent store after integrity verification.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachedExtent {
+    /// Identity of the cached extent.
+    pub key: ExtentKey,
+    /// File-relative starting offset represented by the extent.
+    pub file_offset: u64,
+    /// Verified on-disk extent bytes.
+    pub data: Vec<u8>,
+    /// Stored content hash for the extent.
+    pub content_hash: Vec<u8>,
+    /// Transfer class persisted for the extent's file layout.
+    pub transfer_class: TransferClass,
+    /// Current pin generation for eviction policy.
+    pub pin_generation: u64,
+}
+
 /// Summary of one cache maintenance pass.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CacheMaintenanceReport {
@@ -200,6 +228,13 @@ pub struct CacheMaintenanceReport {
 /// Persistent client-side block cache backed by the cache SQLite DB and block files.
 #[derive(Debug)]
 pub struct BlockCacheStore {
+    root_dir: PathBuf,
+    connection: Connection,
+}
+
+/// Persistent client-side extent store backed by the cache SQLite DB and extent files.
+#[derive(Debug)]
+pub struct ExtentCacheStore {
     root_dir: PathBuf,
     connection: Connection,
 }
@@ -535,6 +570,344 @@ impl BlockCacheStore {
     }
 }
 
+impl ExtentCacheStore {
+    /// Creates an extent store rooted at the provided directory.
+    pub fn new(root_dir: &Path, connection: Connection) -> rusqlite::Result<Self> {
+        fs::create_dir_all(root_dir)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        Ok(Self {
+            root_dir: root_dir.to_path_buf(),
+            connection,
+        })
+    }
+
+    /// Inserts or replaces one verified extent in the local store.
+    pub fn put_extent(
+        &mut self,
+        record: &ExtentRecord,
+        pin_generation: u64,
+        now_ns: u64,
+    ) -> rusqlite::Result<CachedExtent> {
+        let transfer_class =
+            TransferClass::try_from(record.transfer_class).unwrap_or(TransferClass::Unspecified);
+        let content_hash = blake3::hash(&record.data).as_bytes().to_vec();
+        let relative_path = extent_storage_relative_path(record.file_id, record.extent_index);
+        let absolute_path = self.root_dir.join(&relative_path);
+        if let Some(parent) = absolute_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        fs::write(&absolute_path, &record.data)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+
+        self.connection.execute(
+            "INSERT INTO extent_entries (
+                 file_id, extent_index, file_offset, extent_length, transfer_class, content_hash,
+                 content_size, storage_relative_path, last_access_ns, pin_generation, state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ready')
+             ON CONFLICT(file_id, extent_index) DO UPDATE SET
+                 file_offset = excluded.file_offset,
+                 extent_length = excluded.extent_length,
+                 transfer_class = excluded.transfer_class,
+                 content_hash = excluded.content_hash,
+                 content_size = excluded.content_size,
+                 storage_relative_path = excluded.storage_relative_path,
+                 last_access_ns = excluded.last_access_ns,
+                 pin_generation = excluded.pin_generation,
+                 state = 'ready'",
+            params![
+                record.file_id as i64,
+                record.extent_index as i64,
+                record.file_offset as i64,
+                record.data.len() as i64,
+                record.transfer_class,
+                content_hash,
+                record.data.len() as i64,
+                relative_path.to_string_lossy(),
+                now_ns as i64,
+                pin_generation as i64,
+            ],
+        )?;
+
+        Ok(CachedExtent {
+            key: ExtentKey {
+                file_id: FileId(record.file_id),
+                extent_index: record.extent_index,
+            },
+            file_offset: record.file_offset,
+            data: record.data.clone(),
+            content_hash: blake3::hash(&record.data).as_bytes().to_vec(),
+            transfer_class,
+            pin_generation,
+        })
+    }
+
+    /// Returns a verified cached extent when it exists locally.
+    pub fn get_extent(
+        &mut self,
+        key: &ExtentKey,
+        now_ns: u64,
+    ) -> rusqlite::Result<Option<CachedExtent>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT file_offset, transfer_class, content_hash, storage_relative_path, pin_generation
+                 FROM extent_entries
+                 WHERE file_id = ?1 AND extent_index = ?2 AND state = 'ready'",
+                params![key.file_id.0 as i64, key.extent_index as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((file_offset, transfer_class, content_hash, relative_path, pin_generation)) = row
+        else {
+            return Ok(None);
+        };
+
+        let absolute_path = self.root_dir.join(&relative_path);
+        let data = fs::read(&absolute_path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let actual_hash = blake3::hash(&data).as_bytes().to_vec();
+        if actual_hash != content_hash {
+            self.connection.execute(
+                "DELETE FROM extent_entries WHERE file_id = ?1 AND extent_index = ?2",
+                params![key.file_id.0 as i64, key.extent_index as i64],
+            )?;
+            let _ = fs::remove_file(&absolute_path);
+            return Ok(None);
+        }
+
+        self.connection.execute(
+            "UPDATE extent_entries SET last_access_ns = ?3 WHERE file_id = ?1 AND extent_index = ?2",
+            params![key.file_id.0 as i64, key.extent_index as i64, now_ns as i64],
+        )?;
+
+        Ok(Some(CachedExtent {
+            key: key.clone(),
+            file_offset: file_offset as u64,
+            data,
+            content_hash,
+            transfer_class: TransferClass::try_from(transfer_class as i32)
+                .unwrap_or(TransferClass::Unspecified),
+            pin_generation: pin_generation as u64,
+        }))
+    }
+
+    /// Removes all cached extents for one file.
+    pub fn invalidate_file(&mut self, file_id: FileId) -> rusqlite::Result<usize> {
+        let paths = collect_extent_storage_paths_for_file(&self.connection, file_id)?;
+        let deleted = self.connection.execute(
+            "DELETE FROM extent_entries WHERE file_id = ?1",
+            [file_id.0 as i64],
+        )?;
+        for path in paths {
+            let _ = fs::remove_file(self.root_dir.join(path));
+        }
+        Ok(deleted)
+    }
+
+    /// Applies an invalidation to the extent store when file identity is known.
+    pub fn apply_invalidation(&mut self, event: &InvalidationEvent) -> rusqlite::Result<()> {
+        let kind = InvalidationKind::try_from(event.kind).unwrap_or(InvalidationKind::Unspecified);
+        if matches!(
+            kind,
+            InvalidationKind::File | InvalidationKind::Directory | InvalidationKind::Subtree
+        ) && event.file_id != 0
+        {
+            let _ = self.invalidate_file(FileId(event.file_id))?;
+        }
+        Ok(())
+    }
+
+    /// Records fetch state for one extent.
+    pub fn record_extent_fetch_state(
+        &mut self,
+        key: &ExtentKey,
+        priority: i32,
+        state: &str,
+        now_ns: u64,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT INTO extent_fetch_state (file_id, extent_index, priority, state, updated_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_id, extent_index) DO UPDATE SET
+                 priority = excluded.priority,
+                 state = excluded.state,
+                 updated_at_ns = excluded.updated_at_ns",
+            params![
+                key.file_id.0 as i64,
+                key.extent_index as i64,
+                priority,
+                state,
+                now_ns as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records one pin generation for eviction-sensitive extents.
+    pub fn record_pin(
+        &mut self,
+        generation: u64,
+        reason: &str,
+        created_at_ns: u64,
+    ) -> rusqlite::Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO pins (generation, reason, created_at_ns) VALUES (?1, ?2, ?3)",
+            params![generation as i64, reason, created_at_ns as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the logical size of all tracked extent entries.
+    pub fn total_size_bytes(&self) -> rusqlite::Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(content_size), 0) FROM extent_entries",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|total| total.max(0) as u64)
+    }
+
+    /// Evicts least-recently-used, oldest-pin extents until the store fits within the limit.
+    pub fn evict_to_limit(&mut self, max_bytes: u64) -> rusqlite::Result<CacheMaintenanceReport> {
+        let bytes_before = self.total_size_bytes()?;
+        if bytes_before <= max_bytes {
+            return Ok(CacheMaintenanceReport {
+                bytes_before,
+                bytes_after: bytes_before,
+                ..CacheMaintenanceReport::default()
+            });
+        }
+
+        let mut report = CacheMaintenanceReport {
+            bytes_before,
+            bytes_after: bytes_before,
+            ..CacheMaintenanceReport::default()
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT file_id, extent_index, content_size, storage_relative_path
+             FROM extent_entries
+             ORDER BY pin_generation ASC, last_access_ns ASC, extent_index ASC",
+        )?;
+        let victims = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut remaining = bytes_before;
+        for (file_id, extent_index, content_size, relative_path) in victims {
+            if remaining <= max_bytes {
+                break;
+            }
+            self.connection.execute(
+                "DELETE FROM extent_entries WHERE file_id = ?1 AND extent_index = ?2",
+                params![file_id, extent_index],
+            )?;
+            let _ = fs::remove_file(self.root_dir.join(&relative_path));
+            report.entries_removed += 1;
+            report.reclaimed_bytes = report
+                .reclaimed_bytes
+                .saturating_add(content_size.max(0) as u64);
+            remaining = remaining.saturating_sub(content_size.max(0) as u64);
+        }
+
+        report.bytes_after = self.total_size_bytes()?;
+        Ok(report)
+    }
+
+    /// Removes corrupt, missing, and orphaned extent artifacts from the local store.
+    pub fn repair(&mut self) -> rusqlite::Result<CacheMaintenanceReport> {
+        let bytes_before = self.total_size_bytes()?;
+        let mut report = CacheMaintenanceReport {
+            bytes_before,
+            bytes_after: bytes_before,
+            ..CacheMaintenanceReport::default()
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT file_id, extent_index, content_hash, content_size, storage_relative_path
+             FROM extent_entries",
+        )?;
+        let entries = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut referenced_paths = BTreeSet::new();
+
+        for (file_id, extent_index, expected_hash, content_size, relative_path) in entries {
+            let absolute_path = self.root_dir.join(&relative_path);
+            referenced_paths.insert(relative_path.clone());
+            let healthy = fs::read(&absolute_path)
+                .ok()
+                .is_some_and(|data| blake3::hash(&data).as_bytes() == expected_hash.as_slice());
+
+            if healthy {
+                continue;
+            }
+
+            self.connection.execute(
+                "DELETE FROM extent_entries WHERE file_id = ?1 AND extent_index = ?2",
+                params![file_id, extent_index],
+            )?;
+            let _ = fs::remove_file(&absolute_path);
+            report.entries_removed += 1;
+            report.repaired_entries += 1;
+            report.reclaimed_bytes = report
+                .reclaimed_bytes
+                .saturating_add(content_size.max(0) as u64);
+        }
+
+        for entry in WalkDir::new(&self.root_dir)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative_path = entry
+                .path()
+                .strip_prefix(&self.root_dir)
+                .expect("walkdir entries should remain under the root")
+                .to_string_lossy()
+                .into_owned();
+            if referenced_paths.contains(&relative_path) {
+                continue;
+            }
+
+            let size = entry.metadata().map_or(0, |metadata| metadata.len());
+            fs::remove_file(entry.path())
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            report.orphan_files_removed += 1;
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(size);
+        }
+
+        report.bytes_after = self.total_size_bytes()?;
+        Ok(report)
+    }
+}
+
 /// Opens the client cache database, applying the current schema if needed.
 pub fn open_cache_database(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -613,12 +986,28 @@ fn block_storage_relative_path(content_hash: &[u8]) -> PathBuf {
     PathBuf::from(&hex[0..2]).join(hex)
 }
 
+fn extent_storage_relative_path(file_id: u64, extent_index: u32) -> PathBuf {
+    PathBuf::from(file_id.to_string()).join(format!("{extent_index}.bin"))
+}
+
 fn collect_storage_paths_for_file(
     connection: &Connection,
     file_id: FileId,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT storage_relative_path FROM cache_entries WHERE file_id = ?1 ORDER BY start_offset",
+    )?;
+    statement
+        .query_map([file_id.0 as i64], |row| row.get::<_, String>(0))?
+        .collect()
+}
+
+fn collect_extent_storage_paths_for_file(
+    connection: &Connection,
+    file_id: FileId,
+) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT storage_relative_path FROM extent_entries WHERE file_id = ?1 ORDER BY extent_index",
     )?;
     statement
         .query_map([file_id.0 as i64], |row| row.get::<_, String>(0))?
@@ -636,10 +1025,14 @@ fn hex_char(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockCacheStore, CLIENT_CACHE_SCHEMA_VERSION, CacheConfig, CacheKey, MetadataCache,
-        MetadataCacheLookup, MetadataCachePolicy, block_storage_relative_path, open_cache_database,
+        BlockCacheStore, CLIENT_CACHE_SCHEMA_VERSION, CacheConfig, CacheKey, CachedExtent,
+        ExtentCacheStore, ExtentKey, MetadataCache, MetadataCacheLookup, MetadataCachePolicy,
+        block_storage_relative_path, open_cache_database,
     };
-    use legato_proto::{DirectoryEntry, FileMetadata, InvalidationEvent, InvalidationKind};
+    use legato_proto::{
+        DirectoryEntry, ExtentRecord, FileMetadata, InvalidationEvent, InvalidationKind,
+        TransferClass,
+    };
     use legato_types::{BlockRange, FileId};
     use tempfile::tempdir;
 
@@ -792,7 +1185,7 @@ mod tests {
         let mut statement = connection
             .prepare(
                 "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('cache_entries', 'pins', 'fetch_state', 'client_state') \
+                 WHERE type = 'table' AND name IN ('cache_entries', 'client_state', 'extent_entries', 'extent_fetch_state', 'fetch_state', 'pins') \
                  ORDER BY name",
             )
             .expect("table inspection statement should prepare");
@@ -809,10 +1202,64 @@ mod tests {
             vec![
                 String::from("cache_entries"),
                 String::from("client_state"),
+                String::from("extent_entries"),
+                String::from("extent_fetch_state"),
                 String::from("fetch_state"),
                 String::from("pins"),
             ]
         );
+    }
+
+    #[test]
+    fn extent_cache_store_round_trips_and_verifies_integrity() {
+        let temp = tempdir().expect("tempdir should be created");
+        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
+            .expect("store should open");
+
+        let cached = store
+            .put_extent(
+                &ExtentRecord {
+                    file_id: 7,
+                    extent_index: 1,
+                    file_offset: 4096,
+                    data: b"fixture-extent".to_vec(),
+                    extent_hash: Vec::new(),
+                    transfer_class: TransferClass::Streamed as i32,
+                },
+                2,
+                100,
+            )
+            .expect("extent should be cached");
+        let loaded = store
+            .get_extent(
+                &ExtentKey {
+                    file_id: FileId(7),
+                    extent_index: 1,
+                },
+                200,
+            )
+            .expect("cached extent should load")
+            .expect("cached extent should exist");
+
+        assert_eq!(
+            cached,
+            CachedExtent {
+                key: ExtentKey {
+                    file_id: FileId(7),
+                    extent_index: 1,
+                },
+                file_offset: 4096,
+                data: b"fixture-extent".to_vec(),
+                content_hash: blake3::hash(b"fixture-extent").as_bytes().to_vec(),
+                transfer_class: TransferClass::Streamed,
+                pin_generation: 2,
+            }
+        );
+        assert_eq!(loaded.data, b"fixture-extent");
+        assert_eq!(loaded.file_offset, 4096);
+        assert_eq!(loaded.transfer_class, TransferClass::Streamed);
     }
 
     #[test]
