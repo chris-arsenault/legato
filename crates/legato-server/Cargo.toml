@@ -11,6 +11,7 @@ legato-foundation = { path = "../legato-foundation" }
 legato-proto = { path = "../legato-proto" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+walkdir = "2"
 
 [lints]
 workspace = true

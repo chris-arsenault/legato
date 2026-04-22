@@ -1,9 +1,11 @@
 //! Server-side bootstrap types for the Legato daemon.
 
+mod index;
 mod schema;
 
 use std::{fs, path::Path};
 
+pub use index::{ReconcileStats, reconcile_library_root};
 use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
