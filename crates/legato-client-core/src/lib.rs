@@ -6,15 +6,15 @@ mod transport;
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
 
 use legato_client_cache::{
-    BlockCacheStore, CacheConfig, CacheKey, CachedBlock, MetadataCache, MetadataCacheLookup,
+    CacheConfig, CachedExtent, ExtentCacheStore, ExtentKey, MetadataCache, MetadataCacheLookup,
 };
 use legato_proto::{
-    AttachRequest, DirectoryEntry, FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest,
-    OpenResponse, PROTOCOL_VERSION, PrefetchPriority as ProtoPrefetchPriority,
-    default_capabilities,
+    AttachRequest, DirectoryEntry, ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata,
+    InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+    PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
 };
 use legato_types::{
-    BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
+    ExtentRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
 };
 use rustls::{
     ClientConfig as RustlsClientConfig, RootCertStore,
@@ -475,100 +475,104 @@ fn backoff_delay_ms(policy: &RetryPolicy, failure_count: u32) -> u64 {
 /// Result of one coordinated read or prefetch planning step.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchPlan {
-    /// Blocks already resident in the local cache.
-    pub cached: Vec<CachedBlock>,
-    /// Blocks that still require a server-side transfer.
-    pub missing: Vec<CacheKey>,
+    /// Extents already resident in the local cache.
+    pub cached: Vec<CachedExtent>,
+    /// Extents that still require a server-side transfer.
+    pub missing: Vec<ExtentRange>,
     /// Number of active waiters now attached to the requested keys.
     pub waiter_count: usize,
 }
 
-/// In-memory coordinator that deduplicates overlapping block fetches.
+/// In-memory coordinator that deduplicates overlapping extent fetches.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FetchCoordinator {
-    block_size: u32,
-    inflight_waiters: HashMap<CacheKey, usize>,
+    inflight_waiters: HashMap<ExtentKey, usize>,
 }
 
 impl FetchCoordinator {
-    /// Creates a fetch coordinator for the provided fixed client block size.
+    /// Creates an empty fetch coordinator.
     #[must_use]
-    pub fn new(block_size: u32) -> Self {
+    pub fn new() -> Self {
         Self {
-            block_size,
             inflight_waiters: HashMap::new(),
         }
     }
 
-    /// Plans the cache lookups and remote fetches required for one range.
-    pub fn prepare_range(
+    /// Plans the cache lookups and remote fetches required for one semantic extent.
+    pub fn prepare_extent(
         &mut self,
-        store: &mut BlockCacheStore,
-        range: &BlockRange,
+        store: &mut ExtentCacheStore,
+        extent: &ExtentRange,
         now_ns: u64,
     ) -> rusqlite::Result<FetchPlan> {
-        let mut cached = Vec::new();
-        let mut missing = Vec::new();
-        let mut waiter_count = 0;
-
-        for key in self.block_keys(range) {
-            if let Some(block) = store.get_block(&key, now_ns)? {
-                cached.push(block);
-                continue;
-            }
-
-            let waiters = self.inflight_waiters.entry(key.clone()).or_insert(0);
-            *waiters += 1;
-            waiter_count += *waiters;
-            if *waiters == 1 {
-                missing.push(key);
-            }
+        let key = ExtentKey {
+            file_id: extent.file_id,
+            extent_index: extent.extent_index,
+        };
+        if let Some(cached) = store.get_extent(&key, now_ns)? {
+            return Ok(FetchPlan {
+                cached: vec![cached],
+                missing: Vec::new(),
+                waiter_count: 0,
+            });
         }
 
+        let waiters = self.inflight_waiters.entry(key).or_insert(0);
+        *waiters += 1;
         Ok(FetchPlan {
-            cached,
-            missing,
-            waiter_count,
+            cached: Vec::new(),
+            missing: if *waiters == 1 {
+                vec![extent.clone()]
+            } else {
+                Vec::new()
+            },
+            waiter_count: *waiters,
         })
     }
 
-    /// Completes one fetched block and records it in the local cache.
-    pub fn complete_block(
+    /// Completes one fetched extent and records it in the local cache.
+    pub fn complete_extent(
         &mut self,
-        store: &mut BlockCacheStore,
-        key: &CacheKey,
+        store: &mut ExtentCacheStore,
+        extent: &ExtentRange,
         data: &[u8],
         pin_generation: u64,
         now_ns: u64,
-    ) -> rusqlite::Result<CachedBlock> {
-        self.inflight_waiters.remove(key);
-        store.put_block(key, 1, data, pin_generation, now_ns)
-    }
-
-    fn block_keys(&self, range: &BlockRange) -> Vec<CacheKey> {
-        (0..range.block_count)
-            .map(|index| CacheKey {
-                file_id: range.file_id,
-                start_offset: range.start_offset + u64::from(index) * u64::from(self.block_size),
-            })
-            .collect()
+    ) -> rusqlite::Result<CachedExtent> {
+        let key = ExtentKey {
+            file_id: extent.file_id,
+            extent_index: extent.extent_index,
+        };
+        self.inflight_waiters.remove(&key);
+        store.put_extent(
+            &legato_proto::ExtentRecord {
+                file_id: extent.file_id.0,
+                extent_index: extent.extent_index,
+                file_offset: extent.file_offset,
+                data: data.to_vec(),
+                extent_hash: Vec::new(),
+                transfer_class: 0,
+            },
+            pin_generation,
+            now_ns,
+        )
     }
 }
 
 /// Outcome of one synchronous client-side prefetch execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefetchExecution {
-    /// Ranges accepted by the local executor.
-    pub accepted: Vec<BlockRange>,
-    /// Ranges guaranteed resident for the requested wait-through priority.
-    pub completed: Vec<BlockRange>,
+    /// Extents accepted by the local executor.
+    pub accepted: Vec<ExtentRange>,
+    /// Extents guaranteed resident for the requested wait-through priority.
+    pub completed: Vec<ExtentRange>,
 }
 
 /// Priority-ordered schedule emitted before prefetch execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefetchSchedule {
-    /// Ranges in execution order.
-    pub ranges: Vec<PrefetchPlanEntry>,
+    /// Extents in execution order.
+    pub extents: Vec<PrefetchPlanEntry>,
     /// Highest priority the caller waits through before returning.
     pub wait_through: PrefetchPriority,
 }
@@ -576,7 +580,7 @@ pub struct PrefetchSchedule {
 /// Tracks cache residency and executes prefetch requests through the local cache store.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrefetchExecutor {
-    residency: HashMap<CacheKey, PrefetchPriority>,
+    residency: HashMap<ExtentKey, PrefetchPriority>,
     pin_generation: u64,
 }
 
@@ -595,49 +599,57 @@ impl PrefetchExecutor {
         &mut self,
         request: &PrefetchRequest,
         coordinator: &mut FetchCoordinator,
-        store: &mut BlockCacheStore,
+        store: &mut ExtentCacheStore,
         now_ns: u64,
         mut source: F,
     ) -> rusqlite::Result<PrefetchExecution>
     where
-        F: FnMut(FileId, u64) -> Vec<u8>,
+        F: FnMut(&ExtentRange) -> Vec<u8>,
     {
         let schedule = schedule_prefetch_request(request);
-        self.pin_generation += 1;
-        store.record_pin(self.pin_generation, "prefetch", now_ns)?;
+        self.pin_generation = store.begin_pin_generation("prefetch", now_ns)?;
 
         let mut accepted = Vec::new();
         let mut completed = Vec::new();
 
-        for entry in &schedule.ranges {
-            accepted.push(entry.range.clone());
-            store.record_fetch_state(
-                &entry.range,
+        for entry in &schedule.extents {
+            accepted.push(entry.extent.clone());
+            let key = ExtentKey {
+                file_id: entry.extent.file_id,
+                extent_index: entry.extent.extent_index,
+            };
+            store.record_extent_fetch_state(
+                &key,
                 prefetch_priority_rank(entry.priority),
                 "queued",
                 now_ns,
             )?;
 
-            let plan = coordinator.prepare_range(store, &entry.range, now_ns)?;
-            for key in plan.missing {
-                let data = source(key.file_id, key.start_offset);
-                let _ =
-                    coordinator.complete_block(store, &key, &data, self.pin_generation, now_ns)?;
-                self.residency.insert(key, entry.priority);
+            let plan = coordinator.prepare_extent(store, &entry.extent, now_ns)?;
+            for extent in plan.missing {
+                let data = source(&extent);
+                let cached = coordinator.complete_extent(
+                    store,
+                    &extent,
+                    &data,
+                    self.pin_generation,
+                    now_ns,
+                )?;
+                self.residency.insert(cached.key, entry.priority);
             }
 
-            for block in plan.cached {
-                self.residency.insert(block.key, entry.priority);
+            for extent in plan.cached {
+                self.residency.insert(extent.key, entry.priority);
             }
 
-            store.record_fetch_state(
-                &entry.range,
+            store.record_extent_fetch_state(
+                &key,
                 prefetch_priority_rank(entry.priority),
                 "resident",
                 now_ns,
             )?;
             if priority_satisfies_wait(entry.priority, schedule.wait_through) {
-                completed.push(entry.range.clone());
+                completed.push(entry.extent.clone());
             }
         }
 
@@ -653,23 +665,20 @@ impl PrefetchExecutor {
         self.pin_generation
     }
 
-    /// Returns whether every block in the range is resident at or above the required priority.
+    /// Returns whether the extent is resident at or above the required priority.
     #[must_use]
-    pub fn is_range_resident(
+    pub fn is_extent_resident(
         &self,
-        range: &BlockRange,
+        extent: &ExtentRange,
         required_priority: PrefetchPriority,
-        block_size: u32,
     ) -> bool {
-        (0..range.block_count).all(|index| {
-            let key = CacheKey {
-                file_id: range.file_id,
-                start_offset: range.start_offset + u64::from(index) * u64::from(block_size),
-            };
-            self.residency
-                .get(&key)
-                .is_some_and(|priority| priority_satisfies_wait(*priority, required_priority))
-        })
+        let key = ExtentKey {
+            file_id: extent.file_id,
+            extent_index: extent.extent_index,
+        };
+        self.residency
+            .get(&key)
+            .is_some_and(|priority| priority_satisfies_wait(*priority, required_priority))
     }
 }
 
@@ -677,30 +686,48 @@ impl PrefetchExecutor {
 #[derive(Clone, Debug)]
 pub struct LocalControlPlane {
     metadata_cache: MetadataCache,
-    canonical_paths: HashMap<String, FileMetadata>,
+    canonical_paths: HashMap<String, InodeMetadata>,
     canonical_directories: HashMap<String, Vec<DirectoryEntry>>,
     fetch_coordinator: FetchCoordinator,
     prefetch_executor: PrefetchExecutor,
 }
 
 impl LocalControlPlane {
-    /// Creates a local control plane with the provided metadata cache and block size.
+    /// Creates a local control plane with the provided metadata cache.
     #[must_use]
-    pub fn new(metadata_cache: MetadataCache, block_size: u32) -> Self {
+    pub fn new(metadata_cache: MetadataCache) -> Self {
         Self {
             metadata_cache,
             canonical_paths: HashMap::new(),
             canonical_directories: HashMap::new(),
-            fetch_coordinator: FetchCoordinator::new(block_size),
+            fetch_coordinator: FetchCoordinator::new(),
             prefetch_executor: PrefetchExecutor::new(),
         }
     }
 
     /// Registers a canonical resolved path for later local prefetch requests.
     pub fn register_path(&mut self, metadata: FileMetadata, now_ns: u64) {
-        self.metadata_cache
-            .put_stat(&metadata.path, Some(metadata.clone()), now_ns);
-        self.canonical_paths.insert(metadata.path.clone(), metadata);
+        self.register_resolved_path(
+            InodeMetadata {
+                file_id: metadata.file_id,
+                path: metadata.path,
+                size: metadata.size,
+                mtime_ns: metadata.mtime_ns,
+                is_dir: metadata.is_dir,
+                layout: None,
+            },
+            now_ns,
+        );
+    }
+
+    /// Registers a canonical resolved inode, including semantic layout when available.
+    pub fn register_resolved_path(&mut self, inode: InodeMetadata, now_ns: u64) {
+        self.metadata_cache.put_stat(
+            &inode.path,
+            Some(inode_metadata_to_file_metadata(&inode)),
+            now_ns,
+        );
+        self.canonical_paths.insert(inode.path.clone(), inode);
     }
 
     /// Registers a canonical directory listing for later local read-dir requests.
@@ -724,7 +751,10 @@ impl LocalControlPlane {
         match self.metadata_cache.stat(path, now_ns) {
             MetadataCacheLookup::Hit(metadata) => metadata,
             MetadataCacheLookup::Miss => {
-                let metadata = self.canonical_paths.get(path).cloned();
+                let metadata = self
+                    .canonical_paths
+                    .get(path)
+                    .map(inode_metadata_to_file_metadata);
                 self.metadata_cache.put_stat(path, metadata.clone(), now_ns);
                 metadata
             }
@@ -748,26 +778,30 @@ impl LocalControlPlane {
         &mut self,
         hints: &[PrefetchHintPath],
         wait_through: PrefetchPriority,
-        store: &mut BlockCacheStore,
+        store: &mut ExtentCacheStore,
         now_ns: u64,
         source: F,
     ) -> rusqlite::Result<PrefetchExecution>
     where
-        F: FnMut(FileId, u64) -> Vec<u8>,
+        F: FnMut(&ExtentRange) -> Vec<u8>,
     {
         let request = PrefetchRequest {
-            ranges: hints
+            extents: hints
                 .iter()
-                .filter_map(|hint| {
-                    self.resolve_path(hint.path.to_string_lossy().as_ref(), now_ns)
-                        .map(|metadata| PrefetchPlanEntry {
-                            range: BlockRange {
-                                file_id: FileId(metadata.file_id),
-                                start_offset: hint.start_offset,
-                                block_count: hint.block_count,
-                            },
-                            priority: hint.priority,
+                .flat_map(|hint| {
+                    self.canonical_paths
+                        .get(hint.path.to_string_lossy().as_ref())
+                        .cloned()
+                        .map(|inode| {
+                            extents_for_hint(&inode, hint)
+                                .into_iter()
+                                .map(|extent| PrefetchPlanEntry {
+                                    extent,
+                                    priority: hint.priority,
+                                })
+                                .collect::<Vec<_>>()
                         })
+                        .unwrap_or_default()
                 })
                 .collect(),
             wait_through,
@@ -784,16 +818,72 @@ impl LocalControlPlane {
 
     /// Returns whether the supplied range is already resident locally.
     #[must_use]
-    pub fn is_range_resident(
+    pub fn is_extent_resident(
         &self,
-        range: &BlockRange,
+        extent: &ExtentRange,
         required_priority: PrefetchPriority,
     ) -> bool {
-        self.prefetch_executor.is_range_resident(
-            range,
-            required_priority,
-            self.fetch_coordinator.block_size,
-        )
+        self.prefetch_executor
+            .is_extent_resident(extent, required_priority)
+    }
+}
+
+fn inode_metadata_to_file_metadata(inode: &InodeMetadata) -> FileMetadata {
+    FileMetadata {
+        file_id: inode.file_id,
+        path: inode.path.clone(),
+        size: inode.size,
+        mtime_ns: inode.mtime_ns,
+        content_hash: Vec::new(),
+        is_dir: inode.is_dir,
+        block_size: inode
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.extents.first())
+            .map_or(0, |extent| extent.length.min(u64::from(u32::MAX)) as u32),
+    }
+}
+
+fn extents_for_hint(inode: &InodeMetadata, hint: &PrefetchHintPath) -> Vec<ExtentRange> {
+    if inode.is_dir {
+        return Vec::new();
+    }
+
+    let requested_end = hint.file_offset.saturating_add(hint.length).min(inode.size);
+    let layout = inode
+        .layout
+        .clone()
+        .unwrap_or_else(|| synthesize_unitary_layout(inode.size));
+
+    layout
+        .extents
+        .into_iter()
+        .filter(|extent| {
+            let extent_end = extent.file_offset.saturating_add(extent.length);
+            extent.file_offset < requested_end && extent_end > hint.file_offset
+        })
+        .map(extent_descriptor_to_range(inode.file_id))
+        .collect()
+}
+
+fn synthesize_unitary_layout(size: u64) -> FileLayout {
+    FileLayout {
+        transfer_class: 0,
+        extents: vec![ExtentDescriptor {
+            extent_index: 0,
+            file_offset: 0,
+            length: size.max(1),
+            extent_hash: Vec::new(),
+        }],
+    }
+}
+
+fn extent_descriptor_to_range(file_id: u64) -> impl Fn(ExtentDescriptor) -> ExtentRange {
+    move |extent| ExtentRange {
+        file_id: FileId(file_id),
+        extent_index: extent.extent_index,
+        file_offset: extent.file_offset,
+        length: extent.length,
     }
 }
 
@@ -811,15 +901,16 @@ pub fn proto_prefetch_priority(priority: PrefetchPriority) -> i32 {
 /// Sorts a prefetch request into deterministic priority order for execution.
 #[must_use]
 pub fn schedule_prefetch_request(request: &PrefetchRequest) -> PrefetchSchedule {
-    let mut ranges = request.ranges.clone();
-    ranges.sort_by(|left, right| {
+    let mut extents = request.extents.clone();
+    extents.sort_by(|left, right| {
         prefetch_priority_ordinal(left.priority)
             .cmp(&prefetch_priority_ordinal(right.priority))
-            .then_with(|| left.range.file_id.cmp(&right.range.file_id))
-            .then_with(|| left.range.start_offset.cmp(&right.range.start_offset))
+            .then_with(|| left.extent.file_id.cmp(&right.extent.file_id))
+            .then_with(|| left.extent.file_offset.cmp(&right.extent.file_offset))
+            .then_with(|| left.extent.extent_index.cmp(&right.extent.extent_index))
     });
     PrefetchSchedule {
-        ranges,
+        extents,
         wait_through: request.wait_through,
     }
 }
@@ -858,14 +949,14 @@ mod tests {
         RetryPolicy, SessionStatus, build_tls_client_config, schedule_prefetch_request,
     };
     use legato_client_cache::{
-        BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
+        ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
     };
     use legato_proto::{
-        FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse,
-        PROTOCOL_VERSION,
+        ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata, InvalidationEvent,
+        InvalidationKind, OpenRequest, OpenResponse, PROTOCOL_VERSION,
     };
     use legato_types::{
-        BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
+        ExtentRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
     };
     use tempfile::tempdir;
 
@@ -1078,65 +1169,64 @@ mod tests {
     }
 
     #[test]
-    fn fetch_coordinator_deduplicates_overlapping_ranges() {
+    fn fetch_coordinator_deduplicates_overlapping_extents() {
         let temp = tempdir().expect("tempdir should be created");
         let connection = open_cache_database(&temp.path().join("client.sqlite"))
             .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
             .expect("store should open");
-        let mut coordinator = FetchCoordinator::new(4096);
+        let mut coordinator = FetchCoordinator::new();
 
         let first = coordinator
-            .prepare_range(
+            .prepare_extent(
                 &mut store,
-                &BlockRange {
+                &ExtentRange {
                     file_id: FileId(7),
-                    start_offset: 0,
-                    block_count: 2,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: 4096,
                 },
                 100,
             )
             .expect("first fetch plan should succeed");
-        assert_eq!(first.missing.len(), 2);
+        assert_eq!(first.missing.len(), 1);
 
         let second = coordinator
-            .prepare_range(
+            .prepare_extent(
                 &mut store,
-                &BlockRange {
+                &ExtentRange {
                     file_id: FileId(7),
-                    start_offset: 4096,
-                    block_count: 2,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: 4096,
                 },
                 100,
             )
             .expect("second fetch plan should succeed");
-        assert_eq!(
-            second.missing,
-            vec![legato_client_cache::CacheKey {
-                file_id: FileId(7),
-                start_offset: 8192,
-            }]
-        );
+        assert!(second.missing.is_empty());
 
         let _ = coordinator
-            .complete_block(
+            .complete_extent(
                 &mut store,
-                &legato_client_cache::CacheKey {
+                &ExtentRange {
                     file_id: FileId(7),
-                    start_offset: 0,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: 4096,
                 },
                 b"abcd",
                 1,
                 100,
             )
-            .expect("completed block should persist");
+            .expect("completed extent should persist");
         let cached = coordinator
-            .prepare_range(
+            .prepare_extent(
                 &mut store,
-                &BlockRange {
+                &ExtentRange {
                     file_id: FileId(7),
-                    start_offset: 0,
-                    block_count: 1,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: 4096,
                 },
                 200,
             )
@@ -1150,25 +1240,27 @@ mod tests {
         let temp = tempdir().expect("tempdir should be created");
         let connection = open_cache_database(&temp.path().join("client.sqlite"))
             .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
             .expect("store should open");
-        let mut coordinator = FetchCoordinator::new(4096);
+        let mut coordinator = FetchCoordinator::new();
         let mut executor = PrefetchExecutor::new();
         let request = PrefetchRequest {
-            ranges: vec![
+            extents: vec![
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(7),
-                        start_offset: 0,
-                        block_count: 2,
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
                     },
                     priority: PrefetchPriority::P0,
                 },
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(7),
-                        start_offset: 8192,
-                        block_count: 1,
+                        extent_index: 1,
+                        file_offset: 4096,
+                        length: 4096,
                     },
                     priority: PrefetchPriority::P2,
                 },
@@ -1177,34 +1269,30 @@ mod tests {
         };
 
         let execution = executor
-            .execute_with_source(
-                &request,
-                &mut coordinator,
-                &mut store,
-                100,
-                |_file_id, offset| format!("block-{offset}").into_bytes(),
-            )
+            .execute_with_source(&request, &mut coordinator, &mut store, 100, |extent| {
+                format!("extent-{}", extent.extent_index).into_bytes()
+            })
             .expect("prefetch execution should succeed");
 
         assert_eq!(execution.accepted.len(), 2);
         assert_eq!(execution.completed.len(), 1);
-        assert!(executor.is_range_resident(
-            &BlockRange {
+        assert!(executor.is_extent_resident(
+            &ExtentRange {
                 file_id: FileId(7),
-                start_offset: 0,
-                block_count: 2,
+                extent_index: 0,
+                file_offset: 0,
+                length: 4096,
             },
             PrefetchPriority::P1,
-            4096,
         ));
-        assert!(!executor.is_range_resident(
-            &BlockRange {
+        assert!(!executor.is_extent_resident(
+            &ExtentRange {
                 file_id: FileId(7),
-                start_offset: 8192,
-                block_count: 1,
+                extent_index: 1,
+                file_offset: 4096,
+                length: 4096,
             },
             PrefetchPriority::P1,
-            4096,
         ));
     }
 
@@ -1213,19 +1301,34 @@ mod tests {
         let temp = tempdir().expect("tempdir should be created");
         let connection = open_cache_database(&temp.path().join("client.sqlite"))
             .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
+        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
             .expect("store should open");
         let mut control =
-            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 4096);
-        control.register_path(
-            FileMetadata {
+            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
+        control.register_resolved_path(
+            InodeMetadata {
                 file_id: 7,
                 path: String::from("/srv/libraries/Kontakt/piano.nki"),
                 size: 8192,
                 mtime_ns: 10,
-                content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 4096,
+                layout: Some(FileLayout {
+                    transfer_class: 0,
+                    extents: vec![
+                        ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 4096,
+                            extent_hash: Vec::new(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 1,
+                            file_offset: 4096,
+                            length: 4096,
+                            extent_hash: Vec::new(),
+                        },
+                    ],
+                }),
             },
             100,
         );
@@ -1239,36 +1342,55 @@ mod tests {
             .prefetch_paths(
                 &[PrefetchHintPath {
                     path: "/srv/libraries/Kontakt/piano.nki".into(),
-                    start_offset: 0,
-                    block_count: 2,
+                    file_offset: 0,
+                    length: 8192,
                     priority: PrefetchPriority::P0,
                 }],
                 PrefetchPriority::P1,
                 &mut store,
                 200,
-                |_file_id, offset| format!("prefetch-{offset}").into_bytes(),
+                |extent| format!("prefetch-{}", extent.extent_index).into_bytes(),
             )
             .expect("control-plane prefetch should succeed");
         assert_eq!(
             execution,
             PrefetchExecution {
-                accepted: vec![BlockRange {
-                    file_id: FileId(7),
-                    start_offset: 0,
-                    block_count: 2,
-                }],
-                completed: vec![BlockRange {
-                    file_id: FileId(7),
-                    start_offset: 0,
-                    block_count: 2,
-                }],
+                accepted: vec![
+                    ExtentRange {
+                        file_id: FileId(7),
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
+                    },
+                    ExtentRange {
+                        file_id: FileId(7),
+                        extent_index: 1,
+                        file_offset: 4096,
+                        length: 4096,
+                    },
+                ],
+                completed: vec![
+                    ExtentRange {
+                        file_id: FileId(7),
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
+                    },
+                    ExtentRange {
+                        file_id: FileId(7),
+                        extent_index: 1,
+                        file_offset: 4096,
+                        length: 4096,
+                    },
+                ],
             }
         );
-        assert!(control.is_range_resident(
-            &BlockRange {
+        assert!(control.is_extent_resident(
+            &ExtentRange {
                 file_id: FileId(7),
-                start_offset: 0,
-                block_count: 2,
+                extent_index: 0,
+                file_offset: 0,
+                length: 4096,
             },
             PrefetchPriority::P1,
         ));
@@ -1303,7 +1425,7 @@ mod tests {
         runtime.mark_transport_unavailable();
 
         let mut control =
-            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 1 << 20);
+            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
         control.register_path(
             FileMetadata {
                 file_id: 11,
@@ -1371,28 +1493,31 @@ mod tests {
     #[test]
     fn prefetch_requests_are_scheduled_in_priority_then_offset_order() {
         let schedule = schedule_prefetch_request(&PrefetchRequest {
-            ranges: vec![
+            extents: vec![
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(3),
-                        start_offset: 4096,
-                        block_count: 1,
+                        extent_index: 1,
+                        file_offset: 4096,
+                        length: 4096,
                     },
                     priority: PrefetchPriority::P2,
                 },
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(2),
-                        start_offset: 8192,
-                        block_count: 1,
+                        extent_index: 2,
+                        file_offset: 8192,
+                        length: 4096,
                     },
                     priority: PrefetchPriority::P0,
                 },
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(2),
-                        start_offset: 0,
-                        block_count: 1,
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
                     },
                     priority: PrefetchPriority::P0,
                 },
@@ -1401,8 +1526,8 @@ mod tests {
         });
 
         assert_eq!(schedule.wait_through, PrefetchPriority::P1);
-        assert_eq!(schedule.ranges[0].range.start_offset, 0);
-        assert_eq!(schedule.ranges[1].range.start_offset, 8192);
-        assert_eq!(schedule.ranges[2].priority, PrefetchPriority::P2);
+        assert_eq!(schedule.extents[0].extent.file_offset, 0);
+        assert_eq!(schedule.extents[1].extent.file_offset, 8192);
+        assert_eq!(schedule.extents[2].priority, PrefetchPriority::P2);
     }
 }

@@ -335,10 +335,9 @@ fn control_plane_for_mount(
 ) -> Result<LocalControlPlane, Box<dyn std::error::Error>> {
     let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
     let _store = BlockCacheStore::new(&Path::new(&mount.state_dir).join("blocks"), database)?;
-    let mut control = LocalControlPlane::new(
-        legato_client_cache::MetadataCache::new(legato_client_cache::MetadataCachePolicy::default()),
-        1 << 20,
-    );
+    let mut control = LocalControlPlane::new(legato_client_cache::MetadataCache::new(
+        legato_client_cache::MetadataCachePolicy::default(),
+    ));
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos() as u64);

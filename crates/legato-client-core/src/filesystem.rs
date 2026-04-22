@@ -122,7 +122,7 @@ impl FilesystemService {
         store.recover(max_cache_bytes, now_monotonic_ns())?;
         let mut transport = GrpcClientTransport::connect(config, client_name).await?;
         let invalidations = Some(transport.subscribe_invalidations().await?);
-        let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 0);
+        let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
 
         Ok(Self {
             transport,

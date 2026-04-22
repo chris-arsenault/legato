@@ -4,13 +4,13 @@ use std::{fs, io::Write};
 
 use flate2::{Compression, write::GzEncoder};
 use legato_client_cache::{
-    BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
+    ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
 };
 use legato_client_core::LocalControlPlane;
 use legato_prefetch::analyze_project;
-use legato_proto::{BlockRequest, OpenRequest, ReadBlocksRequest, ResolvePathRequest};
+use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata, OpenRequest};
 use legato_server::{MetadataService, open_metadata_database, reconcile_library_root};
-use legato_types::{FileId, PrefetchHintPath, PrefetchPriority};
+use legato_types::{ExtentRange, FileId, PrefetchHintPath, PrefetchPriority};
 use tempfile::tempdir;
 
 #[test]
@@ -29,67 +29,54 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
     let mut service = MetadataService::new(
         open_metadata_database(&database_path).expect("database should reopen"),
     );
-    let metadata = service
-        .resolve_path(ResolvePathRequest {
-            path: sample_path.to_string_lossy().into_owned(),
-        })
-        .expect("resolve should succeed")
-        .expect("sample should resolve")
-        .metadata
-        .expect("metadata should be present");
-    let open = service
+    let inode = catalog_entry_to_inode(
+        service
+            .resolve_catalog_path(sample_path.to_string_lossy().as_ref())
+            .expect("resolve should succeed")
+            .expect("sample should resolve"),
+    );
+    let _open = service
         .open(OpenRequest {
             path: sample_path.to_string_lossy().into_owned(),
         })
-        .expect("open should succeed")
+        .expect("resolve should succeed")
         .expect("sample should open");
 
     let client_db =
         open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =
-        BlockCacheStore::new(&temp.path().join("blocks"), client_db).expect("store should open");
-    let mut control = LocalControlPlane::new(
-        MetadataCache::new(MetadataCachePolicy::default()),
-        metadata.block_size,
-    );
-    control.register_path(metadata.clone(), 1);
+        ExtentCacheStore::new(&temp.path().join("extents"), client_db).expect("store should open");
+    let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
+    control.register_resolved_path(inode.clone(), 1);
 
     let execution = control
         .prefetch_paths(
             &[PrefetchHintPath {
                 path: sample_path.clone(),
-                start_offset: 0,
-                block_count: 1,
+                file_offset: 0,
+                length: inode.size,
                 priority: PrefetchPriority::P0,
             }],
             PrefetchPriority::P1,
             &mut store,
             2,
-            |_file_id, offset| {
-                service
-                    .read_blocks(ReadBlocksRequest {
-                        ranges: vec![BlockRequest {
-                            file_handle: open.file_handle,
-                            start_offset: offset,
-                            block_count: 1,
-                        }],
-                    })
-                    .expect("server read should succeed")
-                    .into_iter()
-                    .next()
-                    .expect("one block should be returned")
-                    .data
+            |extent| {
+                std::fs::read(&sample_path).expect("sample should read")[(extent.file_offset
+                    as usize)
+                    ..(extent.file_offset + extent.length).min(inode.size) as usize]
+                    .to_vec()
             },
         )
         .expect("prefetch should succeed");
 
     assert_eq!(execution.accepted.len(), 1);
     assert_eq!(execution.completed.len(), 1);
-    assert!(control.is_range_resident(
-        &legato_types::BlockRange {
-            file_id: FileId(metadata.file_id),
-            start_offset: 0,
-            block_count: 1,
+    assert!(control.is_extent_resident(
+        &ExtentRange {
+            file_id: FileId(inode.file_id),
+            extent_index: 0,
+            file_offset: 0,
+            length: inode.size,
         },
         PrefetchPriority::P1,
     ));
@@ -128,68 +115,101 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
     let mut service = MetadataService::new(
         open_metadata_database(&database_path).expect("database should reopen"),
     );
-    let metadata = service
-        .resolve_path(ResolvePathRequest {
-            path: hint.path.clone(),
-        })
-        .expect("resolve should succeed")
-        .expect("sample should resolve")
-        .metadata
-        .expect("metadata should be present");
-    let open = service
+    let inode = catalog_entry_to_inode(
+        service
+            .resolve_catalog_path(&hint.path)
+            .expect("resolve should succeed")
+            .expect("sample should resolve"),
+    );
+    let _open = service
         .open(OpenRequest {
             path: hint.path.clone(),
         })
-        .expect("open should succeed")
+        .expect("resolve should succeed")
         .expect("sample should open");
 
     let client_db =
         open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =
-        BlockCacheStore::new(&temp.path().join("blocks"), client_db).expect("store should open");
-    let mut control = LocalControlPlane::new(
-        MetadataCache::new(MetadataCachePolicy::default()),
-        metadata.block_size,
-    );
-    control.register_path(metadata.clone(), 1);
+        ExtentCacheStore::new(&temp.path().join("extents"), client_db).expect("store should open");
+    let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
+    control.register_resolved_path(inode.clone(), 1);
 
     let execution = control
         .prefetch_paths(
             &[PrefetchHintPath {
                 path: sample_path.clone(),
-                start_offset: hint.start_offset,
-                block_count: hint.block_count,
+                file_offset: hint.file_offset,
+                length: hint.length,
                 priority: hint.priority,
             }],
             analysis.wait_through,
             &mut store,
             2,
-            |_file_id, offset| {
-                service
-                    .read_blocks(ReadBlocksRequest {
-                        ranges: vec![BlockRequest {
-                            file_handle: open.file_handle,
-                            start_offset: offset,
-                            block_count: 1,
-                        }],
-                    })
-                    .expect("server read should succeed")
-                    .into_iter()
-                    .next()
-                    .expect("one block should be returned")
-                    .data
+            |extent| {
+                std::fs::read(&sample_path).expect("sample should read")[(extent.file_offset
+                    as usize)
+                    ..(extent.file_offset + extent.length).min(inode.size) as usize]
+                    .to_vec()
             },
         )
         .expect("prefetch should succeed");
 
     assert_eq!(analysis.plugins, vec![String::from("Kontakt")]);
     assert_eq!(execution.completed.len(), 1);
-    assert!(control.is_range_resident(
-        &legato_types::BlockRange {
-            file_id: FileId(metadata.file_id),
-            start_offset: 0,
-            block_count: 1,
+    assert!(control.is_extent_resident(
+        &ExtentRange {
+            file_id: FileId(inode.file_id),
+            extent_index: 0,
+            file_offset: 0,
+            length: inode.size,
         },
         PrefetchPriority::P1,
     ));
+}
+
+fn catalog_entry_to_inode(entry: legato_server::CatalogEntry) -> InodeMetadata {
+    let layout =
+        entry
+            .transfer_class
+            .zip(entry.extent_bytes)
+            .map(|(transfer_class, extent_bytes)| FileLayout {
+                transfer_class: transfer_class as i32,
+                extents: build_extents(entry.metadata.size, extent_bytes),
+            });
+    InodeMetadata {
+        file_id: entry.metadata.file_id,
+        path: entry.metadata.path,
+        size: entry.metadata.size,
+        mtime_ns: entry.metadata.mtime_ns,
+        is_dir: entry.metadata.is_dir,
+        layout,
+    }
+}
+
+fn build_extents(size: u64, extent_bytes: u64) -> Vec<ExtentDescriptor> {
+    if size == 0 {
+        return vec![ExtentDescriptor {
+            extent_index: 0,
+            file_offset: 0,
+            length: 1,
+            extent_hash: Vec::new(),
+        }];
+    }
+
+    let mut extents = Vec::new();
+    let mut file_offset = 0_u64;
+    let mut extent_index = 0_u32;
+    while file_offset < size {
+        let length = extent_bytes.max(1).min(size - file_offset);
+        extents.push(ExtentDescriptor {
+            extent_index,
+            file_offset,
+            length,
+            extent_hash: Vec::new(),
+        });
+        file_offset += length;
+        extent_index += 1;
+    }
+    extents
 }

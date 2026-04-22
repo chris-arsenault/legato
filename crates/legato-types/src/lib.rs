@@ -20,7 +20,7 @@ pub enum PrefetchPriority {
     P3,
 }
 
-/// Block-oriented byte range tied to a stable file identifier.
+/// Fixed-size block range retained for block-transport compatibility.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockRange {
     /// The stable identifier of the target file.
@@ -31,11 +31,24 @@ pub struct BlockRange {
     pub block_count: u32,
 }
 
+/// Semantic extent range tied to a stable file identifier.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ExtentRange {
+    /// Stable identifier of the target file.
+    pub file_id: FileId,
+    /// Logical extent index within the file layout.
+    pub extent_index: u32,
+    /// The inclusive starting byte offset.
+    pub file_offset: u64,
+    /// Logical extent length in bytes.
+    pub length: u64,
+}
+
 /// A project-derived request to warm data into the client cache.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefetchRequest {
-    /// Requested ranges ordered by the planner.
-    pub ranges: Vec<PrefetchPlanEntry>,
+    /// Requested extents ordered by the planner.
+    pub extents: Vec<PrefetchPlanEntry>,
     /// Highest priority that must be durably resident before returning.
     pub wait_through: PrefetchPriority,
 }
@@ -43,8 +56,8 @@ pub struct PrefetchRequest {
 /// A single file/range request paired with an explicit priority.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefetchPlanEntry {
-    /// Range to make resident in the local cache.
-    pub range: BlockRange,
+    /// Extent to make resident in the local cache.
+    pub extent: ExtentRange,
     /// Scheduling priority for the range.
     pub priority: PrefetchPriority,
 }
@@ -55,9 +68,9 @@ pub struct PrefetchHintPath {
     /// Canonical library path or a path that can be resolved against the mount.
     pub path: PathBuf,
     /// Starting byte offset for the requested warmup.
-    pub start_offset: u64,
-    /// Number of blocks associated with the hint.
-    pub block_count: u32,
+    pub file_offset: u64,
+    /// Total byte length requested for the warmup.
+    pub length: u64,
     /// Scheduling priority assigned by the parser.
     pub priority: PrefetchPriority,
 }
@@ -225,7 +238,7 @@ pub fn platform_error_code(platform: ClientPlatform, error: FilesystemError) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockRange, ClientPlatform, FileId, FilesystemError, FilesystemOperation,
+        ClientPlatform, ExtentRange, FileId, FilesystemError, FilesystemOperation,
         FilesystemSemantics, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
         platform_error_code,
     };
@@ -233,20 +246,22 @@ mod tests {
     #[test]
     fn prefetch_request_keeps_priority_ordering_explicit() {
         let request = PrefetchRequest {
-            ranges: vec![
+            extents: vec![
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(7),
-                        start_offset: 0,
-                        block_count: 1,
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 1 << 20,
                     },
                     priority: PrefetchPriority::P0,
                 },
                 PrefetchPlanEntry {
-                    range: BlockRange {
+                    extent: ExtentRange {
                         file_id: FileId(7),
-                        start_offset: 1 << 20,
-                        block_count: 2,
+                        extent_index: 1,
+                        file_offset: 1 << 20,
+                        length: 2 << 20,
                     },
                     priority: PrefetchPriority::P2,
                 },
@@ -254,7 +269,7 @@ mod tests {
             wait_through: PrefetchPriority::P1,
         };
 
-        assert_eq!(request.ranges.len(), 2);
+        assert_eq!(request.extents.len(), 2);
         assert_eq!(request.wait_through, PrefetchPriority::P1);
     }
 

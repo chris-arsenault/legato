@@ -9,10 +9,10 @@ use std::{
 
 use flate2::read::GzDecoder;
 use legato_client_cache::{
-    BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
+    ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
 };
 use legato_client_core::LocalControlPlane;
-use legato_proto::FileMetadata;
+use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
 use legato_types::{PrefetchHintPath, PrefetchPriority};
 use regex::Regex;
 use serde::Serialize;
@@ -72,10 +72,10 @@ pub struct ProjectAnalysis {
 pub struct PrefetchHint {
     /// Canonical or hinted path to warm.
     pub path: String,
-    /// Starting offset for the hint.
-    pub start_offset: u64,
-    /// Number of fixed-size blocks requested.
-    pub block_count: u32,
+    /// Starting byte offset for the hint.
+    pub file_offset: u64,
+    /// Total byte length requested.
+    pub length: u64,
     /// Planner-assigned priority.
     pub priority: PrefetchPriority,
 }
@@ -84,8 +84,8 @@ impl From<PrefetchHintPath> for PrefetchHint {
     fn from(value: PrefetchHintPath) -> Self {
         Self {
             path: value.path.to_string_lossy().into_owned(),
-            start_offset: value.start_offset,
-            block_count: value.block_count,
+            file_offset: value.file_offset,
+            length: value.length,
             priority: value.priority,
         }
     }
@@ -95,8 +95,8 @@ impl From<PrefetchHint> for PrefetchHintPath {
     fn from(value: PrefetchHint) -> Self {
         Self {
             path: PathBuf::from(value.path),
-            start_offset: value.start_offset,
-            block_count: value.block_count,
+            file_offset: value.file_offset,
+            length: value.length,
             priority: value.priority,
         }
     }
@@ -288,8 +288,8 @@ fn analyze_als(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchErr
         .into_iter()
         .map(|path| PrefetchHint {
             path,
-            start_offset: 0,
-            block_count: 1,
+            file_offset: 0,
+            length: 256 * 1024,
             priority: PrefetchPriority::P1,
         })
         .collect::<Vec<_>>();
@@ -332,8 +332,8 @@ fn analyze_nki(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchErr
         .into_iter()
         .map(|sample_path| PrefetchHint {
             path: sample_path,
-            start_offset: 0,
-            block_count: 4,
+            file_offset: 0,
+            length: 4 * 1024 * 1024,
             priority: PrefetchPriority::P0,
         })
         .collect::<Vec<_>>();
@@ -380,8 +380,8 @@ fn analyze_plugin_state(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, Pr
                 .into_iter()
                 .map(|sample_path| PrefetchHint {
                     path: sample_path,
-                    start_offset: 0,
-                    block_count: 4,
+                    file_offset: 0,
+                    length: 4 * 1024 * 1024,
                     priority: PrefetchPriority::P0,
                 }),
         );
@@ -392,8 +392,8 @@ fn analyze_plugin_state(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, Pr
             .into_iter()
             .map(|sample_path| PrefetchHint {
                 path: sample_path,
-                start_offset: 0,
-                block_count: 1,
+                file_offset: 0,
+                length: 256 * 1024,
                 priority: PrefetchPriority::P2,
             }),
     );
@@ -538,10 +538,9 @@ fn execute_analysis(analysis: &ProjectAnalysis) -> Result<BTreeMap<String, usize
     let cache_root = std::env::temp_dir().join(format!("legato-prefetch-{}", unix_now_ns()));
     let database = open_cache_database(&cache_root.join("client.sqlite"))
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    let mut store = BlockCacheStore::new(&cache_root.join("blocks"), database)
+    let mut store = ExtentCacheStore::new(&cache_root.join("extents"), database)
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    let mut control =
-        LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 1 << 20);
+    let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
 
     for (index, hint) in scheduled_hints(
         analysis
@@ -554,15 +553,22 @@ fn execute_analysis(analysis: &ProjectAnalysis) -> Result<BTreeMap<String, usize
     .into_iter()
     .enumerate()
     {
-        control.register_path(
-            FileMetadata {
+        control.register_resolved_path(
+            InodeMetadata {
                 file_id: (index + 1) as u64,
                 path: hint.path.to_string_lossy().into_owned(),
-                size: 0,
+                size: hint.length.max(1),
                 mtime_ns: unix_now_ns(),
-                content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
+                layout: Some(FileLayout {
+                    transfer_class: 0,
+                    extents: vec![ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: hint.file_offset,
+                        length: hint.length.max(1),
+                        extent_hash: Vec::new(),
+                    }],
+                }),
             },
             unix_now_ns(),
         );
@@ -581,7 +587,7 @@ fn execute_analysis(analysis: &ProjectAnalysis) -> Result<BTreeMap<String, usize
             analysis.wait_through,
             &mut store,
             unix_now_ns(),
-            |_file_id, offset| format!("prefetch-{offset}").into_bytes(),
+            |extent| format!("prefetch-{}-{}", extent.file_id.0, extent.extent_index).into_bytes(),
         )
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
 
@@ -629,7 +635,7 @@ fn scheduled_hints(mut hints: Vec<PrefetchHintPath>) -> Vec<PrefetchHintPath> {
         priority_rank(left.priority)
             .cmp(&priority_rank(right.priority))
             .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.start_offset.cmp(&right.start_offset))
+            .then_with(|| left.file_offset.cmp(&right.file_offset))
     });
     hints
 }
@@ -639,7 +645,7 @@ fn sort_and_dedup_hints(hints: &mut Vec<PrefetchHint>) {
         priority_rank(left.priority)
             .cmp(&priority_rank(right.priority))
             .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.start_offset.cmp(&right.start_offset))
+            .then_with(|| left.file_offset.cmp(&right.file_offset))
     });
     hints.dedup();
 }
