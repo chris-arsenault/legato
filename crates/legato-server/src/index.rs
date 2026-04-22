@@ -1,6 +1,11 @@
 //! Library reconciliation and stable file-ID persistence for the server metadata DB.
 
-use std::{collections::HashSet, fs, path::Path, time::UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use walkdir::WalkDir;
@@ -27,65 +32,30 @@ pub fn reconcile_library_root(
     connection: &mut Connection,
     library_root: &Path,
 ) -> rusqlite::Result<ReconcileStats> {
+    reconcile_paths(connection, library_root, &[])
+}
+
+/// Reconciles a targeted set of paths, or the whole tree when `paths` is empty.
+pub fn reconcile_paths(
+    connection: &mut Connection,
+    library_root: &Path,
+    paths: &[PathBuf],
+) -> rusqlite::Result<ReconcileStats> {
     let root = fs::canonicalize(library_root)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let transaction = connection.transaction()?;
 
-    let mut seen_directories = HashSet::new();
-    let mut seen_files = HashSet::new();
     let mut stats = ReconcileStats::default();
 
-    for entry in WalkDir::new(&root).sort_by_file_name() {
-        let entry =
-            entry.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let path = entry.path().to_path_buf();
-        let path_string = normalize_path(&path);
-        let metadata = entry
-            .metadata()
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let identity = filesystem_identity(&metadata);
-        let mtime_ns = modified_time_ns(&metadata)?;
+    let scope_roots = if paths.is_empty() {
+        vec![root.clone()]
+    } else {
+        normalize_scope_roots(&root, paths)?
+    };
 
-        if metadata.is_dir() {
-            let parent_path = path
-                .parent()
-                .filter(|parent| *parent != path)
-                .map(normalize_path);
-            upsert_directory(
-                &transaction,
-                &path_string,
-                parent_path.as_deref(),
-                identity.device_id,
-                identity.inode,
-                mtime_ns,
-                &mut stats,
-            )?;
-            seen_directories.insert(path_string);
-        } else if metadata.is_file() {
-            let parent_path = normalize_path(
-                path.parent()
-                    .expect("walked file entries always have a parent directory"),
-            );
-            let directory_id = lookup_directory_id(&transaction, &parent_path)?
-                .ok_or_else(|| rusqlite::Error::InvalidParameterName(parent_path.clone()))?;
-            upsert_file(
-                &transaction,
-                FileObservation {
-                    directory_id,
-                    path: &path_string,
-                    size: metadata.len(),
-                    mtime_ns,
-                    device_id: identity.device_id,
-                    inode: identity.inode,
-                },
-                &mut stats,
-            )?;
-            seen_files.insert(path_string);
-        }
+    for scope_root in &scope_roots {
+        reconcile_scope(&transaction, &root, scope_root, &mut stats)?;
     }
-
-    prune_missing_files(&transaction, &root, &seen_files, &mut stats)?;
-    prune_missing_directories(&transaction, &root, &seen_directories, &mut stats)?;
 
     transaction.commit()?;
     Ok(stats)
@@ -134,6 +104,246 @@ fn modified_time_ns(metadata: &fs::Metadata) -> rusqlite::Result<i64> {
 
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn normalize_scope_roots(root: &Path, paths: &[PathBuf]) -> rusqlite::Result<Vec<PathBuf>> {
+    let mut normalized = Vec::new();
+
+    for path in paths {
+        let candidate = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+
+        let scoped = if candidate.exists() {
+            fs::canonicalize(&candidate)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+        } else {
+            candidate
+        };
+
+        if scoped == *root || scoped.starts_with(root) {
+            normalized.push(scoped);
+        }
+    }
+
+    normalized.sort();
+    normalized.dedup();
+
+    let mut filtered = Vec::new();
+    'outer: for candidate in normalized {
+        for existing in &filtered {
+            if candidate.starts_with(existing) {
+                continue 'outer;
+            }
+        }
+        filtered.push(candidate);
+    }
+
+    Ok(filtered)
+}
+
+fn reconcile_scope(
+    transaction: &Transaction<'_>,
+    library_root: &Path,
+    scope_root: &Path,
+    stats: &mut ReconcileStats,
+) -> rusqlite::Result<()> {
+    if scope_root.exists() {
+        let metadata = fs::metadata(scope_root)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        if metadata.is_dir() {
+            reconcile_existing_directory(transaction, library_root, scope_root, stats)?;
+        } else if metadata.is_file() {
+            reconcile_existing_file(transaction, library_root, scope_root, stats)?;
+        }
+    } else {
+        prune_missing_scope(transaction, scope_root, library_root, stats)?;
+        return Ok(());
+    }
+
+    let mut seen_directories = HashSet::new();
+    let mut seen_files = HashSet::new();
+
+    for entry in WalkDir::new(scope_root).sort_by_file_name() {
+        let entry =
+            entry.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let path_string = normalize_path(entry.path());
+
+        if entry.file_type().is_dir() {
+            seen_directories.insert(path_string);
+        } else if entry.file_type().is_file() {
+            seen_files.insert(path_string);
+        }
+    }
+
+    prune_missing_files(transaction, scope_root, &seen_files, stats)?;
+    prune_missing_directories(transaction, scope_root, &seen_directories, stats)?;
+    Ok(())
+}
+
+fn reconcile_existing_directory(
+    transaction: &Transaction<'_>,
+    library_root: &Path,
+    directory_root: &Path,
+    stats: &mut ReconcileStats,
+) -> rusqlite::Result<()> {
+    ensure_directory_chain(transaction, library_root, directory_root, stats)?;
+
+    for entry in WalkDir::new(directory_root).sort_by_file_name() {
+        let entry =
+            entry.map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let path = entry.path();
+        let path_string = normalize_path(path);
+        let identity = filesystem_identity(&metadata);
+        let mtime_ns = modified_time_ns(&metadata)?;
+
+        if metadata.is_dir() {
+            let parent_path = path
+                .parent()
+                .filter(|parent| *parent != path)
+                .map(normalize_path);
+            upsert_directory(
+                transaction,
+                &path_string,
+                parent_path.as_deref(),
+                identity.device_id,
+                identity.inode,
+                mtime_ns,
+                stats,
+            )?;
+        } else if metadata.is_file() {
+            let directory_path = normalize_path(
+                path.parent()
+                    .expect("walked file entries always have a parent directory"),
+            );
+            let directory_id = lookup_directory_id(transaction, &directory_path)?
+                .ok_or_else(|| rusqlite::Error::InvalidParameterName(directory_path.clone()))?;
+            upsert_file(
+                transaction,
+                FileObservation {
+                    directory_id,
+                    path: &path_string,
+                    size: metadata.len(),
+                    mtime_ns,
+                    device_id: identity.device_id,
+                    inode: identity.inode,
+                },
+                stats,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn reconcile_existing_file(
+    transaction: &Transaction<'_>,
+    library_root: &Path,
+    file_path: &Path,
+    stats: &mut ReconcileStats,
+) -> rusqlite::Result<()> {
+    let parent = file_path
+        .parent()
+        .expect("reconciled file paths always have a parent directory");
+    ensure_directory_chain(transaction, library_root, parent, stats)?;
+
+    let metadata = fs::metadata(file_path)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let identity = filesystem_identity(&metadata);
+    let mtime_ns = modified_time_ns(&metadata)?;
+    let file_string = normalize_path(file_path);
+    let parent_string = normalize_path(parent);
+    let directory_id = lookup_directory_id(transaction, &parent_string)?
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName(parent_string.clone()))?;
+
+    upsert_file(
+        transaction,
+        FileObservation {
+            directory_id,
+            path: &file_string,
+            size: metadata.len(),
+            mtime_ns,
+            device_id: identity.device_id,
+            inode: identity.inode,
+        },
+        stats,
+    )?;
+    Ok(())
+}
+
+fn ensure_directory_chain(
+    transaction: &Transaction<'_>,
+    library_root: &Path,
+    directory_path: &Path,
+    stats: &mut ReconcileStats,
+) -> rusqlite::Result<()> {
+    let mut chain = directory_path
+        .ancestors()
+        .take_while(|path| path.starts_with(library_root))
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    chain.reverse();
+
+    for path in chain {
+        if !path.exists() {
+            continue;
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        let identity = filesystem_identity(&metadata);
+        let mtime_ns = modified_time_ns(&metadata)?;
+        let path_string = normalize_path(&path);
+        let parent_path = path
+            .parent()
+            .filter(|parent| *parent != path)
+            .map(normalize_path);
+        upsert_directory(
+            transaction,
+            &path_string,
+            parent_path.as_deref(),
+            identity.device_id,
+            identity.inode,
+            mtime_ns,
+            stats,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn prune_missing_scope(
+    transaction: &Transaction<'_>,
+    scope_root: &Path,
+    library_root: &Path,
+    stats: &mut ReconcileStats,
+) -> rusqlite::Result<()> {
+    let scope_string = normalize_path(scope_root);
+    if scope_root == library_root {
+        let deleted_files = transaction.execute("DELETE FROM files", [])?;
+        let deleted_dirs = transaction.execute("DELETE FROM directories", [])?;
+        stats.files_deleted += deleted_files as u64;
+        stats.directories_deleted += deleted_dirs as u64;
+        return Ok(());
+    }
+
+    let prefix = format!("{scope_string}/%");
+    stats.files_deleted += transaction.execute(
+        "DELETE FROM files WHERE path = ?1 OR path LIKE ?2",
+        params![scope_string, prefix],
+    )? as u64;
+    stats.directories_deleted += transaction.execute(
+        "DELETE FROM directories WHERE path = ?1 OR path LIKE ?2",
+        params![scope_string, prefix],
+    )? as u64;
+    Ok(())
 }
 
 fn lookup_directory_id(transaction: &Transaction<'_>, path: &str) -> rusqlite::Result<Option<i64>> {
