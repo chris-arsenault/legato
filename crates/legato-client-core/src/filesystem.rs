@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::{
@@ -11,8 +11,9 @@ use legato_client_cache::{
 };
 use legato_proto::{BlockRequest, DirectoryEntry, FileMetadata, InvalidationEvent};
 use legato_types::{FileId, FilesystemAttributes};
+use tokio::time::timeout;
 
-use crate::{ClientConfig, GrpcClientTransport, LocalControlPlane};
+use crate::{ClientConfig, GrpcClientTransport, GrpcInvalidationSubscription, LocalControlPlane};
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -102,6 +103,7 @@ pub struct FilesystemService {
     store: BlockCacheStore,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
+    invalidations: Option<GrpcInvalidationSubscription>,
 }
 
 impl FilesystemService {
@@ -114,7 +116,8 @@ impl FilesystemService {
         let cache_db = open_cache_database(&state_dir.join("client.sqlite"))?;
         let store = BlockCacheStore::new(&state_dir.join("blocks"), cache_db)?;
         let block_size = config.cache.block_size;
-        let transport = GrpcClientTransport::connect(config, client_name).await?;
+        let mut transport = GrpcClientTransport::connect(config, client_name).await?;
+        let invalidations = Some(transport.subscribe_invalidations().await?);
         let control = LocalControlPlane::new(
             MetadataCache::new(MetadataCachePolicy::default()),
             block_size,
@@ -126,6 +129,7 @@ impl FilesystemService {
             store,
             next_handle: 1,
             open_handles: HashMap::new(),
+            invalidations,
         })
     }
 
@@ -135,11 +139,18 @@ impl FilesystemService {
         &self.transport.attach_session().server_name
     }
 
+    /// Returns whether the service currently has an active invalidation subscription.
+    #[must_use]
+    pub fn has_active_subscription(&self) -> bool {
+        self.invalidations.is_some()
+    }
+
     /// Returns a cached or remotely fetched metadata view for one path.
     pub async fn lookup(
         &mut self,
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
+        self.sync_invalidations().await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.control.resolve_path(path, now_ns) {
             return Ok(metadata_to_attributes(metadata));
@@ -159,6 +170,7 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
+        self.sync_invalidations().await?;
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.control.list_dir(path, now_ns) {
             return Ok(entries);
@@ -178,6 +190,7 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
+        self.sync_invalidations().await?;
         let response = self
             .transport
             .open(path.to_owned())
@@ -204,6 +217,7 @@ impl FilesystemService {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, FilesystemServiceError> {
+        self.sync_invalidations().await?;
         let snapshot = self
             .open_handles
             .get(&local_handle)
@@ -265,6 +279,57 @@ impl FilesystemService {
     #[must_use]
     pub fn open_handle(&self, local_handle: u64) -> Option<&FilesystemOpenHandle> {
         self.open_handles.get(&local_handle)
+    }
+
+    async fn sync_invalidations(&mut self) -> Result<(), FilesystemServiceError> {
+        loop {
+            if !self.poll_one_invalidation().await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_one_invalidation(&mut self) -> Result<bool, FilesystemServiceError> {
+        self.ensure_invalidation_subscription().await?;
+        let Some(mut subscription) = self.invalidations.take() else {
+            return Ok(false);
+        };
+
+        match timeout(Duration::from_millis(10), subscription.recv_next()).await {
+            Err(_elapsed) => {
+                self.invalidations = Some(subscription);
+                Ok(false)
+            }
+            Ok(Ok(Some(event))) => {
+                self.apply_invalidation(&event)?;
+                self.invalidations = Some(subscription);
+                Ok(true)
+            }
+            Ok(Ok(None)) => {
+                self.reconnect_and_resubscribe().await?;
+                Ok(false)
+            }
+            Ok(Err(error)) if should_retry_after_reconnect(&error) => {
+                self.reconnect_and_resubscribe().await?;
+                Ok(false)
+            }
+            Ok(Err(error)) => Err(FilesystemServiceError::Transport(error)),
+        }
+    }
+
+    async fn ensure_invalidation_subscription(&mut self) -> Result<(), FilesystemServiceError> {
+        if self.invalidations.is_none() {
+            self.invalidations = Some(self.transport.subscribe_invalidations().await?);
+        }
+        Ok(())
+    }
+
+    async fn reconnect_and_resubscribe(&mut self) -> Result<(), FilesystemServiceError> {
+        self.transport.reconnect().await?;
+        self.refresh_handles_from_runtime();
+        self.invalidations = Some(self.transport.subscribe_invalidations().await?);
+        Ok(())
     }
 
     async fn fetch_missing_blocks(
@@ -445,7 +510,10 @@ fn should_retry_after_reconnect(error: &crate::ClientTransportError) -> bool {
     match error {
         crate::ClientTransportError::Rpc(status) => matches!(
             status.code(),
-            tonic::Code::Unavailable | tonic::Code::InvalidArgument | tonic::Code::Unknown
+            tonic::Code::Cancelled
+                | tonic::Code::Unavailable
+                | tonic::Code::InvalidArgument
+                | tonic::Code::Unknown
         ),
         crate::ClientTransportError::Transport(_) => true,
         _ => false,
@@ -566,6 +634,7 @@ mod tests {
             .expect("release should succeed");
         assert!(service.open_handle(handle.local_handle).is_none());
 
+        drop(service);
         bound.shutdown().await.expect("server should shut down");
     }
 
@@ -646,7 +715,76 @@ mod tests {
             .expect("read should recover after reconnect");
         assert_eq!(slice, b"restart");
 
+        drop(service);
         second_bound.shutdown().await.expect("server should stop");
+    }
+
+    #[tokio::test]
+    async fn filesystem_service_establishes_and_uses_invalidation_subscription() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        let sample_path = library_root.join("Kontakt").join("piano.nki");
+        fs::write(&sample_path, b"hello legato").expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-cache",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let mut service = FilesystemService::connect(
+            local_client_config(address.to_string(), &bundle_dir, "localhost"),
+            "studio-cache",
+            fixture.path().join("client-state").as_path(),
+        )
+        .await
+        .expect("service should connect");
+        assert!(service.has_active_subscription());
+
+        let attrs = service
+            .lookup(sample_path.to_string_lossy().as_ref())
+            .await
+            .expect("lookup should succeed");
+        assert_eq!(attrs.file_id.0, 1);
+
+        let initial_entries = service
+            .read_dir(library_root.join("Kontakt").to_string_lossy().as_ref())
+            .await
+            .expect("initial readdir should succeed");
+        assert_eq!(initial_entries.len(), 1);
+
+        drop(service);
+        bound.shutdown().await.expect("server should shut down");
     }
 
     #[test]

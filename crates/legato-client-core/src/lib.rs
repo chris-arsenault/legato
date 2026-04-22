@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 pub use filesystem::{
     FilesystemOpenHandle, FilesystemService, FilesystemServiceError, now_monotonic_ns,
 };
-pub use transport::{ClientAttachSession, ClientTransportError, GrpcClientTransport};
+pub use transport::{
+    ClientAttachSession, ClientTransportError, GrpcClientTransport, GrpcInvalidationSubscription,
+};
 
 /// Immutable settings used to bootstrap a client runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

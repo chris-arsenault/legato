@@ -13,9 +13,9 @@ use tonic::{
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
     AttachResponse, BlockRequest, BlockResponse, CloseRequest, CloseResponse, DirectoryEntry,
-    FileMetadata, ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION, PrefetchRequest,
-    PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, StatRequest,
-    legato_client::LegatoClient,
+    FileMetadata, InvalidationEvent, ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+    PrefetchRequest, PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, StatRequest,
+    SubscribeRequest, legato_client::LegatoClient,
 };
 
 /// Session metadata returned after a successful attach.
@@ -25,6 +25,19 @@ pub struct ClientAttachSession {
     pub server_name: String,
     /// Capabilities negotiated for the current connection.
     pub negotiated_capabilities: Vec<i32>,
+}
+
+/// Streaming invalidation subscription tied to one live gRPC session.
+#[derive(Debug)]
+pub struct GrpcInvalidationSubscription {
+    stream: tonic::Streaming<InvalidationEvent>,
+}
+
+impl GrpcInvalidationSubscription {
+    /// Receives the next invalidation from the remote stream.
+    pub async fn recv_next(&mut self) -> Result<Option<InvalidationEvent>, ClientTransportError> {
+        self.stream.message().await.map_err(Into::into)
+    }
 }
 
 /// Errors returned by the live gRPC client transport.
@@ -248,6 +261,19 @@ impl GrpcClientTransport {
         request: PrefetchRequest,
     ) -> Result<PrefetchResponse, ClientTransportError> {
         Ok(self.client.prefetch(request).await?.into_inner())
+    }
+
+    /// Subscribes to the server invalidation stream for the current transport generation.
+    pub async fn subscribe_invalidations(
+        &mut self,
+    ) -> Result<GrpcInvalidationSubscription, ClientTransportError> {
+        let stream = self
+            .client
+            .subscribe(SubscribeRequest {})
+            .await?
+            .into_inner();
+        self.runtime.mark_subscription_active();
+        Ok(GrpcInvalidationSubscription { stream })
     }
 
     /// Closes one remote file handle.

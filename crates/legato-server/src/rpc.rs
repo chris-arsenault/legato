@@ -12,7 +12,7 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
     task::JoinHandle,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, timeout},
 };
 use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::{
@@ -60,10 +60,22 @@ pub struct BoundServer {
 impl BoundServer {
     /// Signals shutdown and waits for the underlying transport task to exit.
     pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = self.shutdown_signal.send(());
-        self.watch_task.abort();
-        drop(self.watcher);
-        self.task.await??;
+        let Self {
+            shutdown_signal,
+            mut task,
+            watch_task,
+            watcher,
+        } = self;
+        let _ = shutdown_signal.send(());
+        watch_task.abort();
+        drop(watcher);
+        match timeout(Duration::from_secs(5), &mut task).await {
+            Ok(task_result) => task_result??,
+            Err(_elapsed) => {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         Ok(())
     }
 }
