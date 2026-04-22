@@ -22,6 +22,7 @@ trap cleanup EXIT
 mkdir -p "${OUTPUT_DIR}" "${STAGE_DIR}/usr/local/bin" "${STAGE_DIR}${STATE_DIR}" "${STAGE_DIR}${CERT_DIR}" "${SCRIPTS_DIR}"
 
 cp "${ROOT_DIR}/target/release/legatofs" "${STAGE_DIR}/usr/local/bin/legatofs"
+cp "${ROOT_DIR}/deploy/client/macos/register-client.sh" "${STAGE_DIR}/usr/local/bin/legato-register-client"
 sed \
   -e "s#__CERT_DIR__#${CERT_DIR//\\/\\\\}#g" \
   -e "s#__MOUNT_POINT__#${MOUNT_POINT//\\/\\\\}#g" \
@@ -32,6 +33,7 @@ cp "${ROOT_DIR}/deploy/client/config/certs-README.txt" "${STAGE_DIR}${STATE_DIR}
 cp "${ROOT_DIR}/deploy/client/macos/scripts/preinstall" "${SCRIPTS_DIR}/preinstall"
 cp "${ROOT_DIR}/deploy/client/macos/scripts/postinstall" "${SCRIPTS_DIR}/postinstall"
 chmod 755 "${SCRIPTS_DIR}/preinstall" "${SCRIPTS_DIR}/postinstall"
+chmod 755 "${STAGE_DIR}/usr/local/bin/legatofs" "${STAGE_DIR}/usr/local/bin/legato-register-client"
 
 pkgbuild \
   --root "${STAGE_DIR}" \

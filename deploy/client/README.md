@@ -24,13 +24,16 @@ This document defines the installation and upgrade shape for the native Legato c
 
 - Packaging format: signed `.pkg`
 - Installed binary target: `/usr/local/bin/legatofs`
+- Installed registration helper: `/usr/local/bin/legato-register-client`
 - Config root: `/Library/Application Support/Legato`
 - Default installed config: `/Library/Application Support/Legato/legatofs.toml`
 - Installer build script: `deploy/client/package-macos.sh`
 - Installer output: `artifacts/macos/*.pkg`
 - Client-bundle install command:
   `legatofs install --bundle-dir <bundle> --endpoint <host:port> --server-name <dns-name> --mount-point /Volumes/Legato`
-- Startup model: packaged binary plus install-time bundle/config hydration; persistent service registration remains a later step once the runtime is a persistent mount daemon
+- Packaged registration helper:
+  `legato-register-client --bundle-dir <bundle> --endpoint <host:port> --server-name <dns-name> --mount-point /Volumes/Legato`
+- Startup model: packaged binary plus bundle/config hydration through the shared install command; persistent service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
   - replace the binary in place
@@ -41,17 +44,20 @@ This document defines the installation and upgrade shape for the native Legato c
 
 - Packaging format: installer `.exe` built with Inno Setup
 - Installed binary target: `C:\Program Files\Legato\legatofs.exe`
+- Installed registration helper: `C:\Program Files\Legato\register-client.ps1`
 - Config root: `C:\ProgramData\Legato`
 - Default installed config: `C:\ProgramData\Legato\legatofs.toml`
 - Installer build script: `deploy/client/package-windows.ps1`
 - Installer output: `artifacts/windows/*.exe`
 - Installer configuration prompts:
+  - optional client bundle directory
   - server endpoint
   - TLS server name
   - mount point
 - Client-bundle install command:
   `legatofs.exe install --bundle-dir <bundle> --endpoint <host:port> --server-name <dns-name> --mount-point L:\Legato`
-- Startup model: packaged binary plus install-time bundle/config hydration; persistent service registration remains a later step once the runtime is a persistent mount daemon
+- If the installer is given a valid bundle directory, it runs `legatofs.exe install` automatically during setup.
+- Startup model: packaged binary plus install-time bundle/config hydration through the shared install command; persistent service registration remains a later step once the runtime is a persistent mount daemon
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
   - replace the binary in place

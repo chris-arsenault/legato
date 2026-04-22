@@ -23,6 +23,7 @@ OutputBaseFilename=legatofs-{#MyAppVersion}-windows
 
 [Files]
 Source: "{#MyAppSourceDir}\legatofs.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\register-client.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\certs-README.txt"; DestDir: "{commonappdata}\Legato"; Flags: ignoreversion
 
 [Dirs]
@@ -32,18 +33,29 @@ Name: "{commonappdata}\Legato\blocks"
 
 [Icons]
 Name: "{group}\Legato Config"; Filename: "{commonappdata}\Legato\legatofs.toml"
+Name: "{group}\Register Legato Client"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\register-client.ps1"""
 Name: "{group}\Uninstall Legato Client"; Filename: "{uninstallexe}"
 
 [Code]
 var
+  BundleDirPage: TInputQueryWizardPage;
   ServerEndpointPage: TInputQueryWizardPage;
   ServerNamePage: TInputQueryWizardPage;
   MountPointPage: TInputQueryWizardPage;
 
 procedure InitializeWizard;
 begin
-  ServerEndpointPage := CreateInputQueryPage(
+  BundleDirPage := CreateInputQueryPage(
     wpSelectDir,
+    'Client Bundle',
+    'Optionally install a server-issued client bundle',
+    'Enter the directory containing server-ca.pem, client.pem, and client-key.pem if you want the installer to register this client now.'
+  );
+  BundleDirPage.Add('Bundle directory:', False);
+  BundleDirPage.Values[0] := '';
+
+  ServerEndpointPage := CreateInputQueryPage(
+    BundleDirPage.ID,
     'Legato Server',
     'Configure the Legato server endpoint',
     'Enter the Legato server endpoint the client should connect to.'
@@ -74,11 +86,39 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ConfigPath: string;
   ConfigContents: string;
+  BundleDir: string;
+  InstallArgs: string;
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     ConfigPath := ExpandConstant('{commonappdata}\Legato\legatofs.toml');
-    if not FileExists(ConfigPath) then
+    BundleDir := Trim(BundleDirPage.Values[0]);
+
+    if (BundleDir <> '') and DirExists(BundleDir) and
+       FileExists(AddBackslash(BundleDir) + 'server-ca.pem') and
+       FileExists(AddBackslash(BundleDir) + 'client.pem') and
+       FileExists(AddBackslash(BundleDir) + 'client-key.pem') then
+    begin
+      InstallArgs :=
+        'install ' +
+        '--bundle-dir "' + BundleDir + '" ' +
+        '--endpoint "' + ServerEndpointPage.Values[0] + '" ' +
+        '--server-name "' + ServerNamePage.Values[0] + '" ' +
+        '--mount-point "' + MountPointPage.Values[0] + '" ' +
+        '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
+        '--library-root "/srv/libraries" ' +
+        '--force';
+      if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      begin
+        RaiseException('Failed to execute legatofs install during Windows client registration.');
+      end;
+      if ResultCode <> 0 then
+      begin
+        RaiseException('legatofs install failed during Windows client registration.');
+      end;
+    end
+    else if not FileExists(ConfigPath) then
     begin
       ConfigContents :=
         '[common.tracing]' + #13#10 +

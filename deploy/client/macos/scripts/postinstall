@@ -18,6 +18,7 @@ if [ -f "${CONFIG_EXAMPLE}" ] && [ ! -f "${CONFIG_PATH}" ]; then
 fi
 
 chmod 755 /usr/local/bin/legatofs
+chmod 755 /usr/local/bin/legato-register-client
 chmod 755 "${STATE_DIR}"
 chmod 700 "${CERT_DIR}"
 

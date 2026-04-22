@@ -12,6 +12,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir, $BinaryStage | Out-Null
 
 try {
     Copy-Item (Join-Path $RootDir "target\release\legatofs.exe") (Join-Path $BinaryStage "legatofs.exe")
+    Copy-Item (Join-Path $RootDir "deploy\client\windows\register-client.ps1") (Join-Path $BinaryStage "register-client.ps1")
     Copy-Item (Join-Path $RootDir "deploy\client\config\certs-README.txt") (Join-Path $BinaryStage "certs-README.txt")
 
     if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue)) {
