@@ -531,6 +531,7 @@ dependencies = [
  "legato-types",
  "rusqlite",
  "tempfile",
+ "walkdir",
 ]
 
 [[package]]

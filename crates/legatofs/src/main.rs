@@ -7,7 +7,9 @@ use std::{
 
 use legato_client_cache::{BlockCacheStore, open_cache_database};
 use legato_client_core::{ClientConfig, ClientRuntime, LocalControlPlane};
-use legato_foundation::{CommonProcessConfig, init_tracing, load_config};
+use legato_foundation::{
+    CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
+};
 use legato_proto::FileMetadata;
 use legato_types::{
     ClientPlatform, FileId, FilesystemAttributes, FilesystemError, FilesystemSemantics,
@@ -54,6 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_config = load_config::<ClientProcessConfig>(None, "LEGATO_FS")
         .unwrap_or_else(|_| ClientProcessConfig::default());
     init_tracing("legatofs", &process_config.common.tracing)?;
+    let shutdown = ShutdownController::new();
+    let telemetry = ProcessTelemetry::new("legatofs", &process_config.common.metrics);
+    telemetry.record_startup();
+    telemetry.set_lifecycle_state("bootstrap", 1);
+    let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
 
     let runtime = ClientRuntime::new(ClientConfig::default());
     let startup = startup_context(&process_config.mount);
@@ -63,6 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let adapter = legato_fs_macos::MacosFilesystem::new(runtime, startup.mount_point.clone());
         let _ = &mut control;
+        telemetry.set_lifecycle_state("ready", 1);
         println!("legatofs bootstrap ready for {}", adapter.platform_name());
         return Ok(());
     }
@@ -72,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let adapter =
             legato_fs_windows::WindowsFilesystem::new(runtime, startup.mount_point.clone());
         let _ = &mut control;
+        telemetry.set_lifecycle_state("ready", 1);
         println!("legatofs bootstrap ready for {}", adapter.platform_name());
         return Ok(());
     }
@@ -80,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = runtime;
         let _ = control;
+        telemetry.set_lifecycle_state("ready", 1);
         println!("legatofs bootstrap ready for unsupported-host development");
         Ok(())
     }

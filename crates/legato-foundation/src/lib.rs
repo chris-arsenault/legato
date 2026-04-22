@@ -8,4 +8,7 @@ mod telemetry;
 pub use config::load_config;
 pub use error::FoundationError;
 pub use runtime::{ShutdownController, ShutdownToken};
-pub use telemetry::{CommonProcessConfig, MetricsConfig, TracingConfig, init_tracing, metric_name};
+pub use telemetry::{
+    CommonProcessConfig, MetricKind, MetricSample, MetricsConfig, MetricsRegistry,
+    ProcessTelemetry, TracingConfig, init_tracing, metric_name,
+};

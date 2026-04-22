@@ -6,8 +6,8 @@ use legato_client_cache::{
     BlockCacheStore, CacheConfig, CacheKey, CachedBlock, MetadataCache, MetadataCacheLookup,
 };
 use legato_proto::{
-    AttachRequest, FileMetadata, InvalidationEvent, OpenRequest, OpenResponse, PROTOCOL_VERSION,
-    PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
+    AttachRequest, FileMetadata, InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse,
+    PROTOCOL_VERSION, PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
 };
 use legato_types::{
     BlockRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
@@ -137,6 +137,15 @@ pub struct ReconnectPlan {
     pub reopen_requests: Vec<OpenRequest>,
 }
 
+/// Result of applying reconnect completion work after a new transport is established.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryCompletion {
+    /// Paths whose handles were successfully refreshed.
+    pub reopened_paths: Vec<String>,
+    /// Root invalidation to apply when the server generation changed.
+    pub invalidation: Option<InvalidationEvent>,
+}
+
 /// Errors encountered while loading the client TLS configuration.
 #[derive(Debug)]
 pub enum ClientTlsError {
@@ -225,12 +234,7 @@ impl ClientRuntime {
         client_name: &str,
     ) -> Result<(AttachRequest, Arc<RustlsClientConfig>), ClientTlsError> {
         let tls = build_tls_client_config(&self.config.tls)?;
-        self.generation += 1;
-        self.failure_count = 0;
-        self.session_status = SessionStatus::Connected {
-            generation: self.generation,
-            subscription_active: false,
-        };
+        self.mark_transport_ready(false);
         Ok((self.attach_request(client_name), tls))
     }
 
@@ -245,6 +249,13 @@ impl ClientRuntime {
                 generation,
                 subscription_active: true,
             };
+        }
+    }
+
+    /// Marks one tracked handle stale, typically after a server-side restart or ESTALE response.
+    pub fn mark_handle_stale(&mut self, path: &str) {
+        if let Some(open_file) = self.open_files.get_mut(path) {
+            open_file.stale = true;
         }
     }
 
@@ -283,6 +294,17 @@ impl ClientRuntime {
         delay_ms
     }
 
+    /// Marks the runtime connected for a new transport generation.
+    pub fn mark_transport_ready(&mut self, subscription_active: bool) -> u64 {
+        self.generation += 1;
+        self.failure_count = 0;
+        self.session_status = SessionStatus::Connected {
+            generation: self.generation,
+            subscription_active,
+        };
+        self.generation
+    }
+
     /// Builds the reconnect work needed to restore subscriptions and stale handles.
     #[must_use]
     pub fn reconnect_plan(&self, client_name: &str) -> ReconnectPlan {
@@ -308,6 +330,33 @@ impl ClientRuntime {
             attach: self.attach_request(client_name),
             resubscribe,
             reopen_requests,
+        }
+    }
+
+    /// Applies reconnect results and returns any invalidation required for local caches.
+    #[must_use]
+    pub fn complete_reconnect(
+        &mut self,
+        reopened: &[(String, OpenResponse)],
+        invalidation_root: Option<&str>,
+    ) -> RecoveryCompletion {
+        for (path, response) in reopened {
+            self.refresh_open_handle(path, response);
+        }
+
+        let mut reopened_paths = reopened
+            .iter()
+            .map(|(path, _response)| path.clone())
+            .collect::<Vec<_>>();
+        reopened_paths.sort();
+
+        RecoveryCompletion {
+            reopened_paths,
+            invalidation: invalidation_root.map(|path| InvalidationEvent {
+                kind: InvalidationKind::Subtree as i32,
+                path: String::from(path),
+                file_id: 0,
+            }),
         }
     }
 
@@ -761,8 +810,8 @@ mod tests {
 
     use super::{
         ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, FetchCoordinator,
-        LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RetryPolicy,
-        SessionStatus, build_tls_client_config, schedule_prefetch_request,
+        LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RecoveryCompletion,
+        RetryPolicy, SessionStatus, build_tls_client_config, schedule_prefetch_request,
     };
     use legato_client_cache::{
         BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
@@ -882,6 +931,66 @@ mod tests {
             !runtime
                 .open_file("/srv/libraries/Kontakt/piano.nki")
                 .expect("open file should be refreshed")
+                .stale
+        );
+    }
+
+    #[test]
+    fn explicit_stale_handle_recovery_refreshes_handles_and_invalidates_root() {
+        let mut runtime = ClientRuntime::new(ClientConfig::default());
+        runtime.mark_transport_ready(true);
+        runtime.record_open_handle(
+            "/srv/libraries/Kontakt/piano.nki",
+            &OpenResponse {
+                file_handle: 10,
+                file_id: 42,
+                size: 1024,
+                mtime_ns: 77,
+                content_hash: Vec::new(),
+                block_size: 4096,
+            },
+        );
+        runtime.mark_handle_stale("/srv/libraries/Kontakt/piano.nki");
+
+        let plan = runtime.reconnect_plan("legatofs");
+        let completion = runtime.complete_reconnect(
+            &[(
+                String::from("/srv/libraries/Kontakt/piano.nki"),
+                OpenResponse {
+                    file_handle: 22,
+                    file_id: 42,
+                    size: 1024,
+                    mtime_ns: 78,
+                    content_hash: Vec::new(),
+                    block_size: 4096,
+                },
+            )],
+            Some("/srv/libraries"),
+        );
+
+        assert_eq!(plan.reopen_requests.len(), 1);
+        assert_eq!(
+            completion,
+            RecoveryCompletion {
+                reopened_paths: vec![String::from("/srv/libraries/Kontakt/piano.nki")],
+                invalidation: Some(InvalidationEvent {
+                    kind: InvalidationKind::Subtree as i32,
+                    path: String::from("/srv/libraries"),
+                    file_id: 0,
+                }),
+            }
+        );
+        assert_eq!(
+            runtime
+                .open_file("/srv/libraries/Kontakt/piano.nki")
+                .expect("open file should still exist")
+                .file_handle,
+            22
+        );
+        assert!(
+            !runtime
+                .open_file("/srv/libraries/Kontakt/piano.nki")
+                .expect("open file should still exist")
                 .stale
         );
     }
@@ -1129,6 +1238,89 @@ mod tests {
             control
                 .resolve_path("/srv/libraries/Kontakt/piano.nki", 201)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn reconnect_completion_can_drive_control_plane_refresh_end_to_end() {
+        let mut runtime = ClientRuntime::new(ClientConfig::default());
+        runtime.mark_transport_ready(true);
+        runtime.record_open_handle(
+            "/srv/libraries/Strings/long.ncw",
+            &OpenResponse {
+                file_handle: 100,
+                file_id: 11,
+                size: 64,
+                mtime_ns: 1,
+                content_hash: Vec::new(),
+                block_size: 1 << 20,
+            },
+        );
+        runtime.mark_transport_unavailable();
+
+        let mut control =
+            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()), 1 << 20);
+        control.register_path(
+            FileMetadata {
+                file_id: 11,
+                path: String::from("/srv/libraries/Strings/long.ncw"),
+                size: 64,
+                mtime_ns: 1,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 1 << 20,
+            },
+            10,
+        );
+        let completion = runtime.complete_reconnect(
+            &[(
+                String::from("/srv/libraries/Strings/long.ncw"),
+                OpenResponse {
+                    file_handle: 200,
+                    file_id: 11,
+                    size: 64,
+                    mtime_ns: 2,
+                    content_hash: Vec::new(),
+                    block_size: 1 << 20,
+                },
+            )],
+            Some("/srv/libraries"),
+        );
+
+        control.apply_invalidation(
+            &completion
+                .invalidation
+                .expect("server restart should invalidate the control plane"),
+        );
+        assert!(
+            control
+                .resolve_path("/srv/libraries/Strings/long.ncw", 11)
+                .is_none()
+        );
+
+        control.register_path(
+            FileMetadata {
+                file_id: 11,
+                path: String::from("/srv/libraries/Strings/long.ncw"),
+                size: 64,
+                mtime_ns: 2,
+                content_hash: Vec::new(),
+                is_dir: false,
+                block_size: 1 << 20,
+            },
+            12,
+        );
+        assert!(
+            control
+                .resolve_path("/srv/libraries/Strings/long.ncw", 13)
+                .is_some()
+        );
+        assert_eq!(
+            runtime
+                .open_file("/srv/libraries/Strings/long.ncw")
+                .expect("open file should exist")
+                .file_handle,
+            200
         );
     }
 
