@@ -51,3 +51,16 @@ jobs:
         with:
           name: legatofs-windows-installer
           path: artifacts/windows/*.exe
+
+  release-validation:
+    name: Release Validation
+    needs: [ci]
+    runs-on: ubuntu-latest
+    if: ${{ needs.ci.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binaries
+        run: cargo build --release -p legato-server -p legatofs
+      - name: Run local release smoke
+        run: ./deploy/release/validate-local.sh

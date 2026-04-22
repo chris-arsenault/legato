@@ -58,7 +58,7 @@ struct StartupContext {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(command) = parse_command()? {
-        return run_command(command);
+        return run_command(command).await;
     }
 
     let process_config =
@@ -134,6 +134,12 @@ enum Command {
         library_root: String,
         force: bool,
     },
+    Smoke {
+        config_path: Option<PathBuf>,
+        path: String,
+        offset: u64,
+        size: u32,
+    },
 }
 
 fn parse_command() -> Result<Option<Command>, Box<dyn std::error::Error>> {
@@ -184,11 +190,44 @@ where
                 force,
             }))
         }
+        "smoke" => {
+            let mut config_path = None;
+            let mut path = None;
+            let mut offset = 0_u64;
+            let mut size = 4096_u32;
+
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--config" => config_path = arguments.next().map(PathBuf::from),
+                    "--path" => path = arguments.next(),
+                    "--offset" => {
+                        offset = arguments
+                            .next()
+                            .ok_or("missing value for --offset")?
+                            .parse()?;
+                    }
+                    "--size" => {
+                        size = arguments
+                            .next()
+                            .ok_or("missing value for --size")?
+                            .parse()?;
+                    }
+                    other => return Err(format!("unsupported argument for smoke: {other}").into()),
+                }
+            }
+
+            Ok(Some(Command::Smoke {
+                config_path,
+                path: path.ok_or("missing --path for smoke")?,
+                offset,
+                size,
+            }))
+        }
         other => Err(format!("unsupported legatofs command: {other}").into()),
     }
 }
 
-fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Install {
             bundle_dir,
@@ -211,6 +250,45 @@ fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "installed Legato client config into {}",
                 state_dir.display()
+            );
+            Ok(())
+        }
+        Command::Smoke {
+            config_path,
+            path,
+            offset,
+            size,
+        } => {
+            let process_config =
+                load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
+            let mut service = FilesystemService::connect(
+                process_config.client.clone(),
+                default_client_name(),
+                Path::new(&process_config.mount.state_dir),
+            )
+            .await?;
+            let attributes = service.lookup(&path).await?;
+            if attributes.is_dir {
+                let entries = service.read_dir(&path).await?;
+                println!(
+                    "smoke ok: server={} path={} entries={}",
+                    service.server_name(),
+                    path,
+                    entries.len()
+                );
+                return Ok(());
+            }
+
+            let handle = service.open(&path).await?;
+            let bytes = service.read(handle.local_handle, offset, size).await?;
+            service.release(handle.local_handle).await?;
+            println!(
+                "smoke ok: server={} path={} bytes={} offset={} size={}",
+                service.server_name(),
+                path,
+                bytes.len(),
+                offset,
+                size
             );
             Ok(())
         }
@@ -495,6 +573,32 @@ mod tests {
                 state_dir: PathBuf::from("/tmp/legato-state"),
                 library_root: String::from("/srv/libraries"),
                 force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_smoke_command() {
+        let command = parse_command_impl([
+            String::from("smoke"),
+            String::from("--config"),
+            String::from("/tmp/legato-state/legatofs.toml"),
+            String::from("--path"),
+            String::from("/srv/libraries/Kontakt/piano.nki"),
+            String::from("--offset"),
+            String::from("8"),
+            String::from("--size"),
+            String::from("16"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Smoke {
+                config_path: Some(PathBuf::from("/tmp/legato-state/legatofs.toml")),
+                path: String::from("/srv/libraries/Kontakt/piano.nki"),
+                offset: 8,
+                size: 16,
             })
         );
     }
