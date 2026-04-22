@@ -21,4 +21,14 @@ walkdir = "2"
 workspace = true
 
 [dev-dependencies]
+criterion = "0.5"
+flate2 = "1"
+legato-client-cache = { path = "../legato-client-cache" }
+legato-client-core = { path = "../legato-client-core" }
+legato-prefetch = { path = "../legato-prefetch" }
+legato-types = { path = "../legato-types" }
 tempfile = "3"
+
+[[bench]]
+name = "server_workloads"
+harness = false
