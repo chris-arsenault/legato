@@ -3,6 +3,8 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use legato_foundation::{
@@ -48,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _server = Server::new(process_config.server);
     telemetry.set_lifecycle_state("ready", 1);
     println!("legato-server bootstrap ready");
-    Ok(())
+    run_daemon_shell()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -112,6 +114,12 @@ fn run_command(
             );
             Ok(())
         }
+    }
+}
+
+fn run_daemon_shell() -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        thread::sleep(Duration::from_secs(3600));
     }
 }
 
