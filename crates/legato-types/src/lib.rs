@@ -1,5 +1,6 @@
 //! Shared domain types for Legato components.
 
+use serde::Serialize;
 use std::path::PathBuf;
 
 /// Stable server-assigned identifier for a library file.
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 pub struct FileId(pub u64);
 
 /// Relative importance assigned to an explicit or speculative prefetch range.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum PrefetchPriority {
     /// Must be resident before the DAW begins touching the project.
     P0,

@@ -494,6 +494,15 @@ pub struct PrefetchExecution {
     pub completed: Vec<BlockRange>,
 }
 
+/// Priority-ordered schedule emitted before prefetch execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefetchSchedule {
+    /// Ranges in execution order.
+    pub ranges: Vec<PrefetchPlanEntry>,
+    /// Highest priority the caller waits through before returning.
+    pub wait_through: PrefetchPriority,
+}
+
 /// Tracks cache residency and executes prefetch requests through the local cache store.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrefetchExecutor {
@@ -523,13 +532,14 @@ impl PrefetchExecutor {
     where
         F: FnMut(FileId, u64) -> Vec<u8>,
     {
+        let schedule = schedule_prefetch_request(request);
         self.pin_generation += 1;
         store.record_pin(self.pin_generation, "prefetch", now_ns)?;
 
         let mut accepted = Vec::new();
         let mut completed = Vec::new();
 
-        for entry in &request.ranges {
+        for entry in &schedule.ranges {
             accepted.push(entry.range.clone());
             store.record_fetch_state(
                 &entry.range,
@@ -556,7 +566,7 @@ impl PrefetchExecutor {
                 "resident",
                 now_ns,
             )?;
-            if priority_satisfies_wait(entry.priority, request.wait_through) {
+            if priority_satisfies_wait(entry.priority, schedule.wait_through) {
                 completed.push(entry.range.clone());
             }
         }
@@ -565,6 +575,12 @@ impl PrefetchExecutor {
             accepted,
             completed,
         })
+    }
+
+    /// Returns the most recent pin generation used by the executor.
+    #[must_use]
+    pub fn current_pin_generation(&self) -> u64 {
+        self.pin_generation
     }
 
     /// Returns whether every block in the range is resident at or above the required priority.
@@ -699,6 +715,22 @@ pub fn proto_prefetch_priority(priority: PrefetchPriority) -> i32 {
     }
 }
 
+/// Sorts a prefetch request into deterministic priority order for execution.
+#[must_use]
+pub fn schedule_prefetch_request(request: &PrefetchRequest) -> PrefetchSchedule {
+    let mut ranges = request.ranges.clone();
+    ranges.sort_by(|left, right| {
+        prefetch_priority_ordinal(left.priority)
+            .cmp(&prefetch_priority_ordinal(right.priority))
+            .then_with(|| left.range.file_id.cmp(&right.range.file_id))
+            .then_with(|| left.range.start_offset.cmp(&right.range.start_offset))
+    });
+    PrefetchSchedule {
+        ranges,
+        wait_through: request.wait_through,
+    }
+}
+
 fn prefetch_priority_rank(priority: PrefetchPriority) -> i32 {
     proto_prefetch_priority(priority)
 }
@@ -730,7 +762,7 @@ mod tests {
     use super::{
         ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, FetchCoordinator,
         LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RetryPolicy,
-        SessionStatus, build_tls_client_config,
+        SessionStatus, build_tls_client_config, schedule_prefetch_request,
     };
     use legato_client_cache::{
         BlockCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
@@ -1098,5 +1130,43 @@ mod tests {
                 .resolve_path("/srv/libraries/Kontakt/piano.nki", 201)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn prefetch_requests_are_scheduled_in_priority_then_offset_order() {
+        let schedule = schedule_prefetch_request(&PrefetchRequest {
+            ranges: vec![
+                PrefetchPlanEntry {
+                    range: BlockRange {
+                        file_id: FileId(3),
+                        start_offset: 4096,
+                        block_count: 1,
+                    },
+                    priority: PrefetchPriority::P2,
+                },
+                PrefetchPlanEntry {
+                    range: BlockRange {
+                        file_id: FileId(2),
+                        start_offset: 8192,
+                        block_count: 1,
+                    },
+                    priority: PrefetchPriority::P0,
+                },
+                PrefetchPlanEntry {
+                    range: BlockRange {
+                        file_id: FileId(2),
+                        start_offset: 0,
+                        block_count: 1,
+                    },
+                    priority: PrefetchPriority::P0,
+                },
+            ],
+            wait_through: PrefetchPriority::P1,
+        });
+
+        assert_eq!(schedule.wait_through, PrefetchPriority::P1);
+        assert_eq!(schedule.ranges[0].range.start_offset, 0);
+        assert_eq!(schedule.ranges[1].range.start_offset, 8192);
+        assert_eq!(schedule.ranges[2].priority, PrefetchPriority::P2);
     }
 }

@@ -7,12 +7,18 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+flate2 = "1"
 legato-client-cache = { path = "../legato-client-cache" }
 legato-client-core = { path = "../legato-client-core" }
 legato-foundation = { path = "../legato-foundation" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
