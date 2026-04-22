@@ -7,6 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-stream = "0.3"
 blake3 = "1"
 legato-foundation = { path = "../legato-foundation" }
 legato-proto = { path = "../legato-proto" }
@@ -16,6 +17,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 walkdir = "2"
 
 [lints]

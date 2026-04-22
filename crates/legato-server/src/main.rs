@@ -3,16 +3,14 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_server::{
-    Server, ServerConfig, build_tls_server_config, ensure_server_tls_materials,
-    issue_client_tls_bundle,
+    LiveServer, ServerConfig, build_tls_server_config, ensure_server_tls_materials,
+    issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
 };
 use serde::Deserialize;
 
@@ -24,7 +22,8 @@ struct ServerProcessConfig {
     server: ServerConfig,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_config = load_config::<ServerProcessConfig>(
         Some(Path::new("/etc/legato/server.toml")),
         "LEGATO_SERVER",
@@ -46,11 +45,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &process_config.server.tls,
     )?;
     build_tls_server_config(&process_config.server.tls)?;
+    let runtime_tls = load_runtime_tls(&process_config.server.tls)?;
+    let bind_address = parse_bind_address(&process_config.server.bind_address)?;
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
-    let _server = Server::new(process_config.server);
+    let server = LiveServer::bootstrap(process_config.server)?;
+    let bound = server.bind(listener, Some(runtime_tls)).await?;
     telemetry.set_lifecycle_state("ready", 1);
     println!("legato-server bootstrap ready");
-    run_daemon_shell()
+    tokio::signal::ctrl_c().await?;
+    bound.shutdown().await
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -114,12 +118,6 @@ fn run_command(
             );
             Ok(())
         }
-    }
-}
-
-fn run_daemon_shell() -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        thread::sleep(Duration::from_secs(3600));
     }
 }
 

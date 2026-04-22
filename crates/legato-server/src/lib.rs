@@ -3,6 +3,7 @@
 mod api;
 mod index;
 mod invalidation;
+mod rpc;
 mod schema;
 mod tls;
 mod watcher;
@@ -13,6 +14,7 @@ pub use api::MetadataService;
 pub use index::{ReconcileStats, reconcile_library_root, reconcile_paths};
 pub use invalidation::{InvalidationHub, InvalidationSubscription, subtree_invalidation};
 use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
+pub use rpc::{BoundServer, LiveServer, RuntimeTlsConfig, load_runtime_tls, parse_bind_address};
 use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
 use serde::Deserialize;
