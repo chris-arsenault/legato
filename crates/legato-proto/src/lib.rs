@@ -22,17 +22,22 @@ pub use legato::v1::*;
 pub fn default_capabilities() -> Vec<i32> {
     vec![
         Capability::Metadata as i32,
+        Capability::Resolve as i32,
         Capability::BlockStreaming as i32,
+        Capability::ExtentFetch as i32,
         Capability::Prefetch as i32,
+        Capability::Hint as i32,
         Capability::Invalidations as i32,
+        Capability::ChangeSubscription as i32,
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachRequest, AttachResponse, Capability, PROTOCOL_NAMESPACE, PROTOCOL_VERSION,
-        default_capabilities,
+        AttachRequest, AttachResponse, Capability, ChangeKind, ExtentDescriptor, ExtentRecord,
+        FileLayout, HintExtent, HintRequest, InodeMetadata, PROTOCOL_NAMESPACE, PROTOCOL_VERSION,
+        PrefetchPriority, ResolveRequest, ResolveResponse, TransferClass, default_capabilities,
     };
 
     #[test]
@@ -56,5 +61,90 @@ mod tests {
                 .negotiated_capabilities
                 .contains(&(Capability::Prefetch as i32))
         );
+        assert!(
+            response
+                .negotiated_capabilities
+                .contains(&(Capability::Resolve as i32))
+        );
+        assert!(
+            response
+                .negotiated_capabilities
+                .contains(&(Capability::ExtentFetch as i32))
+        );
+    }
+
+    #[test]
+    fn resolve_response_can_carry_semantic_layout_metadata() {
+        let request = ResolveRequest {
+            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+        };
+        let response = ResolveResponse {
+            inode: Some(InodeMetadata {
+                file_id: 7,
+                path: request.path.clone(),
+                size: 4_096,
+                mtime_ns: 99,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: vec![
+                        ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 2_048,
+                            extent_hash: b"extent-0".to_vec(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 1,
+                            file_offset: 2_048,
+                            length: 2_048,
+                            extent_hash: b"extent-1".to_vec(),
+                        },
+                    ],
+                }),
+            }),
+        };
+
+        let inode = response.inode.expect("inode should be present");
+        let layout = inode.layout.expect("layout should be present");
+        assert_eq!(inode.path, request.path);
+        assert_eq!(layout.transfer_class, TransferClass::Streamed as i32);
+        assert_eq!(layout.extents.len(), 2);
+    }
+
+    #[test]
+    fn hint_requests_and_extent_records_use_reset_protocol_vocabulary() {
+        let request = HintRequest {
+            extents: vec![HintExtent {
+                file_id: 42,
+                extent_index: 3,
+                file_offset: 12_288,
+                length: 4_096,
+                priority: PrefetchPriority::P0 as i32,
+                deadline_unix_ms: 123,
+            }],
+            wait_for_residency: true,
+            wait_through_priority: PrefetchPriority::P1 as i32,
+        };
+        let record = ExtentRecord {
+            file_id: 42,
+            extent_index: 3,
+            file_offset: 12_288,
+            data: b"legato".to_vec(),
+            extent_hash: b"hash".to_vec(),
+            transfer_class: TransferClass::Streamed as i32,
+        };
+
+        assert_eq!(request.extents.len(), 1);
+        assert!(request.wait_for_residency);
+        assert_eq!(record.transfer_class, TransferClass::Streamed as i32);
+    }
+
+    #[test]
+    fn change_kind_captures_ordered_catalog_semantics() {
+        assert_eq!(ChangeKind::Upsert as i32, 1);
+        assert_eq!(ChangeKind::Delete as i32, 2);
+        assert_eq!(ChangeKind::Invalidate as i32, 3);
+        assert_eq!(ChangeKind::Checkpoint as i32, 4);
     }
 }

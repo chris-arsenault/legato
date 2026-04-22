@@ -21,21 +21,26 @@ use tonic::{
 };
 
 use legato_proto::{
-    AttachRequest, AttachResponse, BlockResponse, CloseRequest, CloseResponse, ListDirRequest,
-    ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest, PrefetchResponse,
-    ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse,
-    SubscribeRequest,
+    AttachRequest, AttachResponse, BlockResponse, ChangeKind, ChangeRecord, CloseRequest,
+    CloseResponse, ExtentRecord, FetchRequest, FileLayout, HintRequest, HintResponse,
+    InodeMetadata, ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest,
+    PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, ResolveRequest,
+    ResolveResponse, StatRequest, StatResponse, SubscribeChangesRequest, SubscribeRequest,
+    TransferClass,
     legato_server::{Legato, LegatoServer},
 };
 
 use crate::{
     InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend, create_poll_watcher,
     create_recommended_watcher, open_metadata_database, reconcile_library_root,
+    subtree_invalidation,
 };
 
 type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockResponse, Status>> + Send + 'static>>;
 type InvalidationStream =
     Pin<Box<dyn Stream<Item = Result<legato_proto::InvalidationEvent, Status>> + Send + 'static>>;
+type FetchStream = Pin<Box<dyn Stream<Item = Result<ExtentRecord, Status>> + Send + 'static>>;
+type ChangeStream = Pin<Box<dyn Stream<Item = Result<ChangeRecord, Status>> + Send + 'static>>;
 
 /// PEM-encoded TLS materials loaded from the configured server certificate paths.
 #[derive(Clone, Debug)]
@@ -225,12 +230,77 @@ fn spawn_watch_task(
 impl Legato for LiveServer {
     type ReadBlocksStream = BlockStream;
     type SubscribeStream = InvalidationStream;
+    type FetchStream = FetchStream;
+    type SubscribeChangesStream = ChangeStream;
 
     async fn attach(
         &self,
         _request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
         Ok(Response::new(self.shell.attach_response()))
+    }
+
+    async fn resolve(
+        &self,
+        request: Request<ResolveRequest>,
+    ) -> Result<Response<ResolveResponse>, Status> {
+        let path = request.into_inner().path;
+        let metadata = self
+            .metadata
+            .lock()
+            .await
+            .resolve_path(ResolvePathRequest { path: path.clone() })
+            .map_err(map_storage_error)?
+            .ok_or_else(|| Status::not_found("path not found"))?;
+        let inode = metadata_to_inode(
+            metadata
+                .metadata
+                .ok_or_else(|| Status::internal("resolve response missing metadata"))?,
+        );
+        Ok(Response::new(ResolveResponse { inode: Some(inode) }))
+    }
+
+    async fn fetch(
+        &self,
+        _request: Request<FetchRequest>,
+    ) -> Result<Response<Self::FetchStream>, Status> {
+        Err(Status::unimplemented(
+            "extent fetch is not wired into the runtime yet",
+        ))
+    }
+
+    async fn hint(&self, request: Request<HintRequest>) -> Result<Response<HintResponse>, Status> {
+        let request = request.into_inner();
+        Ok(Response::new(HintResponse {
+            accepted: request.extents,
+            completed: Vec::new(),
+        }))
+    }
+
+    async fn subscribe_changes(
+        &self,
+        request: Request<SubscribeChangesRequest>,
+    ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
+        let since_sequence = request.into_inner().since_sequence;
+        let library_root = self.config.library_root.clone();
+        let stream = async_stream::try_stream! {
+            yield ChangeRecord {
+                sequence: since_sequence.saturating_add(1),
+                kind: ChangeKind::Checkpoint as i32,
+                file_id: 0,
+                path: library_root.clone(),
+                inode: None,
+            };
+            let root_invalidation = subtree_invalidation(&library_root, 0);
+            yield ChangeRecord {
+                sequence: since_sequence.saturating_add(2),
+                kind: ChangeKind::Invalidate as i32,
+                file_id: root_invalidation.file_id,
+                path: root_invalidation.path,
+                inode: None,
+            };
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
@@ -375,6 +445,59 @@ fn map_storage_error(error: rusqlite::Error) -> Status {
     }
 }
 
+fn metadata_to_inode(metadata: legato_proto::FileMetadata) -> InodeMetadata {
+    let layout = infer_file_layout(&metadata);
+    InodeMetadata {
+        file_id: metadata.file_id,
+        path: metadata.path,
+        size: metadata.size,
+        mtime_ns: metadata.mtime_ns,
+        is_dir: metadata.is_dir,
+        layout: Some(layout),
+    }
+}
+
+fn infer_file_layout(metadata: &legato_proto::FileMetadata) -> FileLayout {
+    let transfer_class = if metadata.is_dir || metadata.size <= 4 * 1024 * 1024 {
+        TransferClass::Unitary
+    } else if metadata.size <= 128 * 1024 * 1024 {
+        TransferClass::Streamed
+    } else {
+        TransferClass::Random
+    };
+    let extent_length = match transfer_class {
+        TransferClass::Unitary => metadata.size.max(1),
+        TransferClass::Streamed => 4 * 1024 * 1024,
+        TransferClass::Random => 1024 * 1024,
+        TransferClass::Unspecified => metadata.block_size.max(1) as u64,
+    };
+    let extent_count = if metadata.size == 0 {
+        1
+    } else {
+        metadata.size.div_ceil(extent_length)
+    };
+    let mut extents = Vec::with_capacity(extent_count as usize);
+    for extent_index in 0..extent_count {
+        let file_offset = extent_index * extent_length;
+        let length = if metadata.size == 0 {
+            0
+        } else {
+            std::cmp::min(extent_length, metadata.size - file_offset)
+        };
+        extents.push(legato_proto::ExtentDescriptor {
+            extent_index: extent_index as u32,
+            file_offset,
+            length,
+            extent_hash: Vec::new(),
+        });
+    }
+
+    FileLayout {
+        transfer_class: transfer_class as i32,
+        extents,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::Path, sync::Arc, time::Duration};
@@ -385,12 +508,13 @@ mod tests {
     use tonic::transport::{Channel, ClientTlsConfig};
 
     use legato_proto::{
-        AttachRequest, Capability, OpenRequest, ReadBlocksRequest, ResolvePathRequest, StatRequest,
+        AttachRequest, Capability, OpenRequest, ReadBlocksRequest, ResolvePathRequest,
+        ResolveRequest, StatRequest, SubscribeChangesRequest, TransferClass,
         legato_client::LegatoClient,
     };
     use tempfile::tempdir;
 
-    use super::{LiveServer, load_runtime_tls, spawn_watch_task};
+    use super::{LiveServer, infer_file_layout, load_runtime_tls, spawn_watch_task};
     use crate::{
         InvalidationHub, MetadataService, ServerConfig, ensure_server_tls_materials,
         open_metadata_database, reconcile_library_root,
@@ -517,6 +641,144 @@ mod tests {
             resolved.metadata.expect("metadata should be present").path,
             sample_path.to_string_lossy()
         );
+
+        bound
+            .shutdown()
+            .await
+            .expect("server should shut down cleanly");
+    }
+
+    #[test]
+    fn infer_file_layout_uses_reset_transfer_classes() {
+        let unitary = infer_file_layout(&legato_proto::FileMetadata {
+            file_id: 1,
+            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+            size: 512 * 1024,
+            mtime_ns: 0,
+            content_hash: Vec::new(),
+            is_dir: false,
+            block_size: 1 << 20,
+        });
+        assert_eq!(unitary.transfer_class, TransferClass::Unitary as i32);
+        assert_eq!(unitary.extents.len(), 1);
+
+        let streamed = infer_file_layout(&legato_proto::FileMetadata {
+            file_id: 2,
+            path: String::from("/srv/libraries/Samples/legato.wav"),
+            size: 32 * 1024 * 1024,
+            mtime_ns: 0,
+            content_hash: Vec::new(),
+            is_dir: false,
+            block_size: 1 << 20,
+        });
+        assert_eq!(streamed.transfer_class, TransferClass::Streamed as i32);
+        assert_eq!(streamed.extents.len(), 8);
+
+        let random = infer_file_layout(&legato_proto::FileMetadata {
+            file_id: 3,
+            path: String::from("/srv/libraries/Containers/library.bin"),
+            size: 512 * 1024 * 1024,
+            mtime_ns: 0,
+            content_hash: Vec::new(),
+            is_dir: false,
+            block_size: 1 << 20,
+        });
+        assert_eq!(random.transfer_class, TransferClass::Random as i32);
+        assert_eq!(random.extents[0].length, 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn grpc_runtime_serves_reset_resolve_and_change_scaffolding() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        let sample_path = library_root.join("Kontakt").join("piano.nki");
+        fs::write(&sample_path, b"hello legato").expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: crate::ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let tls = load_runtime_tls(&config.tls).expect("runtime tls should load");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener addr should be available");
+        let bound = server
+            .bind(listener, Some(tls))
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        crate::issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "client-test",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let channel = Channel::from_shared(format!("https://{address}"))
+            .expect("channel uri should be valid")
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(
+                        fs::read(bundle_dir.join("server-ca.pem")).expect("server ca should load"),
+                    ))
+                    .identity(tonic::transport::Identity::from_pem(
+                        fs::read(bundle_dir.join("client.pem")).expect("client cert should load"),
+                        fs::read(bundle_dir.join("client-key.pem"))
+                            .expect("client key should load"),
+                    ))
+                    .domain_name("localhost"),
+            )
+            .expect("tls config should be valid")
+            .connect()
+            .await
+            .expect("client should connect");
+        let mut client = LegatoClient::new(channel);
+
+        let resolved = client
+            .resolve(ResolveRequest {
+                path: sample_path.to_string_lossy().into_owned(),
+            })
+            .await
+            .expect("resolve should succeed")
+            .into_inner();
+        let inode = resolved.inode.expect("inode should be present");
+        let layout = inode.layout.expect("layout should be present");
+        assert_eq!(inode.file_id, 1);
+        assert_eq!(layout.transfer_class, TransferClass::Unitary as i32);
+
+        let mut stream = client
+            .subscribe_changes(SubscribeChangesRequest { since_sequence: 0 })
+            .await
+            .expect("subscribe changes should succeed")
+            .into_inner();
+        let first = stream
+            .message()
+            .await
+            .expect("change stream should yield")
+            .expect("first record should exist");
+        let second = stream
+            .message()
+            .await
+            .expect("change stream should yield")
+            .expect("second record should exist");
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
 
         bound
             .shutdown()

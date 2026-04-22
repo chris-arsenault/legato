@@ -4,6 +4,10 @@ package legato.v1;
 
 service Legato {
   rpc Attach(AttachRequest) returns (AttachResponse);
+  rpc Resolve(ResolveRequest) returns (ResolveResponse);
+  rpc Fetch(FetchRequest) returns (stream ExtentRecord);
+  rpc Hint(HintRequest) returns (HintResponse);
+  rpc SubscribeChanges(SubscribeChangesRequest) returns (stream ChangeRecord);
   rpc Stat(StatRequest) returns (StatResponse);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc ResolvePath(ResolvePathRequest) returns (ResolvePathResponse);
@@ -20,6 +24,10 @@ enum Capability {
   CAPABILITY_BLOCK_STREAMING = 2;
   CAPABILITY_PREFETCH = 3;
   CAPABILITY_INVALIDATIONS = 4;
+  CAPABILITY_RESOLVE = 5;
+  CAPABILITY_EXTENT_FETCH = 6;
+  CAPABILITY_CHANGE_SUBSCRIPTION = 7;
+  CAPABILITY_HINT = 8;
 }
 
 enum PrefetchPriority {
@@ -35,6 +43,21 @@ enum InvalidationKind {
   INVALIDATION_KIND_FILE = 1;
   INVALIDATION_KIND_DIRECTORY = 2;
   INVALIDATION_KIND_SUBTREE = 3;
+}
+
+enum TransferClass {
+  TRANSFER_CLASS_UNSPECIFIED = 0;
+  TRANSFER_CLASS_UNITARY = 1;
+  TRANSFER_CLASS_STREAMED = 2;
+  TRANSFER_CLASS_RANDOM = 3;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_UPSERT = 1;
+  CHANGE_KIND_DELETE = 2;
+  CHANGE_KIND_INVALIDATE = 3;
+  CHANGE_KIND_CHECKPOINT = 4;
 }
 
 message AttachRequest {
@@ -57,6 +80,87 @@ message FileMetadata {
   bytes content_hash = 5;
   bool is_dir = 6;
   uint32 block_size = 7;
+}
+
+message ExtentDescriptor {
+  uint32 extent_index = 1;
+  uint64 file_offset = 2;
+  uint64 length = 3;
+  bytes extent_hash = 4;
+}
+
+message FileLayout {
+  TransferClass transfer_class = 1;
+  repeated ExtentDescriptor extents = 2;
+}
+
+message InodeMetadata {
+  uint64 file_id = 1;
+  string path = 2;
+  uint64 size = 3;
+  uint64 mtime_ns = 4;
+  bool is_dir = 5;
+  FileLayout layout = 6;
+}
+
+message ResolveRequest {
+  string path = 1;
+}
+
+message ResolveResponse {
+  InodeMetadata inode = 1;
+}
+
+message ExtentRef {
+  uint64 file_id = 1;
+  uint32 extent_index = 2;
+  uint64 file_offset = 3;
+  uint64 length = 4;
+}
+
+message FetchRequest {
+  repeated ExtentRef extents = 1;
+}
+
+message ExtentRecord {
+  uint64 file_id = 1;
+  uint32 extent_index = 2;
+  uint64 file_offset = 3;
+  bytes data = 4;
+  bytes extent_hash = 5;
+  TransferClass transfer_class = 6;
+}
+
+message HintExtent {
+  uint64 file_id = 1;
+  uint32 extent_index = 2;
+  uint64 file_offset = 3;
+  uint64 length = 4;
+  PrefetchPriority priority = 5;
+  uint64 deadline_unix_ms = 6;
+}
+
+message HintRequest {
+  repeated HintExtent extents = 1;
+  bool wait_for_residency = 2;
+  PrefetchPriority wait_through_priority = 3;
+}
+
+message HintResponse {
+  repeated HintExtent accepted = 1;
+  repeated HintExtent completed = 2;
+}
+
+message SubscribeChangesRequest {
+  uint64 since_sequence = 1;
+}
+
+message ChangeRecord {
+  uint64 sequence = 1;
+  ChangeKind kind = 2;
+  uint64 file_id = 3;
+  string path = 4;
+  InodeMetadata inode = 5;
 }
 
 message StatRequest {
