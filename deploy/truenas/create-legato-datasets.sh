@@ -1,7 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 # Creates the Legato datasets and local account layout on a TrueNAS host.
+#
+# TrueNAS SCALE commonly mounts user datasets under `/mnt/...` with execution
+# restrictions. If this script lives on a dataset path, invoke it through the
+# interpreter instead of executing it directly:
+#
+#   sudo bash deploy/truenas/create-legato-datasets.sh
+#
+# or from a root shell:
+#
+#   bash deploy/truenas/create-legato-datasets.sh
 #
 # Default dataset layout:
 #   /mnt/apps/apps/legato
@@ -41,6 +51,23 @@ require_command() {
   local command_name="$1"
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "error: required command not found: ${command_name}" >&2
+    exit 1
+  fi
+}
+
+require_root() {
+  if [ "${EUID}" -ne 0 ]; then
+    cat >&2 <<'EOF'
+error: this script must run as root.
+
+On TrueNAS, if the script is stored under /mnt/... do not run it as:
+  sudo ./deploy/truenas/create-legato-datasets.sh
+
+Use one of these instead:
+  sudo bash deploy/truenas/create-legato-datasets.sh
+  sudo -i
+  bash deploy/truenas/create-legato-datasets.sh
+EOF
     exit 1
   fi
 }
@@ -132,6 +159,7 @@ apply_owner_and_mode() {
 }
 
 main() {
+  require_root
   require_command zfs
   require_command getent
   require_command chown

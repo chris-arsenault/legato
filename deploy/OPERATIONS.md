@@ -26,6 +26,14 @@ This document is the MVP deployment and recovery guide for running Legato as a D
 
 For the current `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`.
 
+Run it through `bash` on the TrueNAS host, not as a directly executed file from `/mnt/...`, because SCALE commonly applies execution restrictions to dataset-backed paths:
+
+```bash
+sudo bash deploy/truenas/create-legato-datasets.sh
+```
+
+Running `sudo ./deploy/truenas/create-legato-datasets.sh` can fail with a `sudo: process ... unexpected status 0x57f` error even though the script contents are valid.
+
 ## Server Configuration
 
 The base example is [deploy/server/server.toml.example](/home/dev/repos/legato/deploy/server/server.toml.example).
