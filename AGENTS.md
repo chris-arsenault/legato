@@ -10,6 +10,8 @@ This is a lightweight working index for agents operating in the Legato repositor
 - [System Shape](docs/architecture/SYSTEM_SHAPE.md)
 - [Protocol And Behavior](docs/design/PROTOCOL_AND_BEHAVIOR.md)
 - [Operations Runbook](deploy/OPERATIONS.md)
+- [Platform Manifest](platform.yml)
+- [Komodo Compose Stack](compose.yaml)
 - [Client Packaging Notes](deploy/client/README.md)
 - [Protocol Versioning](crates/legato-proto/PROTO_VERSIONING.md)
 

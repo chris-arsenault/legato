@@ -19,10 +19,12 @@ This document is the MVP deployment and recovery guide for running Legato as a D
    - Library dataset: mounted read-only into the container as `/srv/libraries`
    - State dataset: mounted read-write as `/var/lib/legato`
    - TLS secret/materials: mounted read-only as `/etc/legato/certs`
-2. Use [deploy/server/compose.yaml](/home/dev/repos/legato/deploy/server/compose.yaml) as the Komodo workload source.
+2. Use [compose.yaml](/home/dev/repos/legato/compose.yaml) as the Komodo workload source.
 3. Keep `restart: unless-stopped` enabled so a TrueNAS or Docker daemon restart brings the service back automatically.
 4. Set `LEGATO_SERVER__COMMON__TRACING__JSON=true` in container env for structured logs.
 5. Expose the metrics port only on trusted networks if `common.metrics.bind_address` is configured.
+
+For the current `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`.
 
 ## Server Configuration
 
@@ -131,3 +133,16 @@ Those tests verify:
 - Check that the server metadata DB is writable and not out of disk space.
 - Scrape `/metrics` before restarting a process so you preserve incident clues.
 - If read latency regresses, run the benchmark suite and compare against prior scan/open/read baselines.
+
+## Shared CI And Publish Shape
+
+Legato now exposes the Ahara shared CI/CD entrypoints at the repo root:
+
+- [platform.yml](/home/dev/repos/legato/platform.yml)
+- [Dockerfile](/home/dev/repos/legato/Dockerfile)
+- [compose.yaml](/home/dev/repos/legato/compose.yaml)
+- [secret-paths.yml](/home/dev/repos/legato/secret-paths.yml)
+- [.github/workflows/ci.yml](/home/dev/repos/legato/.github/workflows/ci.yml)
+
+The root `Dockerfile` is intentionally packaging-only. CI builds the Rust binary first, places it in `dist/`, and Docker only assembles the runtime image.
+The root `compose.yaml` is the only supported Komodo stack definition. The older nested deploy entrypoints were removed to avoid split deployment paths.

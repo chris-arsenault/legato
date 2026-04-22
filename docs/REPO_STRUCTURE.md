@@ -53,8 +53,8 @@ This document describes the shape of the workspace so you can find the right cod
 
 ## Deployment Docs
 
-- `deploy/server/`
-  Container build and compose assets for the server side.
+- `deploy/server/server.toml.example`
+  Example server configuration for the runtime inside the deployed container.
 - `deploy/client/README.md`
   Packaging expectations for native clients.
 - `deploy/OPERATIONS.md`

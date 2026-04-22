@@ -1,0 +1,14 @@
+services:
+  legato-server:
+    image: ghcr.io/chris-arsenault/legato:${IMAGE_TAG}
+    container_name: legato-server
+    restart: unless-stopped
+    environment:
+      LEGATO_SERVER__COMMON__TRACING__JSON: "true"
+      LEGATO_SERVER__COMMON__TRACING__LEVEL: "info"
+    ports:
+      - "7823:7823"
+    volumes:
+      - /mnt/pool/libraries:/srv/libraries:ro
+      - /mnt/pool/appdata/legato:/var/lib/legato
+      - /mnt/pool/appdata/legato/config:/etc/legato:ro

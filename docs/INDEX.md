@@ -24,6 +24,10 @@ This directory is the short-form map of the repository documentation.
 
 - [deploy/OPERATIONS.md](../deploy/OPERATIONS.md)
   Deployment shape, runtime topology, observability, and recovery guidance.
+- [platform.yml](../platform.yml)
+  Shared Ahara CI manifest that declares stack, deploy shape, and Rust artifact outputs.
+- [compose.yaml](../compose.yaml)
+  Root Komodo/TrueNAS stack definition used by the shared deploy workflow.
 - [deploy/client/README.md](../deploy/client/README.md)
   Packaging, install layout, and upgrade expectations for native clients.
 - [crates/legato-proto/PROTO_VERSIONING.md](../crates/legato-proto/PROTO_VERSIONING.md)

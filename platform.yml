@@ -1,0 +1,9 @@
+project: legato
+prefix: legato
+stack:
+  - rust
+truenas: true
+rust_artifacts:
+  binaries:
+    - bin: legato-server
+      image: .

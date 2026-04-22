@@ -8,6 +8,7 @@ This is the minimal workflow guide for working in the Legato workspace.
 - Edition `2024`
 - Workspace lint policy in the root `Cargo.toml`
 - SQLite used for server metadata and client cache state
+- Shared Ahara CI driven by the root `platform.yml`
 
 ## Common Commands
 
@@ -23,6 +24,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p legato-server --test end_to_end
 cargo bench -p legato-server --no-run
 ```
+
+## Shared CI Entry Points
+
+- `.github/workflows/ci.yml`
+  Minimal caller into Ahara's shared reusable workflow.
+- `platform.yml`
+  Declares the project stack and deployable Rust binary artifact.
+- `Dockerfile`
+  Packaging-only image build that expects the CI workflow to populate `dist/legato-server`.
+- `compose.yaml`
+  Root Komodo/TrueNAS stack file used by the shared deploy action.
+- `secret-paths.yml`
+  Placeholder for SSM-backed Komodo environment injection.
 
 ## What The Checks Cover
 
