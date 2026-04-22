@@ -8,9 +8,10 @@ use std::{
 };
 
 use legato_proto::{
-    BlockResponse, CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, InvalidationEvent,
-    ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, ReadBlocksRequest,
-    ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse, TransferClass,
+    BlockResponse, ChangeKind, ChangeRecord, CloseRequest, CloseResponse, DirectoryEntry,
+    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, ListDirResponse, OpenRequest,
+    OpenResponse, ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, StatRequest,
+    StatResponse, TransferClass,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -80,6 +81,64 @@ impl MetadataService {
     /// Resolves a path to catalog-backed metadata and persisted layout values.
     pub fn resolve_catalog_path(&self, path: &str) -> rusqlite::Result<Option<CatalogEntry>> {
         lookup_catalog_entry(&self.connection, path)
+    }
+
+    /// Resolves one catalog entry by stable file identifier.
+    pub fn resolve_catalog_file_id(&self, file_id: u64) -> rusqlite::Result<Option<CatalogEntry>> {
+        lookup_file_only_metadata_by_id(&self.connection, file_id)
+    }
+
+    /// Loads durable change records after the provided sequence cursor.
+    pub fn change_records_since(&self, since_sequence: u64) -> rusqlite::Result<Vec<ChangeRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, kind, file_id, path, is_dir, size, mtime_ns, transfer_class, extent_bytes
+             FROM change_log
+             WHERE sequence > ?1
+             ORDER BY sequence",
+        )?;
+        statement
+            .query_map([since_sequence as i64], |row| {
+                let sequence: i64 = row.get(0)?;
+                let kind: i64 = row.get(1)?;
+                let file_id: i64 = row.get(2)?;
+                let path: String = row.get(3)?;
+                let is_dir: i64 = row.get(4)?;
+                let size: i64 = row.get(5)?;
+                let mtime_ns: i64 = row.get(6)?;
+                let transfer_class: Option<i64> = row.get(7)?;
+                let extent_bytes: Option<i64> = row.get(8)?;
+
+                Ok(ChangeRecord {
+                    sequence: sequence as u64,
+                    kind: kind as i32,
+                    file_id: file_id as u64,
+                    path: path.clone(),
+                    inode: if kind == ChangeKind::Delete as i64 {
+                        None
+                    } else {
+                        Some(InodeMetadata {
+                            file_id: file_id as u64,
+                            path,
+                            size: size as u64,
+                            mtime_ns: mtime_ns as u64,
+                            is_dir: is_dir != 0,
+                            layout: transfer_class
+                                .and_then(|transfer_class| {
+                                    TransferClass::try_from(transfer_class as i32).ok()
+                                })
+                                .zip(extent_bytes)
+                                .map(|(transfer_class, extent_bytes)| {
+                                    crate::LayoutDecision {
+                                        transfer_class,
+                                        extent_bytes: extent_bytes as u64,
+                                    }
+                                    .file_layout(size as u64, is_dir != 0)
+                                }),
+                        })
+                    },
+                })
+            })?
+            .collect()
     }
 
     /// Lists the direct children of a directory path.
@@ -301,6 +360,44 @@ fn lookup_catalog_entry(
     lookup_file_only_metadata(connection, path)
 }
 
+fn lookup_file_only_metadata_by_id(
+    connection: &Connection,
+    file_id: u64,
+) -> rusqlite::Result<Option<CatalogEntry>> {
+    connection
+        .query_row(
+            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''), block_size,
+                    transfer_class, extent_bytes
+             FROM files
+             WHERE file_id = ?1",
+            [file_id as i64],
+            |row| {
+                let file_id: i64 = row.get(0)?;
+                let path: String = row.get(1)?;
+                let size: i64 = row.get(2)?;
+                let mtime_ns: i64 = row.get(3)?;
+                let content_hash: Vec<u8> = row.get(4)?;
+                let block_size: i64 = row.get(5)?;
+                let transfer_class: i64 = row.get(6)?;
+                let extent_bytes: i64 = row.get(7)?;
+                Ok(CatalogEntry {
+                    metadata: FileMetadata {
+                        file_id: file_id as u64,
+                        path,
+                        size: size as u64,
+                        mtime_ns: mtime_ns as u64,
+                        content_hash,
+                        is_dir: false,
+                        block_size: block_size as u32,
+                    },
+                    transfer_class: TransferClass::try_from(transfer_class as i32).ok(),
+                    extent_bytes: Some(extent_bytes as u64),
+                })
+            },
+        )
+        .optional()
+}
+
 fn lookup_file_only_metadata(
     connection: &Connection,
     path: &str,
@@ -411,6 +508,22 @@ mod tests {
         assert_eq!(entry.metadata.path, sample_path);
         assert_eq!(entry.transfer_class, Some(TransferClass::Unitary));
         assert_eq!(entry.extent_bytes, Some(10));
+    }
+
+    #[test]
+    fn change_records_since_replays_durable_catalog_mutations() {
+        let (_library_dir, _db_dir, _library_root, service, sample_path) = build_service_fixture();
+
+        let changes = service
+            .change_records_since(0)
+            .expect("change log should load");
+
+        assert!(
+            changes.iter().any(|change| {
+                change.path == sample_path && change.kind == legato_proto::ChangeKind::Upsert as i32
+            }),
+            "expected durable upsert for the sample file"
+        );
     }
 
     #[test]

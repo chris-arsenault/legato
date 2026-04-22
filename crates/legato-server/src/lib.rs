@@ -1,6 +1,7 @@
 //! Server-side bootstrap types for the Legato daemon.
 
 mod api;
+mod extent;
 mod index;
 mod invalidation;
 mod layout;
@@ -151,7 +152,7 @@ mod tests {
         let mut statement = connection
             .prepare(
                 "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('files', 'directories', 'watches', 'server_state') \
+                 WHERE type = 'table' AND name IN ('change_log', 'files', 'directories', 'watches', 'server_state') \
                  ORDER BY name",
             )
             .expect("table inspection statement should prepare");
@@ -166,6 +167,7 @@ mod tests {
         assert_eq!(
             table_names,
             vec![
+                String::from("change_log"),
                 String::from("directories"),
                 String::from("files"),
                 String::from("server_state"),

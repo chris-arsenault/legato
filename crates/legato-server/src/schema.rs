@@ -12,7 +12,7 @@ pub struct Migration {
 }
 
 /// Current schema version for the server metadata database.
-pub const SERVER_SCHEMA_VERSION: u32 = 3;
+pub const SERVER_SCHEMA_VERSION: u32 = 4;
 
 /// Returns the ordered list of migrations for the server metadata database.
 #[must_use]
@@ -32,6 +32,11 @@ pub fn server_migrations() -> &'static [Migration] {
             version: 3,
             name: "add_layout_catalog_metadata",
             sql: include_str!("../migrations/0003_add_layout_catalog_metadata.sql"),
+        },
+        Migration {
+            version: 4,
+            name: "add_change_log",
+            sql: include_str!("../migrations/0004_add_change_log.sql"),
         },
     ]
 }

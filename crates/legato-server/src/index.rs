@@ -97,6 +97,24 @@ struct FileObservation<'a> {
     extent_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UpsertResult {
+    record_id: i64,
+    changed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ChangeRecordInput<'a> {
+    kind: legato_proto::ChangeKind,
+    file_id: i64,
+    path: &'a str,
+    is_dir: bool,
+    size: i64,
+    mtime_ns: i64,
+    transfer_class: Option<i64>,
+    extent_bytes: Option<i64>,
+}
+
 #[cfg(target_family = "unix")]
 fn filesystem_identity(metadata: &fs::Metadata) -> FilesystemIdentity {
     use std::os::unix::fs::MetadataExt;
@@ -120,6 +138,13 @@ fn modified_time_ns(metadata: &fs::Metadata) -> rusqlite::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     Ok(duration.as_nanos() as i64)
+}
+
+fn current_time_ns() -> rusqlite::Result<i64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+        .as_nanos() as i64)
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -251,7 +276,7 @@ fn reconcile_existing_directory(
                 .parent()
                 .filter(|parent| *parent != path)
                 .map(normalize_path);
-            upsert_directory(
+            let upsert = upsert_directory(
                 transaction,
                 &path_string,
                 parent_path.as_deref(),
@@ -260,6 +285,21 @@ fn reconcile_existing_directory(
                 mtime_ns,
                 stats,
             )?;
+            if upsert.changed {
+                record_change(
+                    transaction,
+                    ChangeRecordInput {
+                        kind: legato_proto::ChangeKind::Upsert,
+                        file_id: upsert.record_id,
+                        path: &path_string,
+                        is_dir: true,
+                        size: 0,
+                        mtime_ns,
+                        transfer_class: None,
+                        extent_bytes: None,
+                    },
+                )?;
+            }
         } else if metadata.is_file() {
             if is_policy_path(library_root, path) {
                 continue;
@@ -271,7 +311,7 @@ fn reconcile_existing_directory(
             let directory_id = lookup_directory_id(transaction, &directory_path)?
                 .ok_or_else(|| rusqlite::Error::InvalidParameterName(directory_path.clone()))?;
             let decision = layout_policy.file_decision(&path_string, metadata.len(), false);
-            upsert_file(
+            let upsert = upsert_file(
                 transaction,
                 FileObservation {
                     directory_id,
@@ -285,6 +325,23 @@ fn reconcile_existing_directory(
                 },
                 stats,
             )?;
+            if upsert.changed {
+                record_change(
+                    transaction,
+                    ChangeRecordInput {
+                        kind: legato_proto::ChangeKind::Upsert,
+                        file_id: upsert.record_id,
+                        path: &path_string,
+                        is_dir: false,
+                        size: metadata.len() as i64,
+                        mtime_ns,
+                        transfer_class: Some(decision.transfer_class as i64),
+                        extent_bytes: Some(
+                            decision.stored_extent_bytes(metadata.len(), false) as i64
+                        ),
+                    },
+                )?;
+            }
         }
     }
 
@@ -323,7 +380,7 @@ fn reconcile_existing_file(
         .ok_or_else(|| rusqlite::Error::InvalidParameterName(parent_string.clone()))?;
     let decision = layout_policy.file_decision(&file_string, metadata.len(), false);
 
-    upsert_file(
+    let upsert = upsert_file(
         transaction,
         FileObservation {
             directory_id,
@@ -337,6 +394,21 @@ fn reconcile_existing_file(
         },
         stats,
     )?;
+    if upsert.changed {
+        record_change(
+            transaction,
+            ChangeRecordInput {
+                kind: legato_proto::ChangeKind::Upsert,
+                file_id: upsert.record_id,
+                path: &file_string,
+                is_dir: false,
+                size: metadata.len() as i64,
+                mtime_ns,
+                transfer_class: Some(decision.transfer_class as i64),
+                extent_bytes: Some(decision.stored_extent_bytes(metadata.len(), false) as i64),
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -369,7 +441,7 @@ fn ensure_directory_chain(
             .parent()
             .filter(|parent| *parent != path)
             .map(normalize_path);
-        upsert_directory(
+        let upsert = upsert_directory(
             transaction,
             &path_string,
             parent_path.as_deref(),
@@ -378,6 +450,21 @@ fn ensure_directory_chain(
             mtime_ns,
             stats,
         )?;
+        if upsert.changed {
+            record_change(
+                transaction,
+                ChangeRecordInput {
+                    kind: legato_proto::ChangeKind::Upsert,
+                    file_id: upsert.record_id,
+                    path: &path_string,
+                    is_dir: true,
+                    size: 0,
+                    mtime_ns,
+                    transfer_class: None,
+                    extent_bytes: None,
+                },
+            )?;
+        }
     }
 
     Ok(())
@@ -391,6 +478,18 @@ fn prune_missing_scope(
 ) -> rusqlite::Result<()> {
     let scope_string = normalize_path(scope_root);
     if scope_root == library_root {
+        record_deleted_paths(
+            transaction,
+            "SELECT file_id, path FROM files",
+            legato_proto::ChangeKind::Delete,
+            false,
+        )?;
+        record_deleted_paths(
+            transaction,
+            "SELECT directory_id, path FROM directories",
+            legato_proto::ChangeKind::Delete,
+            true,
+        )?;
         let deleted_files = transaction.execute("DELETE FROM files", [])?;
         let deleted_dirs = transaction.execute("DELETE FROM directories", [])?;
         stats.files_deleted += deleted_files as u64;
@@ -399,10 +498,24 @@ fn prune_missing_scope(
     }
 
     let prefix = format!("{scope_string}/%");
+    record_deleted_scope(
+        transaction,
+        "SELECT file_id, path FROM files WHERE path = ?1 OR path LIKE ?2",
+        &scope_string,
+        legato_proto::ChangeKind::Delete,
+        false,
+    )?;
     stats.files_deleted += transaction.execute(
         "DELETE FROM files WHERE path = ?1 OR path LIKE ?2",
         params![scope_string, prefix],
     )? as u64;
+    record_deleted_scope(
+        transaction,
+        "SELECT directory_id, path FROM directories WHERE path = ?1 OR path LIKE ?2",
+        &scope_string,
+        legato_proto::ChangeKind::Delete,
+        true,
+    )?;
     stats.directories_deleted += transaction.execute(
         "DELETE FROM directories WHERE path = ?1 OR path LIKE ?2",
         params![scope_string, prefix],
@@ -428,13 +541,46 @@ fn upsert_directory(
     inode: i64,
     mtime_ns: i64,
     stats: &mut ReconcileStats,
-) -> rusqlite::Result<i64> {
+) -> rusqlite::Result<UpsertResult> {
     let parent_directory_id = match parent_path {
         Some(parent_path) => lookup_directory_id(transaction, parent_path)?,
         None => None,
     };
 
-    if let Some(directory_id) = lookup_directory_id(transaction, path)? {
+    if let Some((
+        directory_id,
+        current_parent_id,
+        current_device_id,
+        current_inode,
+        current_mtime_ns,
+    )) = transaction
+        .query_row(
+            "SELECT directory_id, parent_directory_id, device_id, inode, mtime_ns
+             FROM directories
+             WHERE path = ?1",
+            [path],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if current_parent_id == parent_directory_id
+            && current_device_id == device_id
+            && current_inode == inode
+            && current_mtime_ns == mtime_ns
+        {
+            return Ok(UpsertResult {
+                record_id: directory_id,
+                changed: false,
+            });
+        }
         transaction.execute(
             "UPDATE directories
              SET parent_directory_id = ?2, device_id = ?3, inode = ?4, mtime_ns = ?5
@@ -448,7 +594,10 @@ fn upsert_directory(
             ],
         )?;
         stats.directories_updated += 1;
-        return Ok(directory_id);
+        return Ok(UpsertResult {
+            record_id: directory_id,
+            changed: true,
+        });
     }
 
     if let Some(directory_id) = transaction
@@ -466,7 +615,10 @@ fn upsert_directory(
             params![directory_id, path, parent_directory_id, mtime_ns],
         )?;
         stats.directories_updated += 1;
-        return Ok(directory_id);
+        return Ok(UpsertResult {
+            record_id: directory_id,
+            changed: true,
+        });
     }
 
     transaction.execute(
@@ -475,22 +627,59 @@ fn upsert_directory(
         params![path, parent_directory_id, device_id, inode, mtime_ns],
     )?;
     stats.directories_created += 1;
-    Ok(transaction.last_insert_rowid())
+    Ok(UpsertResult {
+        record_id: transaction.last_insert_rowid(),
+        changed: true,
+    })
 }
 
 fn upsert_file(
     transaction: &Transaction<'_>,
     observation: FileObservation<'_>,
     stats: &mut ReconcileStats,
-) -> rusqlite::Result<i64> {
-    if let Some(file_id) = transaction
+) -> rusqlite::Result<UpsertResult> {
+    if let Some((
+        file_id,
+        current_directory_id,
+        current_size,
+        current_mtime_ns,
+        current_device_id,
+        current_inode,
+        current_transfer_class,
+        current_extent_bytes,
+    )) = transaction
         .query_row(
-            "SELECT file_id FROM files WHERE path = ?1",
+            "SELECT file_id, directory_id, size, mtime_ns, device_id, inode, transfer_class, extent_bytes
+             FROM files WHERE path = ?1",
             [observation.path],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
         )
         .optional()?
     {
+        if current_directory_id == observation.directory_id
+            && current_size == observation.size as i64
+            && current_mtime_ns == observation.mtime_ns
+            && current_device_id == observation.device_id
+            && current_inode == observation.inode
+            && current_transfer_class == observation.transfer_class as i64
+            && current_extent_bytes == observation.extent_bytes as i64
+        {
+            return Ok(UpsertResult {
+                record_id: file_id,
+                changed: false,
+            });
+        }
         transaction.execute(
             "UPDATE files
              SET directory_id = ?2, size = ?3, mtime_ns = ?4, device_id = ?5, inode = ?6,
@@ -508,7 +697,10 @@ fn upsert_file(
             ],
         )?;
         stats.files_updated += 1;
-        return Ok(file_id);
+        return Ok(UpsertResult {
+            record_id: file_id,
+            changed: true,
+        });
     }
 
     if let Some(file_id) = transaction
@@ -535,7 +727,10 @@ fn upsert_file(
             ],
         )?;
         stats.files_updated += 1;
-        return Ok(file_id);
+        return Ok(UpsertResult {
+            record_id: file_id,
+            changed: true,
+        });
     }
 
     transaction.execute(
@@ -556,7 +751,10 @@ fn upsert_file(
         ],
     )?;
     stats.files_created += 1;
-    Ok(transaction.last_insert_rowid())
+    Ok(UpsertResult {
+        record_id: transaction.last_insert_rowid(),
+        changed: true,
+    })
 }
 
 fn prune_missing_files(
@@ -576,6 +774,28 @@ fn prune_missing_files(
         .into_iter()
         .filter(|path| !seen_files.contains(path))
     {
+        if let Some(file_id) = transaction
+            .query_row(
+                "SELECT file_id FROM files WHERE path = ?1",
+                [path.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            record_change(
+                transaction,
+                ChangeRecordInput {
+                    kind: legato_proto::ChangeKind::Delete,
+                    file_id,
+                    path: &path,
+                    is_dir: false,
+                    size: 0,
+                    mtime_ns: current_time_ns()?,
+                    transfer_class: None,
+                    extent_bytes: None,
+                },
+            )?;
+        }
         stats.files_deleted +=
             transaction.execute("DELETE FROM files WHERE path = ?1", [path])? as u64;
     }
@@ -601,6 +821,28 @@ fn prune_missing_directories(
         .into_iter()
         .filter(|path| path != &root_prefix && !seen_directories.contains(path))
     {
+        if let Some(directory_id) = transaction
+            .query_row(
+                "SELECT directory_id FROM directories WHERE path = ?1",
+                [path.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            record_change(
+                transaction,
+                ChangeRecordInput {
+                    kind: legato_proto::ChangeKind::Delete,
+                    file_id: directory_id,
+                    path: &path,
+                    is_dir: true,
+                    size: 0,
+                    mtime_ns: current_time_ns()?,
+                    transfer_class: None,
+                    extent_bytes: None,
+                },
+            )?;
+        }
         stats.directories_deleted +=
             transaction.execute("DELETE FROM directories WHERE path = ?1", [path])? as u64;
     }
@@ -620,6 +862,90 @@ fn collect_paths(
             row.get::<_, String>(0)
         })?
         .collect()
+}
+
+fn record_change(
+    transaction: &Transaction<'_>,
+    change: ChangeRecordInput<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO change_log (
+             kind, file_id, path, is_dir, size, mtime_ns, transfer_class, extent_bytes, recorded_at_ns
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            change.kind as i64,
+            change.file_id,
+            change.path,
+            if change.is_dir { 1_i64 } else { 0_i64 },
+            change.size,
+            change.mtime_ns,
+            change.transfer_class,
+            change.extent_bytes,
+            current_time_ns()?
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_deleted_scope(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    root_prefix: &str,
+    kind: legato_proto::ChangeKind,
+    is_dir: bool,
+) -> rusqlite::Result<()> {
+    let like_prefix = format!("{root_prefix}/%");
+    let mut statement = transaction.prepare(sql)?;
+    let rows = statement.query_map(params![root_prefix, like_prefix], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (file_id, path) = row?;
+        record_change(
+            transaction,
+            ChangeRecordInput {
+                kind,
+                file_id,
+                path: &path,
+                is_dir,
+                size: 0,
+                mtime_ns: current_time_ns()?,
+                transfer_class: None,
+                extent_bytes: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn record_deleted_paths(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    kind: legato_proto::ChangeKind,
+    is_dir: bool,
+) -> rusqlite::Result<()> {
+    let mut statement = transaction.prepare(sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (file_id, path) = row?;
+        record_change(
+            transaction,
+            ChangeRecordInput {
+                kind,
+                file_id,
+                path: &path,
+                is_dir,
+                size: 0,
+                mtime_ns: current_time_ns()?,
+                transfer_class: None,
+                extent_bytes: None,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

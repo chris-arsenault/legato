@@ -21,9 +21,9 @@ use tonic::{
 };
 
 use legato_proto::{
-    AttachRequest, AttachResponse, BlockResponse, ChangeKind, ChangeRecord, CloseRequest,
-    CloseResponse, ExtentRecord, FetchRequest, HintRequest, HintResponse, InodeMetadata,
-    ListDirRequest, ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest, PrefetchResponse,
+    AttachRequest, AttachResponse, BlockResponse, ChangeRecord, CloseRequest, CloseResponse,
+    ExtentRecord, FetchRequest, HintRequest, HintResponse, InodeMetadata, ListDirRequest,
+    ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest, PrefetchResponse,
     ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, ResolveRequest, ResolveResponse,
     StatRequest, StatResponse, SubscribeChangesRequest, SubscribeRequest,
     legato_server::{Legato, LegatoServer},
@@ -32,7 +32,7 @@ use legato_proto::{
 use crate::{
     CatalogEntry, InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend,
     create_poll_watcher, create_recommended_watcher, open_metadata_database,
-    reconcile_library_root, subtree_invalidation,
+    reconcile_library_root,
 };
 
 type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockResponse, Status>> + Send + 'static>>;
@@ -257,11 +257,24 @@ impl Legato for LiveServer {
 
     async fn fetch(
         &self,
-        _request: Request<FetchRequest>,
+        request: Request<FetchRequest>,
     ) -> Result<Response<Self::FetchStream>, Status> {
-        Err(Status::unimplemented(
-            "extent fetch is not wired into the runtime yet",
-        ))
+        let request = request.into_inner();
+        let extent_store = crate::extent::ServerExtentStore::new(Path::new(&self.config.state_dir));
+        let metadata = self.metadata.lock().await;
+        let mut records = Vec::with_capacity(request.extents.len());
+        for extent in request.extents {
+            let entry = metadata
+                .resolve_catalog_file_id(extent.file_id)
+                .map_err(map_storage_error)?
+                .ok_or_else(|| Status::not_found("file id not found"))?;
+            let record = extent_store
+                .fetch_extent(&entry, &extent)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            records.push(record);
+        }
+        let stream = tokio_stream::iter(records.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn hint(&self, request: Request<HintRequest>) -> Result<Response<HintResponse>, Status> {
@@ -277,24 +290,13 @@ impl Legato for LiveServer {
         request: Request<SubscribeChangesRequest>,
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
         let since_sequence = request.into_inner().since_sequence;
-        let library_root = self.config.library_root.clone();
-        let stream = async_stream::try_stream! {
-            yield ChangeRecord {
-                sequence: since_sequence.saturating_add(1),
-                kind: ChangeKind::Checkpoint as i32,
-                file_id: 0,
-                path: library_root.clone(),
-                inode: None,
-            };
-            let root_invalidation = subtree_invalidation(&library_root, 0);
-            yield ChangeRecord {
-                sequence: since_sequence.saturating_add(2),
-                kind: ChangeKind::Invalidate as i32,
-                file_id: root_invalidation.file_id,
-                path: root_invalidation.path,
-                inode: None,
-            };
-        };
+        let records = self
+            .metadata
+            .lock()
+            .await
+            .change_records_since(since_sequence)
+            .map_err(map_storage_error)?;
+        let stream = tokio_stream::iter(records.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -472,8 +474,8 @@ mod tests {
     use tonic::transport::{Channel, ClientTlsConfig};
 
     use legato_proto::{
-        AttachRequest, Capability, OpenRequest, ReadBlocksRequest, ResolvePathRequest,
-        ResolveRequest, StatRequest, SubscribeChangesRequest, TransferClass,
+        AttachRequest, Capability, ExtentRef, FetchRequest, OpenRequest, ReadBlocksRequest,
+        ResolvePathRequest, ResolveRequest, StatRequest, SubscribeChangesRequest, TransferClass,
         legato_client::LegatoClient,
     };
     use tempfile::tempdir;
@@ -670,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_runtime_serves_reset_resolve_and_change_scaffolding() {
+    async fn grpc_runtime_serves_reset_fetch_and_change_stream() {
         let fixture = tempdir().expect("tempdir should be created");
         let library_root = fixture.path().join("library");
         let state_dir = fixture.path().join("state");
@@ -743,6 +745,25 @@ mod tests {
         let layout = inode.layout.expect("layout should be present");
         assert_eq!(inode.file_id, 1);
         assert_eq!(layout.transfer_class, TransferClass::Unitary as i32);
+        assert_eq!(layout.extents.len(), 1);
+
+        let fetched = client
+            .fetch(FetchRequest {
+                extents: vec![ExtentRef {
+                    file_id: inode.file_id,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: inode.size,
+                }],
+            })
+            .await
+            .expect("fetch should succeed")
+            .into_inner()
+            .collect::<Result<Vec<_>, _>>()
+            .await
+            .expect("extent stream should collect");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].data, b"hello legato");
 
         let mut stream = client
             .subscribe_changes(SubscribeChangesRequest { since_sequence: 0 })
@@ -759,8 +780,9 @@ mod tests {
             .await
             .expect("change stream should yield")
             .expect("second record should exist");
-        assert_eq!(first.sequence, 1);
-        assert_eq!(second.sequence, 2);
+        assert_eq!(first.kind, legato_proto::ChangeKind::Upsert as i32);
+        assert_eq!(second.kind, legato_proto::ChangeKind::Upsert as i32);
+        assert!(second.sequence > first.sequence);
 
         bound
             .shutdown()
