@@ -1,10 +1,16 @@
 //! Metadata RPC implementations over the server metadata database.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use legato_proto::{
-    CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, ListDirRequest, ListDirResponse,
-    OpenRequest, OpenResponse, ResolvePathRequest, ResolvePathResponse, StatRequest, StatResponse,
+    BlockResponse, CloseRequest, CloseResponse, DirectoryEntry, FileMetadata, ListDirRequest,
+    ListDirResponse, OpenRequest, OpenResponse, ReadBlocksRequest, ResolvePathRequest,
+    ResolvePathResponse, StatRequest, StatResponse,
 };
 use rusqlite::{Connection, OptionalExtension};
 
@@ -13,7 +19,14 @@ use rusqlite::{Connection, OptionalExtension};
 pub struct MetadataService {
     connection: Connection,
     next_handle: u64,
-    open_handles: HashMap<u64, u64>,
+    open_handles: HashMap<u64, OpenHandle>,
+}
+
+#[derive(Debug)]
+struct OpenHandle {
+    file_id: u64,
+    path: String,
+    block_size: u32,
 }
 
 impl MetadataService {
@@ -114,7 +127,14 @@ impl MetadataService {
 
         let file_handle = self.next_handle;
         self.next_handle += 1;
-        self.open_handles.insert(file_handle, metadata.file_id);
+        self.open_handles.insert(
+            file_handle,
+            OpenHandle {
+                file_id: metadata.file_id,
+                path: metadata.path.clone(),
+                block_size: metadata.block_size,
+            },
+        );
 
         Ok(Some(OpenResponse {
             file_handle,
@@ -124,6 +144,51 @@ impl MetadataService {
             content_hash: metadata.content_hash,
             block_size: metadata.block_size,
         }))
+    }
+
+    /// Reads one or more aligned block ranges from already opened file handles.
+    pub fn read_blocks(&self, request: ReadBlocksRequest) -> rusqlite::Result<Vec<BlockResponse>> {
+        let mut responses = Vec::new();
+
+        for range in request.ranges {
+            let handle = self.open_handles.get(&range.file_handle).ok_or_else(|| {
+                invalid_request_error(format!("unknown file handle {}", range.file_handle))
+            })?;
+            let block_size = u64::from(handle.block_size);
+
+            if block_size == 0 {
+                return Err(invalid_request_error(format!(
+                    "file handle {} has an invalid block size",
+                    range.file_handle
+                )));
+            }
+            if range.start_offset % block_size != 0 {
+                return Err(invalid_request_error(format!(
+                    "start offset {} is not aligned to block size {} for file handle {}",
+                    range.start_offset, block_size, range.file_handle
+                )));
+            }
+
+            let mut file = File::open(&handle.path).map_err(io_error)?;
+            file.seek(SeekFrom::Start(range.start_offset))
+                .map_err(io_error)?;
+
+            for block_index in 0..range.block_count {
+                let offset = range.start_offset + u64::from(block_index) * block_size;
+                let Some(data) = read_block(&mut file, handle.block_size)? else {
+                    break;
+                };
+
+                responses.push(BlockResponse {
+                    file_handle: range.file_handle,
+                    offset,
+                    block_hash: blake3::hash(&data).as_bytes().to_vec(),
+                    data,
+                });
+            }
+        }
+
+        Ok(responses)
     }
 
     /// Closes a previously issued file handle.
@@ -137,6 +202,14 @@ impl MetadataService {
     #[must_use]
     pub fn is_handle_open(&self, file_handle: u64) -> bool {
         self.open_handles.contains_key(&file_handle)
+    }
+
+    /// Returns the file ID associated with an open handle.
+    #[must_use]
+    pub fn file_id_for_handle(&self, file_handle: u64) -> Option<u64> {
+        self.open_handles
+            .get(&file_handle)
+            .map(|handle| handle.file_id)
     }
 }
 
@@ -213,21 +286,40 @@ fn entry_name(path: &str) -> String {
         .unwrap_or_else(|| String::from(path))
 }
 
+fn read_block(file: &mut File, block_size: u32) -> rusqlite::Result<Option<Vec<u8>>> {
+    let mut buffer = vec![0_u8; block_size as usize];
+    let bytes_read = file.read(&mut buffer).map_err(io_error)?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+    buffer.truncate(bytes_read);
+    Ok(Some(buffer))
+}
+
+fn io_error(error: io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+fn invalid_request_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use legato_proto::{
-        CloseRequest, ListDirRequest, OpenRequest, ResolvePathRequest, StatRequest,
+        CloseRequest, ListDirRequest, OpenRequest, ReadBlocksRequest, ResolvePathRequest,
+        StatRequest,
     };
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::MetadataService;
     use crate::{open_metadata_database, reconcile_library_root};
 
     #[test]
     fn stat_and_resolve_path_return_file_metadata() {
-        let (library_root, service, sample_path) = build_service_fixture();
+        let (_library_dir, _db_dir, library_root, service, sample_path) = build_service_fixture();
 
         let stat = service
             .stat(StatRequest {
@@ -248,7 +340,7 @@ mod tests {
 
     #[test]
     fn list_dir_returns_direct_children_only() {
-        let (library_root, service, sample_path) = build_service_fixture();
+        let (_library_dir, _db_dir, library_root, service, sample_path) = build_service_fixture();
 
         let listing = service
             .list_dir(ListDirRequest {
@@ -282,7 +374,8 @@ mod tests {
 
     #[test]
     fn open_and_close_manage_server_side_handles() {
-        let (_library_root, mut service, sample_path) = build_service_fixture();
+        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
+            build_service_fixture();
 
         let open = service
             .open(OpenRequest { path: sample_path })
@@ -298,19 +391,119 @@ mod tests {
         assert!(!service.is_handle_open(open.file_handle));
     }
 
-    fn build_service_fixture() -> (std::path::PathBuf, MetadataService, String) {
+    #[test]
+    fn read_blocks_returns_aligned_ranges_with_tail_hashes() {
+        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
+            build_service_fixture();
+
+        let open = service
+            .open(OpenRequest { path: sample_path })
+            .expect("open should succeed")
+            .expect("sample file should open");
+
+        let blocks = service
+            .read_blocks(ReadBlocksRequest {
+                ranges: vec![legato_proto::BlockRequest {
+                    file_handle: open.file_handle,
+                    start_offset: 0,
+                    block_count: 4,
+                }],
+            })
+            .expect("read blocks should succeed");
+
+        assert_eq!(
+            service.file_id_for_handle(open.file_handle),
+            Some(open.file_id)
+        );
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].offset, 0);
+        assert_eq!(blocks[0].data, b"abcd");
+        assert_eq!(
+            blocks[0].block_hash,
+            blake3::hash(b"abcd").as_bytes().to_vec()
+        );
+        assert_eq!(blocks[1].offset, 4);
+        assert_eq!(blocks[1].data, b"efgh");
+        assert_eq!(
+            blocks[1].block_hash,
+            blake3::hash(b"efgh").as_bytes().to_vec()
+        );
+        assert_eq!(blocks[2].offset, 8);
+        assert_eq!(blocks[2].data, b"ij");
+        assert_eq!(
+            blocks[2].block_hash,
+            blake3::hash(b"ij").as_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn read_blocks_rejects_unknown_handles_and_unaligned_offsets() {
+        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
+            build_service_fixture();
+
+        let open = service
+            .open(OpenRequest { path: sample_path })
+            .expect("open should succeed")
+            .expect("sample file should open");
+
+        let unknown_handle_error = service
+            .read_blocks(ReadBlocksRequest {
+                ranges: vec![legato_proto::BlockRequest {
+                    file_handle: open.file_handle + 99,
+                    start_offset: 0,
+                    block_count: 1,
+                }],
+            })
+            .expect_err("unknown handles should be rejected");
+        assert!(
+            unknown_handle_error
+                .to_string()
+                .contains("unknown file handle"),
+            "error should mention the unknown handle: {unknown_handle_error}"
+        );
+
+        let unaligned_error = service
+            .read_blocks(ReadBlocksRequest {
+                ranges: vec![legato_proto::BlockRequest {
+                    file_handle: open.file_handle,
+                    start_offset: 2,
+                    block_count: 1,
+                }],
+            })
+            .expect_err("unaligned offsets should be rejected");
+        assert!(
+            unaligned_error.to_string().contains("not aligned"),
+            "error should mention alignment: {unaligned_error}"
+        );
+    }
+
+    fn build_service_fixture() -> (
+        TempDir,
+        TempDir,
+        std::path::PathBuf,
+        MetadataService,
+        String,
+    ) {
         let fixture = tempdir().expect("fixture tempdir should be created");
         let library_root = fixture.path().join("libraries");
         fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
         let sample_path = library_root.join("Kontakt").join("piano.nki");
-        fs::write(&sample_path, "fixture").expect("fixture file should be written");
+        fs::write(&sample_path, b"abcdefghij").expect("fixture file should be written");
 
         let db_dir = tempdir().expect("db tempdir should be created");
         let mut connection =
             open_metadata_database(&db_dir.path().join("server.sqlite")).expect("db should open");
         reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
+        connection
+            .execute(
+                "UPDATE files SET block_size = 4 WHERE path = ?1",
+                [sample_path.to_string_lossy().as_ref()],
+            )
+            .expect("test block size should update");
 
         (
+            fixture,
+            db_dir,
             library_root,
             MetadataService::new(connection),
             sample_path.to_string_lossy().into_owned(),
