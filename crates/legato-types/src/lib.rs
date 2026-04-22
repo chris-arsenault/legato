@@ -61,9 +61,173 @@ pub struct PrefetchHintPath {
     pub priority: PrefetchPriority,
 }
 
+/// Supported native client platform backends.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ClientPlatform {
+    /// macOS user-space mount backend.
+    Macos,
+    /// Windows WinFSP-style mount backend.
+    Windows,
+}
+
+/// Read-only filesystem operations exposed by the native mount adapters.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FilesystemOperation {
+    /// Resolve a path to attributes.
+    Lookup,
+    /// Return inode-like metadata for one file or directory.
+    GetAttr,
+    /// Enumerate direct children of a directory.
+    ReadDir,
+    /// Open a file for reading.
+    Open,
+    /// Read byte ranges from an opened file.
+    Read,
+    /// Release a previously opened file handle.
+    Release,
+    /// Attempt to create a file or directory.
+    Create,
+    /// Attempt to write file contents.
+    Write,
+    /// Attempt to rename a path.
+    Rename,
+    /// Attempt to remove a path.
+    Unlink,
+}
+
+/// Normalized file attributes returned by the adapter layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemAttributes {
+    /// Stable server-assigned file identifier.
+    pub file_id: FileId,
+    /// Canonical library path represented by these attributes.
+    pub path: PathBuf,
+    /// Whether the target is a directory.
+    pub is_dir: bool,
+    /// Logical file size in bytes.
+    pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+    /// Fixed block size exposed by the mount.
+    pub block_size: u32,
+    /// Whether the mount should present the path as writable.
+    pub read_only: bool,
+}
+
+/// Cross-platform error categories surfaced by adapter operations.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FilesystemError {
+    /// The path does not exist or cannot be resolved.
+    NotFound,
+    /// The caller attempted a mutating operation on the read-only mount.
+    ReadOnly,
+    /// The request references a stale server-local handle.
+    StaleHandle,
+    /// The server is temporarily unreachable or reconnecting.
+    Transient,
+    /// The request was malformed for the current filesystem state.
+    InvalidInput,
+}
+
+/// Shared read-only contract for native filesystem adapters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemSemantics {
+    /// Whether the mount denies all mutating operations.
+    pub read_only: bool,
+    /// Whether directory listings are returned in sorted path order.
+    pub deterministic_readdir: bool,
+    /// Whether directory timestamps are synthesized from the metadata plane.
+    pub stable_directory_mtime: bool,
+}
+
+impl Default for FilesystemSemantics {
+    fn default() -> Self {
+        Self {
+            read_only: true,
+            deterministic_readdir: true,
+            stable_directory_mtime: true,
+        }
+    }
+}
+
+impl FilesystemSemantics {
+    /// Returns whether the operation should be denied by read-only policy.
+    #[must_use]
+    pub fn denies(&self, operation: FilesystemOperation) -> bool {
+        self.read_only
+            && matches!(
+                operation,
+                FilesystemOperation::Create
+                    | FilesystemOperation::Write
+                    | FilesystemOperation::Rename
+                    | FilesystemOperation::Unlink
+            )
+    }
+}
+
+/// Platform-specific errno/status values derived from shared adapter errors.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PlatformErrorCode {
+    /// Stable symbolic name used in tests and diagnostics.
+    pub symbolic_name: &'static str,
+    /// Numeric status/errno value for the target platform.
+    pub raw_code: i32,
+}
+
+/// Maps the shared adapter error taxonomy to platform-specific status codes.
+#[must_use]
+pub fn platform_error_code(platform: ClientPlatform, error: FilesystemError) -> PlatformErrorCode {
+    match (platform, error) {
+        (ClientPlatform::Macos, FilesystemError::NotFound) => PlatformErrorCode {
+            symbolic_name: "ENOENT",
+            raw_code: 2,
+        },
+        (ClientPlatform::Macos, FilesystemError::ReadOnly) => PlatformErrorCode {
+            symbolic_name: "EROFS",
+            raw_code: 30,
+        },
+        (ClientPlatform::Macos, FilesystemError::StaleHandle) => PlatformErrorCode {
+            symbolic_name: "ESTALE",
+            raw_code: 70,
+        },
+        (ClientPlatform::Macos, FilesystemError::Transient) => PlatformErrorCode {
+            symbolic_name: "EAGAIN",
+            raw_code: 35,
+        },
+        (ClientPlatform::Macos, FilesystemError::InvalidInput) => PlatformErrorCode {
+            symbolic_name: "EINVAL",
+            raw_code: 22,
+        },
+        (ClientPlatform::Windows, FilesystemError::NotFound) => PlatformErrorCode {
+            symbolic_name: "STATUS_OBJECT_NAME_NOT_FOUND",
+            raw_code: 0xC000_0034_u32 as i32,
+        },
+        (ClientPlatform::Windows, FilesystemError::ReadOnly) => PlatformErrorCode {
+            symbolic_name: "STATUS_MEDIA_WRITE_PROTECTED",
+            raw_code: 0xC000_00A2_u32 as i32,
+        },
+        (ClientPlatform::Windows, FilesystemError::StaleHandle) => PlatformErrorCode {
+            symbolic_name: "STATUS_FILE_INVALID",
+            raw_code: 0xC000_0098_u32 as i32,
+        },
+        (ClientPlatform::Windows, FilesystemError::Transient) => PlatformErrorCode {
+            symbolic_name: "STATUS_RETRY",
+            raw_code: 0xC000_022D_u32 as i32,
+        },
+        (ClientPlatform::Windows, FilesystemError::InvalidInput) => PlatformErrorCode {
+            symbolic_name: "STATUS_INVALID_PARAMETER",
+            raw_code: 0xC000_000D_u32 as i32,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BlockRange, FileId, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest};
+    use super::{
+        BlockRange, ClientPlatform, FileId, FilesystemError, FilesystemOperation,
+        FilesystemSemantics, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
+        platform_error_code,
+    };
 
     #[test]
     fn prefetch_request_keeps_priority_ordering_explicit() {
@@ -91,5 +255,27 @@ mod tests {
 
         assert_eq!(request.ranges.len(), 2);
         assert_eq!(request.wait_through, PrefetchPriority::P1);
+    }
+
+    #[test]
+    fn read_only_semantics_block_mutating_operations() {
+        let semantics = FilesystemSemantics::default();
+
+        assert!(semantics.denies(FilesystemOperation::Write));
+        assert!(semantics.denies(FilesystemOperation::Rename));
+        assert!(!semantics.denies(FilesystemOperation::Read));
+        assert!(!semantics.denies(FilesystemOperation::ReadDir));
+    }
+
+    #[test]
+    fn platform_error_code_maps_shared_errors_consistently() {
+        assert_eq!(
+            platform_error_code(ClientPlatform::Macos, FilesystemError::ReadOnly).symbolic_name,
+            "EROFS"
+        );
+        assert_eq!(
+            platform_error_code(ClientPlatform::Windows, FilesystemError::Transient).symbolic_name,
+            "STATUS_RETRY"
+        );
     }
 }

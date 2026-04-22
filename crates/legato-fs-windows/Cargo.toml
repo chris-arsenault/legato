@@ -8,7 +8,7 @@ version.workspace = true
 
 [dependencies]
 legato-client-core = { path = "../legato-client-core" }
+legato-types = { path = "../legato-types" }
 
 [lints]
 workspace = true
-

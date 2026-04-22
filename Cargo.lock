@@ -539,6 +539,7 @@ name = "legato-fs-macos"
 version = "0.1.0"
 dependencies = [
  "legato-client-core",
+ "legato-types",
 ]
 
 [[package]]
@@ -546,6 +547,7 @@ name = "legato-fs-windows"
 version = "0.1.0"
 dependencies = [
  "legato-client-core",
+ "legato-types",
 ]
 
 [[package]]
@@ -595,10 +597,13 @@ version = "0.1.0"
 name = "legatofs"
 version = "0.1.0"
 dependencies = [
+ "legato-client-cache",
  "legato-client-core",
  "legato-foundation",
  "legato-fs-macos",
  "legato-fs-windows",
+ "legato-proto",
+ "legato-types",
  "serde",
 ]
 

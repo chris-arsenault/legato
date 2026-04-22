@@ -7,10 +7,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+legato-client-cache = { path = "../legato-client-cache" }
 legato-client-core = { path = "../legato-client-core" }
 legato-foundation = { path = "../legato-foundation" }
 legato-fs-macos = { path = "../legato-fs-macos" }
 legato-fs-windows = { path = "../legato-fs-windows" }
+legato-proto = { path = "../legato-proto" }
+legato-types = { path = "../legato-types" }
 serde = { version = "1", features = ["derive"] }
 
 [lints]
