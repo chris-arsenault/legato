@@ -23,6 +23,7 @@ This document is the MVP deployment and recovery guide for running Legato as a D
 3. Keep `restart: unless-stopped` enabled so a TrueNAS or Docker daemon restart brings the service back automatically.
 4. Set `LEGATO_SERVER__COMMON__TRACING__JSON=true` in container env for structured logs.
 5. Expose the metrics port only on trusted networks if `common.metrics.bind_address` is configured.
+6. Run the container as the same numeric UID/GID that owns the mounted datasets. The compose file defaults to `42173:42173`; override `LEGATO_UID` and `LEGATO_GID` in Komodo if your TrueNAS-side owner differs.
 
 For the current `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`.
 
@@ -31,6 +32,8 @@ The canonical host-to-container mount mapping for that layout is:
 - `/mnt/apps/shares/legato` -> `/srv/libraries` (read-only)
 - `/mnt/apps/apps/legato` -> `/var/lib/legato`
 - `/mnt/apps/apps/legato/config` -> `/etc/legato` (read-only)
+
+The compose stack also runs `legato-server` as `${LEGATO_UID}:${LEGATO_GID}` so the process can read and write those mounted datasets without relying on the image's baked-in default UID.
 
 Run it through `bash` on the TrueNAS host, not as a directly executed file from `/mnt/...`, because SCALE commonly applies execution restrictions to dataset-backed paths:
 
