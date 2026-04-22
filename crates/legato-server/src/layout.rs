@@ -32,6 +32,8 @@ pub struct LayoutDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LayoutRule {
     pattern: String,
+    vendor: Option<String>,
+    extensions: Vec<String>,
     transfer_class: TransferClass,
     extent_bytes: Option<u64>,
 }
@@ -54,6 +56,9 @@ struct LayoutPolicyToml {
 #[derive(Debug, Deserialize)]
 struct LayoutRuleToml {
     pattern: String,
+    vendor: Option<String>,
+    #[serde(default)]
+    extensions: Vec<String>,
     transfer_class: TransferClassToml,
     extent_bytes: Option<u64>,
 }
@@ -90,6 +95,12 @@ impl LayoutPolicy {
             .into_iter()
             .map(|rule| LayoutRule {
                 pattern: rule.pattern,
+                vendor: rule.vendor.map(|value| value.to_ascii_lowercase()),
+                extensions: rule
+                    .extensions
+                    .into_iter()
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect(),
                 transfer_class: match rule.transfer_class {
                     TransferClassToml::Unitary => TransferClass::Unitary,
                     TransferClassToml::Streamed => TransferClass::Streamed,
@@ -112,7 +123,7 @@ impl LayoutPolicy {
         }
 
         for rule in &self.rules {
-            if glob_matches(&rule.pattern, path) {
+            if rule_matches(rule, path) {
                 return LayoutDecision {
                     transfer_class: rule.transfer_class,
                     extent_bytes: rule
@@ -219,18 +230,40 @@ fn infer_transfer_class(path: &str, size: u64, unitary_max_bytes: u64) -> Transf
     let lower = path.to_ascii_lowercase();
     if has_suffix(
         &lower,
-        &[".nki", ".nkm", ".fxp", ".fxb", ".vstpreset", ".nicnt"],
+        &[
+            ".nki",
+            ".nkm",
+            ".fxp",
+            ".fxb",
+            ".vstpreset",
+            ".nicnt",
+            ".json",
+            ".xml",
+            ".txt",
+            ".plist",
+            ".ini",
+        ],
     ) || size <= unitary_max_bytes
     {
         return TransferClass::Unitary;
     }
-    if has_suffix(&lower, &[".nkr", ".nkc", ".bin", ".db"]) || lower.contains("/steam/") {
+    if has_suffix(
+        &lower,
+        &[
+            ".nkr", ".nkc", ".nkx", ".bin", ".db", ".db3", ".sqlite", ".dat", ".pak", ".blob",
+        ],
+    ) || lower.contains("/steam/")
+        || lower.contains("/resources/")
+        || lower.contains("/containers/")
+    {
         return TransferClass::Random;
     }
     if has_suffix(
         &lower,
         &[".wav", ".aif", ".aiff", ".flac", ".ncw", ".caf", ".rex"],
-    ) {
+    ) || lower.contains("/samples/")
+        || lower.contains("/audio/")
+    {
         return TransferClass::Streamed;
     }
     if size > 128 * 1024 * 1024 {
@@ -242,6 +275,20 @@ fn infer_transfer_class(path: &str, size: u64, unitary_max_bytes: u64) -> Transf
 
 fn has_suffix(path: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|suffix| path.ends_with(suffix))
+}
+
+fn rule_matches(rule: &LayoutRule, path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    glob_matches(&rule.pattern, path)
+        && rule
+            .vendor
+            .as_ref()
+            .is_none_or(|vendor| lower.contains(vendor))
+        && (rule.extensions.is_empty()
+            || rule
+                .extensions
+                .iter()
+                .any(|extension| lower.ends_with(extension)))
 }
 
 /// Returns the reserved policy file path for one library root.
@@ -320,6 +367,26 @@ mod tests {
                 .transfer_class,
             TransferClass::Random
         );
+        assert_eq!(
+            policy
+                .classify(
+                    "/srv/libraries/Spitfire/Resources/patches.sqlite",
+                    32 * 1024 * 1024,
+                    false
+                )
+                .transfer_class,
+            TransferClass::Random
+        );
+        assert_eq!(
+            policy
+                .classify(
+                    "/srv/libraries/Kontakt Factory Library/Samples/Strings/long.ncw",
+                    256 * 1024 * 1024,
+                    false
+                )
+                .transfer_class,
+            TransferClass::Streamed
+        );
     }
 
     #[test]
@@ -333,6 +400,8 @@ streamed_extent_bytes = 8388608
 
 [[rule]]
 pattern = "/srv/libraries/Vendor/*"
+vendor = "Vendor"
+extensions = [".dat", ".cache"]
 transfer_class = "random"
 extent_bytes = 2097152
 "#,
@@ -348,6 +417,48 @@ extent_bytes = 2097152
 
         assert_eq!(decision.transfer_class, TransferClass::Random);
         assert_eq!(decision.extent_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vendor_specific_rules_can_target_real_library_shapes() {
+        let fixture = tempdir().expect("tempdir should be created");
+        fs::write(
+            fixture.path().join(".legato-layout.toml"),
+            r#"
+[[rule]]
+pattern = "/srv/libraries/*"
+vendor = "Kontakt Factory Library"
+extensions = [".ncw"]
+transfer_class = "streamed"
+extent_bytes = 8388608
+
+[[rule]]
+pattern = "/srv/libraries/*"
+vendor = "Spectrasonics"
+extensions = [".db"]
+transfer_class = "random"
+extent_bytes = 1048576
+"#,
+        )
+        .expect("policy file should be written");
+
+        let policy = LayoutPolicy::load(fixture.path()).expect("policy should load");
+
+        let kontakt = policy.classify(
+            "/srv/libraries/Kontakt Factory Library/Samples/Strings/long.ncw",
+            512 * 1024 * 1024,
+            false,
+        );
+        let spectrasonics = policy.classify(
+            "/srv/libraries/Spectrasonics/Resources/index.db",
+            64 * 1024 * 1024,
+            false,
+        );
+
+        assert_eq!(kontakt.transfer_class, TransferClass::Streamed);
+        assert_eq!(kontakt.extent_bytes, 8 * 1024 * 1024);
+        assert_eq!(spectrasonics.transfer_class, TransferClass::Random);
+        assert_eq!(spectrasonics.extent_bytes, 1024 * 1024);
     }
 
     #[test]
