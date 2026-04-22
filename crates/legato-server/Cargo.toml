@@ -11,6 +11,7 @@ blake3 = "1"
 legato-foundation = { path = "../legato-foundation" }
 legato-proto = { path = "../legato-proto" }
 notify = "8"
+rcgen = { version = "0.14", features = ["crypto", "pem", "ring", "x509-parser"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"

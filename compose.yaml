@@ -12,4 +12,4 @@ services:
     volumes:
       - /mnt/apps/shares/legato:/srv/libraries:ro
       - /mnt/apps/apps/legato:/var/lib/legato
-      - /mnt/apps/apps/legato/config:/etc/legato:ro
+      - /mnt/apps/apps/legato/config:/etc/legato

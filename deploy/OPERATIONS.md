@@ -18,7 +18,7 @@ This document is the MVP deployment and recovery guide for running Legato as a D
 1. Provision three persistent paths on the TrueNAS side:
    - Library dataset: mounted read-only into the container as `/srv/libraries`
    - State dataset: mounted read-write as `/var/lib/legato`
-   - TLS secret/materials: mounted read-only as `/etc/legato/certs`
+   - Config/TLS dataset: mounted at `/etc/legato`
 2. Use [compose.yaml](/home/dev/repos/legato/compose.yaml) as the Komodo workload source.
 3. Keep `restart: unless-stopped` enabled so a TrueNAS or Docker daemon restart brings the service back automatically.
 4. Set `LEGATO_SERVER__COMMON__TRACING__JSON=true` in container env for structured logs.
@@ -31,9 +31,31 @@ The canonical host-to-container mount mapping for that layout is:
 
 - `/mnt/apps/shares/legato` -> `/srv/libraries` (read-only)
 - `/mnt/apps/apps/legato` -> `/var/lib/legato`
-- `/mnt/apps/apps/legato/config` -> `/etc/legato` (read-only)
+- `/mnt/apps/apps/legato/config` -> `/etc/legato`
 
 The compose stack also runs `legato-server` as `${LEGATO_UID}:${LEGATO_GID}` so the process can read and write those mounted datasets without relying on the image's baked-in default UID.
+
+On first boot, `legato-server` now generates its own local CA and listener certificate under `/etc/legato/certs` if they do not already exist. You do not need to pre-stage:
+
+- `server.pem`
+- `server-key.pem`
+- `client-ca.pem`
+- `server-ca.pem`
+- `server-ca-key.pem`
+
+Client registration is handled by the server binary itself. To issue a client bundle after the server has bootstrapped its CA:
+
+```bash
+docker exec legato-server legato-server issue-client --name studio-mac --output-dir /tmp/studio-mac
+```
+
+That writes:
+
+- `client.pem`
+- `client-key.pem`
+- `server-ca.pem`
+
+You can then copy that bundle to the client machine's Legato config root.
 
 Run it through `bash` on the TrueNAS host, not as a directly executed file from `/mnt/...`, because SCALE commonly applies execution restrictions to dataset-backed paths:
 

@@ -16,7 +16,10 @@ use legato_proto::{AttachResponse, PROTOCOL_VERSION, default_capabilities};
 use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
 use serde::Deserialize;
-pub use tls::{ServerTlsConfig, TlsConfigError, build_tls_server_config};
+pub use tls::{
+    BootstrappedServerTlsPaths, ServerTlsConfig, TlsConfigError, build_tls_server_config,
+    ensure_server_tls_materials, issue_client_tls_bundle,
+};
 pub use watcher::{
     NotificationAction, WatchBackend, apply_notification_result, create_poll_watcher,
     create_recommended_watcher, invalidation_events_for_action, plan_notification_result,
