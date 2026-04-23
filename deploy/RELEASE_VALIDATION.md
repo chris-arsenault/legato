@@ -25,7 +25,14 @@ This document defines the v1 release-validation matrix for Legato. It separates 
 
 ## CI Gate
 
-The GitHub Actions workflow now includes a `release-validation` job after the shared `ci` job. It builds release binaries and runs the local smoke validation script.
+The GitHub Actions workflow now includes:
+
+- `release-validation`
+  Builds release binaries and runs the local smoke validation script.
+- `package-macos-client`
+  Builds the macOS `.pkg`, installs it on the runner, and verifies the packaged registration helper can create usable runtime state from a synthetic issued bundle.
+- `package-windows-client`
+  Builds the Windows installer, runs a silent install on the runner, and verifies the packaged registration helper can create usable runtime state from a synthetic issued bundle.
 
 This does not replace platform packaging jobs. It complements them by proving that the shipped server and client binaries can execute the basic release flow end to end.
 

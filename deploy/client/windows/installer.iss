@@ -29,7 +29,7 @@ Source: "{#MyAppSourceDir}\certs-README.txt"; DestDir: "{commonappdata}\Legato";
 [Dirs]
 Name: "{commonappdata}\Legato"
 Name: "{commonappdata}\Legato\certs"
-Name: "{commonappdata}\Legato\blocks"
+Name: "{commonappdata}\Legato\extents"
 
 [Icons]
 Name: "{group}\Legato Config"; Filename: "{commonappdata}\Legato\legatofs.toml"
@@ -103,8 +103,6 @@ begin
       InstallArgs :=
         'install ' +
         '--bundle-dir "' + BundleDir + '" ' +
-        '--endpoint "' + ServerEndpointPage.Values[0] + '" ' +
-        '--server-name "' + ServerNamePage.Values[0] + '" ' +
         '--mount-point "' + MountPointPage.Values[0] + '" ' +
         '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
         '--library-root "/srv/libraries" ' +

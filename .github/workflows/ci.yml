@@ -29,6 +29,8 @@ jobs:
         run: cargo build --release -p legatofs
       - name: Package macOS installer
         run: ./deploy/client/package-macos.sh
+      - name: Validate macOS installer
+        run: ./deploy/client/validate-macos-package.sh "$(ls artifacts/macos/*.pkg | head -n1)"
       - uses: actions/upload-artifact@v4
         with:
           name: legatofs-macos-installer
@@ -47,6 +49,9 @@ jobs:
       - name: Package Windows installer
         shell: pwsh
         run: .\deploy\client\package-windows.ps1
+      - name: Validate Windows installer
+        shell: pwsh
+        run: .\deploy\client\validate-windows-installer.ps1 (Get-ChildItem artifacts\windows\*.exe | Select-Object -First 1).FullName
       - uses: actions/upload-artifact@v4
         with:
           name: legatofs-windows-installer
