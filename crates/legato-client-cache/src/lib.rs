@@ -1,5 +1,6 @@
 //! Local metadata and extent-store primitives shared by client-side components.
 
+pub mod catalog;
 pub mod segment;
 
 mod schema;

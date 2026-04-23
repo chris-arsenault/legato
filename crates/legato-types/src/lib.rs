@@ -1,10 +1,10 @@
 //! Shared domain types for Legato components.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Stable server-assigned identifier for a library file.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct FileId(pub u64);
 
 /// Relative importance assigned to an explicit or speculative prefetch range.
