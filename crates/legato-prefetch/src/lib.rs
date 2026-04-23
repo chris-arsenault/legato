@@ -1,18 +1,20 @@
-//! Project-aware prefetch planning, parsing, and CLI execution.
+//! Project-aware prefetch planning, parsing, CLI execution, and mount-triggered warming.
 
 use std::{
-    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
 
-use flate2::read::GzDecoder;
 use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{ClientConfig, FilesystemOpenHandle, FilesystemService};
 use legato_foundation::load_config;
 use legato_types::{PrefetchHintPath, PrefetchPriority};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+mod analyzers;
+
+pub use analyzers::kontakt::detect_kontakt_version;
+pub use analyzers::{AnalyzerMatch, AnalyzerRegistry, ProjectAnalyzer, project_analyzer_registry};
 
 /// Supported project/input formats understood by the prefetch planner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -207,6 +209,8 @@ impl From<std::io::Error> for PrefetchError {
     }
 }
 
+const MAX_INLINE_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Parses a `legato-prefetch` CLI invocation.
 pub fn parse_cli_args<I, S>(args: I) -> Result<PrefetchCommand, PrefetchError>
 where
@@ -317,271 +321,18 @@ pub fn run_cli_command(command: PrefetchCommand) -> Result<CommandResult, Prefet
 /// Analyzes a project or plugin-state file and returns structured hints.
 pub fn analyze_project(path: &Path) -> Result<ProjectAnalysis, PrefetchError> {
     let bytes = fs::read(path)?;
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase());
-
-    match extension.as_deref() {
-        Some("als") => analyze_als(path, &bytes),
-        Some("nki") => analyze_nki(path, &bytes),
-        Some("fxp") | Some("fxb") | Some("vstpreset") => analyze_plugin_state(path, &bytes),
-        _ => Err(PrefetchError::UnsupportedFormat(path.to_path_buf())),
-    }
+    analyze_project_bytes(path, &bytes)
 }
 
-fn analyze_als(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchError> {
-    let xml = decode_als_xml(bytes)?;
-    let sample_paths = extract_paths_from_text(&xml, sample_path_regex());
-    let plugins = extract_plugins_from_text(&xml);
-    let hints = sample_paths
-        .into_iter()
-        .map(|path| PrefetchHint {
-            path,
-            file_offset: 0,
-            length: 256 * 1024,
-            priority: PrefetchPriority::P1,
-        })
-        .collect::<Vec<_>>();
-
-    let mut diagnostics = Vec::new();
-    diagnostics.push(Diagnostic {
-        code: String::from("als_format"),
-        message: format!("analyzed Ableton Live set {}", path.display()),
-    });
-    if plugins.is_empty() {
-        diagnostics.push(Diagnostic {
-            code: String::from("als_plugins_missing"),
-            message: String::from("no plugin descriptors detected in ALS payload"),
-        });
-    }
-
-    Ok(ProjectAnalysis {
-        format: ProjectFormat::AbletonAls,
-        hints,
-        plugins,
-        diagnostics,
-        wait_through: PrefetchPriority::P1,
-    })
+/// Analyzes project bytes using the supplied path as the format hint.
+pub fn analyze_project_bytes(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchError> {
+    analyzers::project_analyzer_registry().analyze(path, bytes)
 }
 
-fn analyze_nki(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchError> {
-    let version = detect_kontakt_version(bytes);
-    let structured_paths = match version {
-        KontaktVersion::V6 => parse_kontakt_v6(bytes),
-        KontaktVersion::V7 => parse_kontakt_v7(bytes),
-        KontaktVersion::V5 | KontaktVersion::Unknown => extract_kontakt_paths(bytes),
-    };
-    let paths = if structured_paths.is_empty() {
-        extract_kontakt_paths(bytes)
-    } else {
-        structured_paths
-    };
-
-    let hints = paths
-        .into_iter()
-        .map(|sample_path| PrefetchHint {
-            path: sample_path,
-            file_offset: 0,
-            length: 4 * 1024 * 1024,
-            priority: PrefetchPriority::P0,
-        })
-        .collect::<Vec<_>>();
-
-    let diagnostics = vec![
-        Diagnostic {
-            code: String::from("kontakt_version"),
-            message: format!("detected Kontakt version {:?}", version),
-        },
-        Diagnostic {
-            code: String::from("kontakt_fallback"),
-            message: format!(
-                "planned fallback/structured NKI analysis for {}",
-                path.display()
-            ),
-        },
-    ];
-
-    Ok(ProjectAnalysis {
-        format: ProjectFormat::KontaktNki,
-        hints,
-        plugins: vec![String::from("Kontakt")],
-        diagnostics,
-        wait_through: PrefetchPriority::P0,
-    })
-}
-
-fn analyze_plugin_state(path: &Path, bytes: &[u8]) -> Result<ProjectAnalysis, PrefetchError> {
-    let lower_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let plugins = detect_plugin_names(&lower_name, bytes);
-    let mut hints = Vec::new();
-
-    if plugins
-        .iter()
-        .any(|plugin| plugin.eq_ignore_ascii_case("kontakt"))
-    {
-        hints.extend(
-            extract_kontakt_paths(bytes)
-                .into_iter()
-                .map(|sample_path| PrefetchHint {
-                    path: sample_path,
-                    file_offset: 0,
-                    length: 4 * 1024 * 1024,
-                    priority: PrefetchPriority::P0,
-                }),
-        );
-    }
-
-    hints.extend(
-        extract_plugin_paths(bytes)
-            .into_iter()
-            .map(|sample_path| PrefetchHint {
-                path: sample_path,
-                file_offset: 0,
-                length: 256 * 1024,
-                priority: PrefetchPriority::P2,
-            }),
-    );
-    sort_and_dedup_hints(&mut hints);
-
-    Ok(ProjectAnalysis {
-        format: ProjectFormat::PluginState,
-        hints,
-        plugins,
-        diagnostics: vec![Diagnostic {
-            code: String::from("plugin_state"),
-            message: format!("analyzed plugin state {}", path.display()),
-        }],
-        wait_through: PrefetchPriority::P1,
-    })
-}
-
-fn decode_als_xml(bytes: &[u8]) -> Result<String, PrefetchError> {
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut decoder = GzDecoder::new(bytes);
-        let mut xml = String::new();
-        std::io::Read::read_to_string(&mut decoder, &mut xml)
-            .map_err(|error| PrefetchError::Parse(error.to_string()))?;
-        return Ok(xml);
-    }
-
-    String::from_utf8(bytes.to_vec()).map_err(|error| PrefetchError::Parse(error.to_string()))
-}
-
-fn parse_kontakt_v6(bytes: &[u8]) -> Vec<String> {
-    extract_kontakt_paths(bytes)
-        .into_iter()
-        .filter(|path| has_sample_extension(path))
-        .collect()
-}
-
-fn parse_kontakt_v7(bytes: &[u8]) -> Vec<String> {
-    extract_kontakt_paths(bytes)
-        .into_iter()
-        .filter(|path| has_sample_extension(path) || path.to_ascii_lowercase().ends_with(".nkr"))
-        .collect()
-}
-
-fn extract_kontakt_paths(bytes: &[u8]) -> Vec<String> {
-    let mut paths = extract_plugin_paths(bytes);
-    paths.retain(|path| {
-        let lower = path.to_ascii_lowercase();
-        has_sample_extension(path)
-            || lower.ends_with(".nkr")
-            || lower.ends_with(".nkc")
-            || lower.ends_with(".nicnt")
-    });
-    dedup_sorted(paths)
-}
-
-fn extract_plugin_paths(bytes: &[u8]) -> Vec<String> {
-    let regex = generic_path_regex();
-    let mut paths = extract_paths_from_text(&String::from_utf8_lossy(bytes), regex.clone());
-    for utf16_text in decode_utf16le_candidates(bytes) {
-        paths.extend(extract_paths_from_text(&utf16_text, regex.clone()));
-        paths.extend(extract_path_tokens(&utf16_text));
-    }
-    dedup_sorted(paths)
-}
-
-fn extract_paths_from_text(text: &str, regex: Regex) -> Vec<String> {
-    regex
-        .find_iter(text)
-        .map(|match_| sanitize_path(match_.as_str()))
-        .filter(|path| !path.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn extract_path_tokens(text: &str) -> Vec<String> {
-    text.split(|character: char| {
-        character.is_whitespace()
-            || matches!(
-                character,
-                '"' | '\'' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}'
-            )
-    })
-    .map(sanitize_path)
-    .filter(|token| {
-        token.contains(['\\', '/'])
-            && [
-                ".wav", ".aif", ".aiff", ".flac", ".ncw", ".nki", ".nkr", ".nkc", ".sfz", ".rex",
-                ".caf",
-            ]
-            .iter()
-            .any(|suffix| token.to_ascii_lowercase().ends_with(suffix))
-    })
-    .collect()
-}
-
-fn extract_plugins_from_text(text: &str) -> Vec<String> {
-    let regex = Regex::new("(?i)(kontakt|serum|omnisphere|falcon|play|massive)").expect("regex");
-    regex
-        .find_iter(text)
-        .map(|match_| capitalize_plugin(match_.as_str()))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn detect_plugin_names(file_name: &str, bytes: &[u8]) -> Vec<String> {
-    let mut plugins = BTreeSet::new();
-    for candidate in [
-        "kontakt",
-        "serum",
-        "omnisphere",
-        "falcon",
-        "play",
-        "massive",
-    ] {
-        if file_name.contains(candidate)
-            || String::from_utf8_lossy(bytes)
-                .to_ascii_lowercase()
-                .contains(candidate)
-        {
-            plugins.insert(capitalize_plugin(candidate));
-        }
-    }
-    plugins.into_iter().collect()
-}
-
-fn detect_kontakt_version(bytes: &[u8]) -> KontaktVersion {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    if text.contains("kontakt 7") || text.contains("k7") {
-        KontaktVersion::V7
-    } else if text.contains("kontakt 6") || text.contains("k6") {
-        KontaktVersion::V6
-    } else if text.contains("kontakt 5") || text.contains("k5") {
-        KontaktVersion::V5
-    } else {
-        KontaktVersion::Unknown
-    }
+/// Returns whether one path is eligible for project-open prefetch.
+#[must_use]
+pub fn supports_project_prefetch(path: &Path) -> bool {
+    analyzers::project_analyzer_registry().supports_path(path)
 }
 
 fn execute_analysis(
@@ -599,6 +350,49 @@ fn execute_analysis(
         .build()
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
     runtime.block_on(execute_analysis_live(analysis, process_config))
+}
+
+/// Executes integrated project prefetch for one already-opened project handle.
+///
+/// The mount adapters call this after a supported project or preset is opened so
+/// Legato can warm dependent sample files without requiring a separate CLI step.
+pub async fn prefetch_opened_project(
+    service: &mut FilesystemService,
+    handle: &FilesystemOpenHandle,
+) -> Result<Option<ExecutionReport>, PrefetchError> {
+    let project_path = Path::new(&handle.path);
+    if !supports_project_prefetch(project_path) || handle.size == 0 {
+        return Ok(None);
+    }
+    if handle.size > MAX_INLINE_PROJECT_BYTES {
+        return Ok(None);
+    }
+
+    let project_bytes = service
+        .read(handle.local_handle, 0, handle.size as u32)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let analysis = analyze_project_bytes(project_path, &project_bytes)?;
+    let mut report = ExecutionReport::default();
+
+    for hint in scheduled_hints(
+        analysis
+            .hints
+            .into_iter()
+            .map(PrefetchHintPath::from)
+            .collect(),
+    ) {
+        report.accepted += 1;
+        match prefetch_one_hint_inline(service, &hint).await {
+            Ok(bytes_read) => {
+                report.completed += 1;
+                report.bytes_read = report.bytes_read.saturating_add(bytes_read);
+            }
+            Err(_error) => report.failed += 1,
+        }
+    }
+
+    Ok(Some(report))
 }
 
 async fn execute_analysis_live(
@@ -717,6 +511,30 @@ async fn prefetch_one_hint(
     })
 }
 
+async fn prefetch_one_hint_inline(
+    service: &mut FilesystemService,
+    hint: &PrefetchHintPath,
+) -> Result<u64, PrefetchError> {
+    let handle = service
+        .open(hint.path.to_string_lossy().as_ref())
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let read_size = hint
+        .length
+        .max(1)
+        .min(u64::from(u32::MAX))
+        .min(handle.size.saturating_sub(hint.file_offset)) as u32;
+    let bytes = service
+        .read(handle.local_handle, hint.file_offset, read_size)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    service
+        .release(handle.local_handle)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    Ok(bytes.len() as u64)
+}
+
 fn hint_already_resident(
     state_dir: &Path,
     handle: &FilesystemOpenHandle,
@@ -765,16 +583,6 @@ fn scheduled_hints(mut hints: Vec<PrefetchHintPath>) -> Vec<PrefetchHintPath> {
     hints
 }
 
-fn sort_and_dedup_hints(hints: &mut Vec<PrefetchHint>) {
-    hints.sort_by(|left, right| {
-        priority_rank(left.priority)
-            .cmp(&priority_rank(right.priority))
-            .then_with(|| left.path.cmp(&right.path))
-            .then_with(|| left.file_offset.cmp(&right.file_offset))
-    });
-    hints.dedup();
-}
-
 fn parse_priority(value: &str) -> Result<PrefetchPriority, PrefetchError> {
     match value.to_ascii_uppercase().as_str() {
         "P0" => Ok(PrefetchPriority::P0),
@@ -794,61 +602,6 @@ fn priority_rank(priority: PrefetchPriority) -> u8 {
         PrefetchPriority::P2 => 2,
         PrefetchPriority::P3 => 3,
     }
-}
-
-fn sample_path_regex() -> Regex {
-    Regex::new(r#"(?i)([A-Za-z]:\\[^"'<>|]+?\.(wav|aif|aiff|flac|ncw|mp3)|/[^"'<>|]+?\.(wav|aif|aiff|flac|ncw|mp3))"#)
-        .expect("regex")
-}
-
-fn generic_path_regex() -> Regex {
-    Regex::new(r#"(?i)([A-Za-z]:\\[^"'<>|]{3,}?\.(wav|aif|aiff|flac|ncw|nki|nkr|nkc|sfz|rex|caf)|/[^"'<>|]{3,}?\.(wav|aif|aiff|flac|ncw|nki|nkr|nkc|sfz|rex|caf))"#)
-        .expect("regex")
-}
-
-fn sanitize_path(path: &str) -> String {
-    path.trim_matches(|character| matches!(character, '"' | '\'' | '\0'))
-        .replace("\\\\", "\\")
-}
-
-fn capitalize_plugin(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
-    let mut characters = lower.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-        None => String::new(),
-    }
-}
-
-fn decode_utf16le_candidates(bytes: &[u8]) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for start in [0usize, 1usize] {
-        if bytes.len().saturating_sub(start) < 2 {
-            continue;
-        }
-
-        let units = bytes[start..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
-        candidates.push(String::from_utf16_lossy(&units));
-    }
-    candidates
-}
-
-fn dedup_sorted(paths: Vec<String>) -> Vec<String> {
-    paths
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn has_sample_extension(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".wav", ".aif", ".aiff", ".flac", ".ncw", ".mp3"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn default_config_path() -> PathBuf {
@@ -892,14 +645,15 @@ fn default_client_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write};
+    use std::{fs, io::Write, path::Path};
 
     use flate2::{Compression, write::GzEncoder};
     use tempfile::tempdir;
 
     use super::{
         KontaktVersion, PrefetchCommand, ProjectAnalysis, ProjectFormat, analyze_project,
-        detect_kontakt_version, parse_cli_args,
+        detect_kontakt_version, parse_cli_args, project_analyzer_registry,
+        supports_project_prefetch,
     };
     use legato_types::PrefetchPriority;
 
@@ -1039,5 +793,21 @@ mod tests {
         assert!(output.contains("accepted: 2"));
         assert!(output.contains("skipped: 1"));
         assert!(output.contains("bytes-fetched: 4096"));
+    }
+
+    #[test]
+    fn built_in_registry_exposes_static_analyzers() {
+        let registry = project_analyzer_registry();
+        let keys = registry
+            .analyzers()
+            .iter()
+            .map(|analyzer| analyzer.key())
+            .collect::<Vec<_>>();
+
+        assert_eq!(keys, vec!["ableton-als", "kontakt-nki", "plugin-state"]);
+        assert!(supports_project_prefetch(Path::new("session.als")));
+        assert!(supports_project_prefetch(Path::new("piano.nki")));
+        assert!(supports_project_prefetch(Path::new("preset.vstpreset")));
+        assert!(!supports_project_prefetch(Path::new("notes.txt")));
     }
 }

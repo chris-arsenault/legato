@@ -8,6 +8,7 @@ use std::{
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
+use legato_prefetch::prefetch_opened_project;
 use legato_proto::DirectoryEntry;
 use legato_types::{
     ClientPlatform, FilesystemAttributes, FilesystemError, FilesystemOperation,
@@ -232,6 +233,9 @@ impl WindowsFilesystem {
         path: &str,
     ) -> Result<WindowsOpenFile, PlatformErrorCode> {
         let handle = service.open(path).await.map_err(map_error)?;
+        if let Err(error) = prefetch_opened_project(service, &handle).await {
+            eprintln!("legato project prefetch skipped for {path}: {error}");
+        }
         Ok(WindowsOpenFile {
             handle: handle.local_handle,
             attributes: self.translate_attributes(&attributes_from_open_handle(&handle)),

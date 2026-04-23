@@ -8,6 +8,7 @@ use std::{
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
+use legato_prefetch::prefetch_opened_project;
 use legato_proto::DirectoryEntry;
 use legato_types::{
     ClientPlatform, FilesystemAttributes, FilesystemError, FilesystemOperation,
@@ -196,6 +197,9 @@ impl MacosFilesystem {
         path: &str,
     ) -> Result<MacosOpenFile, PlatformErrorCode> {
         let handle = service.open(path).await.map_err(map_error)?;
+        if let Err(error) = prefetch_opened_project(service, &handle).await {
+            eprintln!("legato project prefetch skipped for {path}: {error}");
+        }
         Ok(MacosOpenFile {
             handle: handle.local_handle,
             attributes: self.translate_attributes(&attributes_from_open_handle(&handle)),
@@ -502,6 +506,7 @@ fn timestamp_from_ns(nanoseconds: u64) -> SystemTime {
 mod tests {
     use std::{fs, path::Path};
 
+    use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
     use legato_server::{
         LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
@@ -688,6 +693,95 @@ mod tests {
             .release(&mut service, open.handle)
             .await
             .expect("release should succeed");
+        bound.shutdown().await.expect("server should shut down");
+    }
+
+    #[tokio::test]
+    async fn macos_adapter_prefetches_project_dependencies_on_open() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        let client_state_dir = fixture.path().join("client-state");
+        fs::create_dir_all(library_root.join("Projects")).expect("project tree should be created");
+        fs::create_dir_all(library_root.join("Samples")).expect("sample tree should be created");
+
+        let sample_path = library_root.join("Samples").join("Kick.wav");
+        fs::write(&sample_path, vec![0x5a; 128 * 1024]).expect("sample should be written");
+        let project_path = library_root.join("Projects").join("session.als");
+        let project_xml = format!(
+            r#"<Ableton><Plugin Device="Kontakt"/><SampleRef Path="{}"/></Ableton>"#,
+            sample_path.to_string_lossy()
+        );
+        fs::write(&project_path, project_xml).expect("project should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-mac",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let mut service = FilesystemService::connect(
+            local_client_config(address.to_string(), &bundle_dir, "localhost"),
+            "studio-mac",
+            client_state_dir.as_path(),
+        )
+        .await
+        .expect("service should connect");
+        let adapter = MacosFilesystem::new("/Volumes/Legato");
+
+        let project = adapter
+            .open(&mut service, project_path.to_string_lossy().as_ref())
+            .await
+            .expect("project open should succeed");
+        let sample = service
+            .open(sample_path.to_string_lossy().as_ref())
+            .await
+            .expect("sample should open");
+        let store =
+            ClientLegatoStore::open(client_state_dir.as_path(), 0).expect("store should open");
+        assert!(
+            store
+                .get_extent(sample.file_id, sample.extents[0].extent_index)
+                .expect("extent lookup should succeed")
+                .is_some()
+        );
+
+        adapter
+            .release(&mut service, project.handle)
+            .await
+            .expect("project release should succeed");
+        service
+            .release(sample.local_handle)
+            .await
+            .expect("sample release should succeed");
         bound.shutdown().await.expect("server should shut down");
     }
 }

@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 legato-client-core = { path = "../legato-client-core" }
+legato-prefetch = { path = "../legato-prefetch" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
 tokio = { version = "1", features = ["sync"] }
@@ -16,6 +17,7 @@ tokio = { version = "1", features = ["sync"] }
 unifuse = "0.1"
 
 [dev-dependencies]
+legato-client-cache = { path = "../legato-client-cache" }
 legato-server = { path = "../legato-server" }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

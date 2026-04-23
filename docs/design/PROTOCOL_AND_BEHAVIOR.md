@@ -38,9 +38,9 @@ Legato consists of:
 
 1. a server daemon on the TrueNAS side
 2. a native user-space filesystem client
-3. a project-aware prefetch tool
+3. project-aware prefetch logic invoked by the client when supported project files are opened
 
-The server owns the canonical store and streams filesystem records. The client mounts a local read-only view, stores local segment records, tracks residency, and fetches misses. The prefetch tool analyzes project or plugin state and asks the local runtime to make specific extents resident.
+The server owns the canonical store and streams filesystem records. The client mounts a local read-only view, stores local segment records, tracks residency, and fetches misses. When the mounted client sees a supported project or preset open, it analyzes that file and asks the local runtime to make specific extents resident.
 
 ## File Identity And Catalog
 
@@ -102,7 +102,7 @@ Directory listing and stat calls are served from catalog state.
 
 ## Prefetch Behavior
 
-`legato-prefetch` analyzes project inputs and emits prioritized residency work.
+When the mounted client opens a supported project or preset, `legato-prefetch` analyzes that input and emits prioritized residency work. The same logic is also exposed as an optional CLI.
 
 Input families:
 
@@ -121,7 +121,7 @@ Priority levels:
 - `P3`
   Speculative or readahead work.
 
-If the caller waits through a priority, completion means accepted extents at or above that priority are locally resident before the command returns.
+If the caller uses the optional CLI and waits through a priority, completion means accepted extents at or above that priority are locally resident before the command returns.
 
 ## Consistency Model
 

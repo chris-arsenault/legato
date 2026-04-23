@@ -20,7 +20,7 @@ This document describes the shape of the workspace so you can find the right cod
 - `crates/legatofs`
   Native client entrypoint. It wires config loading, telemetry bootstrap, local store setup, project-facing commands, and the platform adapter.
 - `crates/legato-prefetch`
-  Project-aware prefetch helper. It analyzes DAW and plugin state, resolves referenced library paths, and emits or executes prefetch hints.
+  Project-aware prefetch logic. It analyzes DAW and plugin state, resolves referenced library paths, and is used by both mount-triggered project opens and the optional CLI.
 
 ## Shared Client Libraries
 

@@ -1033,7 +1033,9 @@ dependencies = [
 name = "legato-fs-macos"
 version = "0.1.0"
 dependencies = [
+ "legato-client-cache",
  "legato-client-core",
+ "legato-prefetch",
  "legato-proto",
  "legato-server",
  "legato-types",
@@ -1047,6 +1049,7 @@ name = "legato-fs-windows"
 version = "0.1.0"
 dependencies = [
  "legato-client-core",
+ "legato-prefetch",
  "legato-proto",
  "legato-server",
  "legato-types",
