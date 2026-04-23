@@ -44,7 +44,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install WinFsp
         shell: pwsh
-        run: choco install winfsp --no-progress -y
+        run: |
+          choco install winfsp --no-progress -y
+
+          $installDirCandidates = @(
+            "${env:ProgramFiles(x86)}\WinFsp",
+            "$env:ProgramFiles\WinFsp"
+          )
+          $installDir = $installDirCandidates | Where-Object { Test-Path (Join-Path $_ "inc\winfsp\winfsp.h") } | Select-Object -First 1
+          if (-not $installDir) {
+            throw "WinFsp headers were not found after installation."
+          }
+
+          $registryPath = "HKLM:\SOFTWARE\WOW6432Node\WinFsp"
+          New-Item -Path $registryPath -Force | Out-Null
+          New-ItemProperty -Path $registryPath -Name InstallDir -Value $installDir -PropertyType String -Force | Out-Null
       - name: Build legatofs
         run: cargo build --release -p legatofs
       - name: Package Windows installer
