@@ -28,7 +28,7 @@ jobs:
       - name: Build legatofs
         run: cargo build --release -p legatofs
       - name: Package macOS installer
-        run: ./deploy/client/package-macos.sh
+        run: bash ./deploy/client/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
           name: legatofs-macos-installer
@@ -42,6 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install WinFsp
+        shell: pwsh
+        run: choco install winfsp --no-progress -y
       - name: Build legatofs
         run: cargo build --release -p legatofs
       - name: Package Windows installer
