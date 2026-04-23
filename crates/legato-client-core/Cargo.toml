@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 legato-client-cache = { path = "../legato-client-cache" }
+legato-foundation = { path = "../legato-foundation" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

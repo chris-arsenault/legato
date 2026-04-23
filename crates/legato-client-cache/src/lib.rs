@@ -228,6 +228,7 @@ mod tests {
             kind: InvalidationKind::File as i32,
             path: String::from("/srv/libraries/Kontakt/piano.nki"),
             file_id: 7,
+            issued_at_ns: 0,
         });
         assert!(matches!(
             cache.stat("/srv/libraries/Kontakt/piano.nki", 105),

@@ -106,17 +106,28 @@ This is the useful performance surface today.
 
 ### Client And Prefetch Metrics
 
-`legatofs` and `legato-prefetch` currently emit startup and lifecycle metrics, but they do not yet emit detailed runtime performance metrics.
+`legatofs` and `legato-prefetch` now emit runtime metrics in addition to startup and lifecycle metrics.
 
-Missing client-side operational metrics include:
+Current client-side runtime metrics include:
 
-- client cache hit ratio
-- client read latency
-- reconnect count and reconnect duration
-- invalidation lag
-- prefetch hints accepted/completed/failed
-- prefetch duration and bytes warmed
-- eviction and compaction activity
+- logical client read count
+- extent cache hit and miss counts
+- logical read bytes served locally vs bytes that required remote fetch
+- last client read duration
+- reconnect count and last reconnect duration
+- invalidation count by kind and last invalidation handling lag
+- resident extent and resident byte gauges
+- automatic eviction count and bytes removed
+- prefetch hints accepted, skipped, completed, and failed
+- prefetch bytes read and bytes newly warmed
+- last prefetch duration
+
+Current limitations remain:
+
+- no per-file or top-N hot/cold file metrics
+- no direct cache inventory endpoint
+- no unified server aggregation endpoint yet
+- no first-class compaction metrics emitted from explicit maintenance commands yet
 
 ## Proposed Unified Metrics Endpoint
 

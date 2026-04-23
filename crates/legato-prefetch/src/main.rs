@@ -1,9 +1,10 @@
 //! Binary entrypoint for the Legato project-aware prefetch planner.
 
+use legato_client_core::ClientRuntimeMetrics;
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
-use legato_prefetch::{parse_cli_args, run_cli_command};
+use legato_prefetch::{parse_cli_args, run_cli_command_with_metrics};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -23,7 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
 
     let command = parse_cli_args(std::env::args())?;
-    let result = run_cli_command(command)?;
+    let metrics = ClientRuntimeMetrics::new("legato-prefetch", &telemetry);
+    let result = run_cli_command_with_metrics(command, Some(metrics))?;
     telemetry.set_lifecycle_state("ready", 1);
     println!("{}", result.output);
     std::process::exit(result.exit_code);

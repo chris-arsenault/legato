@@ -201,4 +201,5 @@ message InvalidationEvent {
   InvalidationKind kind = 1;
   string path = 2;
   uint64 file_id = 3;
+  uint64 issued_at_ns = 4;
 }

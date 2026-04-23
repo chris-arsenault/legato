@@ -1,6 +1,9 @@
 //! Invalidation fan-out primitives for server-side metadata and cache refresh.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use legato_proto::{InvalidationEvent, InvalidationKind};
 
@@ -90,25 +93,35 @@ pub fn subtree_invalidation(path: &str, file_id: u64) -> InvalidationEvent {
         kind: InvalidationKind::Subtree as i32,
         path: String::from(path),
         file_id,
+        issued_at_ns: current_time_ns(),
     }
+}
+
+fn current_time_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{InvalidationHub, subtree_invalidation};
+    use legato_proto::InvalidationKind;
 
     #[test]
     fn subscribe_emits_reconnect_safe_root_invalidation() {
         let mut hub = InvalidationHub::new("/");
 
         let subscription = hub.subscribe();
+        let root = &subscription.initial_events[0];
 
         assert_eq!(hub.subscriber_count(), 1);
         assert_eq!(subscription.subscriber_id, 1);
-        assert_eq!(
-            subscription.initial_events,
-            vec![subtree_invalidation("/", 0)]
-        );
+        assert_eq!(subscription.initial_events.len(), 1);
+        assert_eq!(root.kind, InvalidationKind::Subtree as i32);
+        assert_eq!(root.path, "/");
+        assert_eq!(root.file_id, 0);
+        assert!(root.issued_at_ns > 0);
     }
 
     #[test]
@@ -122,22 +135,16 @@ mod tests {
             subtree_invalidation("/Spitfire", 44),
         ]);
 
-        assert_eq!(
-            hub.drain(first.subscriber_id)
-                .expect("first subscriber should exist"),
-            vec![
-                subtree_invalidation("/Kontakt", 12),
-                subtree_invalidation("/Spitfire", 44),
-            ]
-        );
-        assert_eq!(
-            hub.drain(second.subscriber_id)
-                .expect("second subscriber should exist"),
-            vec![
-                subtree_invalidation("/Kontakt", 12),
-                subtree_invalidation("/Spitfire", 44),
-            ]
-        );
+        for drained in [first.subscriber_id, second.subscriber_id] {
+            let events = hub.drain(drained).expect("subscriber should exist");
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].path, "/Kontakt");
+            assert_eq!(events[0].file_id, 12);
+            assert!(events[0].issued_at_ns > 0);
+            assert_eq!(events[1].path, "/Spitfire");
+            assert_eq!(events[1].file_id, 44);
+            assert!(events[1].issued_at_ns > 0);
+        }
     }
 
     #[test]
@@ -151,10 +158,12 @@ mod tests {
 
         assert_eq!(hub.subscriber_count(), 1);
         assert!(hub.drain(first.subscriber_id).is_none());
-        assert_eq!(
-            hub.drain(second.subscriber_id)
-                .expect("second subscriber should exist"),
-            vec![subtree_invalidation("/Kontakt", 12)]
-        );
+        let events = hub
+            .drain(second.subscriber_id)
+            .expect("second subscriber should exist");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/Kontakt");
+        assert_eq!(events[0].file_id, 12);
+        assert!(events[0].issued_at_ns > 0);
     }
 }

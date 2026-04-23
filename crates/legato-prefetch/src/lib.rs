@@ -3,10 +3,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use legato_client_cache::client_store::ClientLegatoStore;
-use legato_client_core::{ClientConfig, FilesystemOpenHandle, FilesystemService};
+use legato_client_core::{
+    ClientConfig, ClientRuntimeMetrics, FilesystemOpenHandle, FilesystemService,
+    PrefetchMetricsReport,
+};
 use legato_foundation::load_config;
 use legato_types::{PrefetchHintPath, PrefetchPriority};
 use serde::{Deserialize, Serialize};
@@ -293,6 +297,14 @@ where
 
 /// Executes one CLI command end to end.
 pub fn run_cli_command(command: PrefetchCommand) -> Result<CommandResult, PrefetchError> {
+    run_cli_command_with_metrics(command, None)
+}
+
+/// Executes one CLI command end to end with optional runtime metrics attached.
+pub fn run_cli_command_with_metrics(
+    command: PrefetchCommand,
+    metrics: Option<ClientRuntimeMetrics>,
+) -> Result<CommandResult, PrefetchError> {
     match command {
         PrefetchCommand::Analyze { project_path, json } => {
             let analysis = analyze_project(&project_path)?;
@@ -309,7 +321,7 @@ pub fn run_cli_command(command: PrefetchCommand) -> Result<CommandResult, Prefet
         } => {
             let mut analysis = analyze_project(&project_path)?;
             analysis.wait_through = wait_through;
-            let execution = execute_analysis(&analysis, config_path.as_deref())?;
+            let execution = execute_analysis(&analysis, config_path.as_deref(), metrics)?;
             Ok(CommandResult {
                 exit_code: 0,
                 output: render_execution(&analysis, &execution, json)?,
@@ -338,6 +350,7 @@ pub fn supports_project_prefetch(path: &Path) -> bool {
 fn execute_analysis(
     analysis: &ProjectAnalysis,
     config_path: Option<&Path>,
+    metrics: Option<ClientRuntimeMetrics>,
 ) -> Result<ExecutionReport, PrefetchError> {
     let config_path = config_path
         .map(Path::to_path_buf)
@@ -349,7 +362,7 @@ fn execute_analysis(
         .enable_all()
         .build()
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    runtime.block_on(execute_analysis_live(analysis, process_config))
+    runtime.block_on(execute_analysis_live(analysis, process_config, metrics))
 }
 
 /// Executes integrated project prefetch for one already-opened project handle.
@@ -373,6 +386,8 @@ pub async fn prefetch_opened_project(
         .await
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
     let analysis = analyze_project_bytes(project_path, &project_bytes)?;
+    let started = Instant::now();
+    let bytes_before = service.resident_bytes();
     let mut report = ExecutionReport::default();
 
     for hint in scheduled_hints(
@@ -391,6 +406,8 @@ pub async fn prefetch_opened_project(
             Err(_error) => report.failed += 1,
         }
     }
+    report.bytes_fetched = service.resident_bytes().saturating_sub(bytes_before);
+    record_prefetch_metrics(service, &report, started.elapsed().as_nanos() as u64);
 
     Ok(Some(report))
 }
@@ -398,13 +415,16 @@ pub async fn prefetch_opened_project(
 async fn execute_analysis_live(
     analysis: &ProjectAnalysis,
     process_config: PrefetchClientProcessConfig,
+    metrics: Option<ClientRuntimeMetrics>,
 ) -> Result<ExecutionReport, PrefetchError> {
+    let started = Instant::now();
     let state_dir = PathBuf::from(&process_config.mount.state_dir);
     let bytes_before = local_extent_bytes(&state_dir)?;
-    let mut service = FilesystemService::connect(
+    let mut service = FilesystemService::connect_with_metrics(
         process_config.client,
         default_client_name(),
         Path::new(&process_config.mount.state_dir),
+        metrics,
     )
     .await
     .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
@@ -431,6 +451,7 @@ async fn execute_analysis_live(
 
     let bytes_after = local_extent_bytes(&state_dir)?;
     report.bytes_fetched = bytes_after.saturating_sub(bytes_before);
+    record_prefetch_metrics(&service, &report, started.elapsed().as_nanos() as u64);
     Ok(report)
 }
 
@@ -571,6 +592,20 @@ fn local_extent_bytes(state_dir: &Path) -> Result<u64, PrefetchError> {
     ClientLegatoStore::open(state_dir, 0)
         .map(|store| store.resident_bytes())
         .map_err(|error| PrefetchError::Runtime(error.to_string()))
+}
+
+fn record_prefetch_metrics(service: &FilesystemService, report: &ExecutionReport, elapsed_ns: u64) {
+    if let Some(metrics) = service.runtime_metrics() {
+        metrics.record_prefetch(PrefetchMetricsReport {
+            accepted: report.accepted as u64,
+            skipped: report.skipped as u64,
+            completed: report.completed as u64,
+            failed: report.failed as u64,
+            bytes_read: report.bytes_read,
+            bytes_fetched: report.bytes_fetched,
+            elapsed_ns,
+        });
+    }
 }
 
 fn scheduled_hints(mut hints: Vec<PrefetchHintPath>) -> Vec<PrefetchHintPath> {

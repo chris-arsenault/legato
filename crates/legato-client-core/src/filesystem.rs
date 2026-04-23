@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::{
@@ -15,7 +15,7 @@ use legato_proto::{
 };
 use legato_types::{FileId, FilesystemAttributes};
 
-use crate::{ClientConfig, GrpcClientTransport, LocalControlPlane};
+use crate::{ClientConfig, ClientRuntimeMetrics, GrpcClientTransport, LocalControlPlane};
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -107,6 +107,7 @@ pub struct FilesystemService {
     transport: GrpcClientTransport,
     control: LocalControlPlane,
     store: ClientLegatoStore,
+    metrics: Option<ClientRuntimeMetrics>,
     max_cache_bytes: u64,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
@@ -119,19 +120,37 @@ impl FilesystemService {
         client_name: impl Into<String>,
         state_dir: &Path,
     ) -> Result<Self, FilesystemServiceError> {
+        Self::connect_with_metrics(config, client_name, state_dir, None).await
+    }
+
+    /// Connects to the remote server and opens the local cache with runtime metrics attached.
+    pub async fn connect_with_metrics(
+        config: ClientConfig,
+        client_name: impl Into<String>,
+        state_dir: &Path,
+        metrics: Option<ClientRuntimeMetrics>,
+    ) -> Result<Self, FilesystemServiceError> {
         let max_cache_bytes = config.cache.max_bytes;
         let store = ClientLegatoStore::open(state_dir, now_monotonic_ns())?;
         let transport = GrpcClientTransport::connect(config, client_name).await?;
         let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
 
-        Ok(Self {
+        let service = Self {
             transport,
             control,
             store,
+            metrics,
             max_cache_bytes,
             next_handle: 1,
             open_handles: HashMap::new(),
-        })
+        };
+        if let Some(metrics) = &service.metrics {
+            metrics.record_residency(
+                service.store.resident_bytes(),
+                service.store.resident_extent_count() as u64,
+            );
+        }
+        Ok(service)
     }
 
     /// Returns attach session metadata for the current connection.
@@ -144,6 +163,18 @@ impl FilesystemService {
     #[must_use]
     pub fn has_active_subscription(&self) -> bool {
         true
+    }
+
+    /// Returns the attached runtime metrics recorder when one is configured.
+    #[must_use]
+    pub fn runtime_metrics(&self) -> Option<&ClientRuntimeMetrics> {
+        self.metrics.as_ref()
+    }
+
+    /// Returns the current logical resident payload bytes in the local extent store.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.store.resident_bytes()
     }
 
     /// Returns a cached or remotely fetched metadata view for one path.
@@ -223,6 +254,7 @@ impl FilesystemService {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, FilesystemServiceError> {
+        let started = Instant::now();
         self.sync_changes().await?;
         let snapshot = self
             .open_handles
@@ -235,13 +267,29 @@ impl FilesystemService {
         let planned_extents = read_plan(&snapshot, offset, size);
         let now_ns = now_monotonic_ns();
         let mut missing_extents = Vec::new();
+        let mut cache_hits = 0_u64;
+        let mut cache_misses = 0_u64;
+        let mut local_bytes = 0_u64;
+        let mut remote_bytes = 0_u64;
         for descriptor in &planned_extents {
+            let requested = overlap_len(
+                descriptor.file_offset,
+                descriptor.length,
+                offset,
+                u64::from(size),
+                snapshot.size,
+            );
             if self
                 .store
                 .get_extent(snapshot.file_id, descriptor.extent_index)?
                 .is_none()
             {
                 missing_extents.push(descriptor.clone());
+                cache_misses = cache_misses.saturating_add(1);
+                remote_bytes = remote_bytes.saturating_add(requested);
+            } else {
+                cache_hits = cache_hits.saturating_add(1);
+                local_bytes = local_bytes.saturating_add(requested);
             }
         }
 
@@ -253,6 +301,15 @@ impl FilesystemService {
 
         let bytes = assemble_read(&mut self.store, &snapshot, offset, size)?;
         self.enforce_cache_budget()?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_read(
+                cache_hits,
+                cache_misses,
+                local_bytes,
+                remote_bytes,
+                started.elapsed().as_nanos() as u64,
+            );
+        }
         Ok(bytes)
     }
 
@@ -261,9 +318,17 @@ impl FilesystemService {
         &mut self,
         event: &InvalidationEvent,
     ) -> Result<(), FilesystemServiceError> {
+        let handled_at_ns = now_monotonic_ns();
         self.control.apply_invalidation(event);
         self.store.apply_invalidation(event)?;
         self.store.checkpoint()?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_invalidation(event, handled_at_ns);
+            metrics.record_residency(
+                self.store.resident_bytes(),
+                self.store.resident_extent_count() as u64,
+            );
+        }
         Ok(())
     }
 
@@ -304,7 +369,11 @@ impl FilesystemService {
                 Ok(())
             }
             Err(error) if should_retry_after_reconnect(&error) => {
+                let reconnect_started = Instant::now();
                 self.transport.reconnect().await?;
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
+                }
                 for record in self
                     .transport
                     .change_records_since(self.store.subscription_cursor())
@@ -341,7 +410,11 @@ impl FilesystemService {
                 Ok(())
             }
             Err(error) if should_retry_after_reconnect(&error) => {
+                let reconnect_started = Instant::now();
                 self.transport.reconnect().await?;
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
+                }
                 self.sync_changes().await?;
                 let refreshed = self
                     .open_handles
@@ -380,9 +453,18 @@ impl FilesystemService {
 
     fn enforce_cache_budget(&mut self) -> Result<(), FilesystemServiceError> {
         if self.store.resident_bytes() > self.max_cache_bytes {
-            let _ = self.store.evict_to_limit(self.max_cache_bytes)?;
+            let report = self.store.evict_to_limit(self.max_cache_bytes)?;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_eviction(&report);
+            }
         } else {
             self.store.checkpoint()?;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_residency(
+                    self.store.resident_bytes(),
+                    self.store.resident_extent_count() as u64,
+                );
+            }
         }
         Ok(())
     }
@@ -531,6 +613,20 @@ fn should_retry_after_reconnect(error: &crate::ClientTransportError) -> bool {
         crate::ClientTransportError::Transport(_) => true,
         _ => false,
     }
+}
+
+fn overlap_len(
+    extent_offset: u64,
+    extent_len: u64,
+    request_offset: u64,
+    request_size: u64,
+    file_size: u64,
+) -> u64 {
+    let request_end = request_offset.saturating_add(request_size).min(file_size);
+    let extent_end = extent_offset.saturating_add(extent_len);
+    let start = request_offset.max(extent_offset);
+    let end = request_end.min(extent_end);
+    end.saturating_sub(start)
 }
 
 #[cfg(test)]
@@ -823,6 +919,7 @@ mod tests {
             kind: InvalidationKind::Subtree as i32,
             path: String::from("/Kontakt"),
             file_id: 0,
+            issued_at_ns: 0,
         };
         let timestamp = now_monotonic_ns();
 

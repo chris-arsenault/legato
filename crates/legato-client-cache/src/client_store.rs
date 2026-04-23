@@ -702,6 +702,7 @@ mod tests {
                 kind: InvalidationKind::Subtree as i32,
                 path: String::from("/Kontakt"),
                 file_id: 0,
+                issued_at_ns: 0,
             })
             .expect("subtree invalidation should apply");
 

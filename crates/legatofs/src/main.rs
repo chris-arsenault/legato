@@ -8,7 +8,9 @@ use std::{
 };
 
 use legato_client_cache::client_store::ClientLegatoStore;
-use legato_client_core::{ClientConfig, FilesystemService, LocalControlPlane};
+use legato_client_core::{
+    ClientConfig, ClientRuntimeMetrics, FilesystemService, LocalControlPlane,
+};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
@@ -78,10 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup = startup_context(&process_config.mount);
     let control = control_plane_for_mount(&process_config.mount, startup.semantics)?;
     let client_name = default_client_name();
-    let service = FilesystemService::connect(
+    let client_metrics = ClientRuntimeMetrics::new("legatofs", &telemetry);
+    let service = FilesystemService::connect_with_metrics(
         process_config.client.clone(),
         &client_name,
         Path::new(&process_config.mount.state_dir),
+        Some(client_metrics),
     )
     .await?;
     let server_name = service.server_name().to_owned();

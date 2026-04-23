@@ -1005,6 +1005,7 @@ name = "legato-client-core"
 version = "0.1.0"
 dependencies = [
  "legato-client-cache",
+ "legato-foundation",
  "legato-proto",
  "legato-server",
  "legato-types",

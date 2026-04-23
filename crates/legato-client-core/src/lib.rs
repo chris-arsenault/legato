@@ -1,6 +1,7 @@
 //! Shared runtime state for native Legato clients.
 
 mod filesystem;
+mod metrics;
 mod transport;
 
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub use filesystem::{
     FilesystemOpenHandle, FilesystemService, FilesystemServiceError, now_monotonic_ns,
 };
+pub use metrics::{ClientRuntimeMetrics, PrefetchMetricsReport};
 pub use transport::{
     ChangePoll, ClientAttachSession, ClientTransportError, GrpcChangeSubscription,
     GrpcClientTransport, GrpcInvalidationSubscription, InvalidationPoll,
@@ -292,6 +294,7 @@ impl ClientRuntime {
                 kind: InvalidationKind::Subtree as i32,
                 path: String::from(path),
                 file_id: 0,
+                issued_at_ns: filesystem::now_monotonic_ns(),
             }),
         }
     }
@@ -661,6 +664,7 @@ impl LocalControlPlane {
                     kind: InvalidationKind::Subtree as i32,
                     path: record.path.clone(),
                     file_id: record.file_id,
+                    issued_at_ns: 0,
                 });
             }
             ChangeKind::Checkpoint | ChangeKind::Unspecified => {}
@@ -864,8 +868,8 @@ mod tests {
 
     use super::{
         ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, FetchCoordinator,
-        LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RecoveryCompletion,
-        RetryPolicy, SessionStatus, build_tls_client_config, schedule_prefetch_request,
+        LocalControlPlane, PrefetchExecution, PrefetchExecutor, ReconnectPlan, RetryPolicy,
+        SessionStatus, build_tls_client_config, schedule_prefetch_request,
     };
     use legato_client_cache::{
         MetadataCache, MetadataCachePolicy, client_store::ClientLegatoStore,
@@ -953,17 +957,14 @@ mod tests {
         let completion = runtime.complete_reconnect(Some("/"));
 
         assert!(plan.resubscribe);
-        assert_eq!(
-            completion,
-            RecoveryCompletion {
-                reopened_paths: Vec::new(),
-                invalidation: Some(InvalidationEvent {
-                    kind: InvalidationKind::Subtree as i32,
-                    path: String::from("/"),
-                    file_id: 0,
-                }),
-            }
-        );
+        assert!(completion.reopened_paths.is_empty());
+        let invalidation = completion
+            .invalidation
+            .expect("root reconnect should invalidate cached metadata");
+        assert_eq!(invalidation.kind, InvalidationKind::Subtree as i32);
+        assert_eq!(invalidation.path, "/");
+        assert_eq!(invalidation.file_id, 0);
+        assert!(invalidation.issued_at_ns > 0);
     }
 
     #[test]
@@ -1232,6 +1233,7 @@ mod tests {
             kind: InvalidationKind::File as i32,
             path: String::from("/Kontakt/piano.nki"),
             file_id: 7,
+            issued_at_ns: 0,
         });
         assert!(control.resolve_path("/Kontakt/piano.nki", 201).is_none());
     }
