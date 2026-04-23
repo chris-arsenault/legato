@@ -396,7 +396,7 @@ fn attributes_from_open_handle(handle: &FilesystemOpenHandle) -> FilesystemAttri
         path: handle.path.clone().into(),
         is_dir: false,
         size: handle.size,
-        mtime_ns: 0,
+        mtime_ns: handle.mtime_ns,
         block_size: handle
             .extents
             .first()

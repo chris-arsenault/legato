@@ -9,7 +9,10 @@ use std::{
 use legato_client_cache::{
     ExtentCacheStore, ExtentKey, MetadataCache, MetadataCachePolicy, open_cache_database,
 };
-use legato_proto::{DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata, InvalidationEvent};
+use legato_proto::{
+    DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata, InodeMetadata, InvalidationEvent,
+    TransferClass,
+};
 use legato_types::{FileId, FilesystemAttributes};
 
 use crate::{
@@ -34,10 +37,14 @@ pub struct FilesystemOpenHandle {
     pub path: String,
     /// Stable server file identifier.
     pub file_id: FileId,
-    /// Current remote server-local handle.
-    pub server_handle: u64,
+    /// Current remote server-local handle when the transport still uses one.
+    pub server_handle: Option<u64>,
     /// Logical file size in bytes.
     pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+    /// Transfer class for head-biased fetch decisions.
+    pub transfer_class: TransferClass,
     /// Semantic file layout used for extent fetches.
     pub extents: Vec<ExtentDescriptor>,
 }
@@ -193,33 +200,33 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
         self.sync_invalidations().await?;
-        let response = self
+        let inode = self
             .transport
             .resolve(path.to_owned())
             .await
             .map_err(map_lookup_error(path))?;
-        let open_response = self
-            .transport
-            .open(path.to_owned())
-            .await
-            .map_err(map_lookup_error(path))?;
-        let handle = FilesystemOpenHandle {
-            local_handle: self.next_handle,
-            path: path.to_owned(),
-            file_id: FileId(open_response.file_id),
-            server_handle: open_response.file_handle,
-            size: open_response.size,
-            extents: response
-                .layout
-                .map_or_else(Vec::new, |layout| layout.extents),
-        };
+        self.control
+            .register_resolved_path(inode.clone(), now_monotonic_ns());
+        let handle = inode_to_open_handle(self.next_handle, inode);
         self.next_handle += 1;
         self.open_handles
             .insert(handle.local_handle, handle.clone());
         Ok(handle)
     }
 
-    /// Reads a byte range from one opened file, serving cached blocks whenever possible.
+    /// Releases a previously opened file handle.
+    pub async fn release(&mut self, local_handle: u64) -> Result<(), FilesystemServiceError> {
+        let Some(handle) = self.open_handles.remove(&local_handle) else {
+            return Err(FilesystemServiceError::UnknownHandle(local_handle));
+        };
+        if let Some(server_handle) = handle.server_handle {
+            self.transport.close(server_handle).await?;
+        }
+        self.transport.runtime_mut().close_open_handle(&handle.path);
+        Ok(())
+    }
+
+    /// Reads a byte range from one opened file, serving cached extents whenever possible.
     pub async fn read(
         &mut self,
         local_handle: u64,
@@ -249,21 +256,12 @@ impl FilesystemService {
         }
 
         if !missing_extents.is_empty() {
-            self.fetch_missing_extents(&snapshot, &missing_extents, now_ns)
+            let fetch_plan = head_biased_fetch_plan(&snapshot, &missing_extents);
+            self.fetch_missing_extents(&snapshot, &fetch_plan, now_ns)
                 .await?;
         }
 
         assemble_read(&mut self.store, &snapshot, offset, size, now_ns)
-    }
-
-    /// Releases a previously opened file handle.
-    pub async fn release(&mut self, local_handle: u64) -> Result<(), FilesystemServiceError> {
-        let Some(handle) = self.open_handles.remove(&local_handle) else {
-            return Err(FilesystemServiceError::UnknownHandle(local_handle));
-        };
-        self.transport.close(handle.server_handle).await?;
-        self.transport.runtime_mut().close_open_handle(&handle.path);
-        Ok(())
     }
 
     /// Applies one invalidation to the local metadata and block caches.
@@ -403,13 +401,8 @@ impl FilesystemService {
 
     async fn refresh_handles_from_runtime(&mut self) {
         for handle in self.open_handles.values_mut() {
-            if let Some(open_file) = self.transport.runtime().open_file(&handle.path) {
-                handle.server_handle = open_file.file_handle;
-                handle.file_id = FileId(open_file.file_id);
-            }
             if let Ok(inode) = self.transport.resolve(handle.path.clone()).await {
-                handle.extents = inode.layout.map_or_else(Vec::new, |layout| layout.extents);
-                handle.size = inode.size;
+                *handle = inode_to_open_handle(handle.local_handle, inode);
             }
         }
     }
@@ -426,6 +419,40 @@ fn read_plan(handle: &FilesystemOpenHandle, offset: u64, size: u32) -> Vec<Exten
         })
         .cloned()
         .collect()
+}
+
+fn head_biased_fetch_plan(
+    handle: &FilesystemOpenHandle,
+    missing_extents: &[ExtentDescriptor],
+) -> Vec<ExtentDescriptor> {
+    let mut plan = missing_extents.to_vec();
+    if handle.transfer_class != TransferClass::Streamed {
+        return plan;
+    }
+
+    let Some(max_extent_index) = missing_extents
+        .iter()
+        .map(|extent| extent.extent_index)
+        .max()
+    else {
+        return plan;
+    };
+
+    for descriptor in handle
+        .extents
+        .iter()
+        .filter(|extent| extent.extent_index > max_extent_index)
+        .take(2)
+    {
+        if plan
+            .iter()
+            .all(|existing| existing.extent_index != descriptor.extent_index)
+        {
+            plan.push(descriptor.clone());
+        }
+    }
+
+    plan
 }
 
 fn assemble_read(
@@ -472,6 +499,24 @@ fn metadata_to_attributes(metadata: FileMetadata) -> FilesystemAttributes {
     }
 }
 
+fn inode_to_open_handle(local_handle: u64, inode: InodeMetadata) -> FilesystemOpenHandle {
+    let transfer_class = inode
+        .layout
+        .as_ref()
+        .and_then(|layout| TransferClass::try_from(layout.transfer_class).ok())
+        .unwrap_or(TransferClass::Unspecified);
+    FilesystemOpenHandle {
+        local_handle,
+        path: inode.path,
+        file_id: FileId(inode.file_id),
+        server_handle: None,
+        size: inode.size,
+        mtime_ns: inode.mtime_ns,
+        transfer_class,
+        extents: inode.layout.map_or_else(Vec::new, |layout| layout.extents),
+    }
+}
+
 fn map_lookup_error<'a>(
     path: &'a str,
 ) -> impl FnOnce(crate::ClientTransportError) -> FilesystemServiceError + 'a {
@@ -501,6 +546,7 @@ fn should_retry_after_reconnect(error: &crate::ClientTransportError) -> bool {
 mod tests {
     use std::{fs, path::Path};
 
+    use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata, TransferClass};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
@@ -511,7 +557,9 @@ mod tests {
         issue_client_tls_bundle, load_runtime_tls,
     };
 
-    use super::{FilesystemService, now_monotonic_ns};
+    use super::{
+        FilesystemService, head_biased_fetch_plan, inode_to_open_handle, now_monotonic_ns,
+    };
 
     fn local_client_config(
         endpoint: String,
@@ -775,5 +823,87 @@ mod tests {
 
         assert!(timestamp > 0);
         assert_eq!(event.path, "/srv/libraries/Kontakt");
+    }
+
+    #[test]
+    fn open_handle_uses_resolved_inode_metadata_without_remote_open_state() {
+        let handle = inode_to_open_handle(
+            7,
+            InodeMetadata {
+                file_id: 42,
+                path: String::from("/srv/libraries/Strings/legato.ncw"),
+                size: 8192,
+                mtime_ns: 123,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: vec![ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
+                        extent_hash: Vec::new(),
+                    }],
+                }),
+            },
+        );
+
+        assert_eq!(handle.local_handle, 7);
+        assert_eq!(handle.file_id.0, 42);
+        assert_eq!(handle.server_handle, None);
+        assert_eq!(handle.mtime_ns, 123);
+        assert_eq!(handle.transfer_class, TransferClass::Streamed);
+        assert_eq!(handle.extents.len(), 1);
+    }
+
+    #[test]
+    fn streamed_reads_bias_fetch_plan_toward_head_then_following_extents() {
+        let handle = inode_to_open_handle(
+            1,
+            InodeMetadata {
+                file_id: 9,
+                path: String::from("/srv/libraries/Strings/long.ncw"),
+                size: 16 * 1024 * 1024,
+                mtime_ns: 55,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: vec![
+                        ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 4 * 1024 * 1024,
+                            extent_hash: Vec::new(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 1,
+                            file_offset: 4 * 1024 * 1024,
+                            length: 4 * 1024 * 1024,
+                            extent_hash: Vec::new(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 2,
+                            file_offset: 8 * 1024 * 1024,
+                            length: 4 * 1024 * 1024,
+                            extent_hash: Vec::new(),
+                        },
+                    ],
+                }),
+            },
+        );
+
+        let fetch_plan = head_biased_fetch_plan(
+            &handle,
+            &[ExtentDescriptor {
+                extent_index: 0,
+                file_offset: 0,
+                length: 4 * 1024 * 1024,
+                extent_hash: Vec::new(),
+            }],
+        );
+
+        assert_eq!(fetch_plan.len(), 3);
+        assert_eq!(fetch_plan[0].extent_index, 0);
+        assert_eq!(fetch_plan[1].extent_index, 1);
+        assert_eq!(fetch_plan[2].extent_index, 2);
     }
 }
