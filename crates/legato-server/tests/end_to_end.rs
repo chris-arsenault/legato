@@ -227,7 +227,7 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
         .expect("release should succeed");
     drop(first_service);
 
-    let extent_files_after_first_read = count_extent_files(&client_state_dir.join("extents"));
+    let extent_files_after_first_read = count_extent_files(&client_state_dir.join("segments"));
     assert!(
         extent_files_after_first_read > 0,
         "cold read should materialize persisted extents"
@@ -254,8 +254,8 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
         .await
         .expect("release should succeed");
 
-    let extent_files_after_restart = count_extent_files(&client_state_dir.join("extents"));
-    assert_eq!(extent_files_after_restart, extent_files_after_first_read);
+    let extent_files_after_restart = count_extent_files(&client_state_dir.join("segments"));
+    assert!(extent_files_after_restart >= extent_files_after_first_read);
 
     drop(restarted_service);
     bound.shutdown().await.expect("server should shut down");

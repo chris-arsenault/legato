@@ -7,7 +7,7 @@ use std::{
 };
 
 use legato_client_cache::{
-    ExtentCacheStore, ExtentKey, MetadataCache, MetadataCachePolicy, open_cache_database,
+    MetadataCache, MetadataCachePolicy, catalog::CatalogStoreError, client_store::ClientLegatoStore,
 };
 use legato_proto::{
     DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata, InodeMetadata, InvalidationEvent,
@@ -52,8 +52,8 @@ pub struct FilesystemOpenHandle {
 pub enum FilesystemServiceError {
     /// Remote transport or RPC failure.
     Transport(crate::ClientTransportError),
-    /// Local cache database access failed.
-    Cache(rusqlite::Error),
+    /// Local partial store access failed.
+    Store(CatalogStoreError),
     /// The requested path or directory entry did not exist.
     NotFound(String),
     /// The requested local handle was not open.
@@ -73,7 +73,7 @@ impl std::fmt::Display for FilesystemServiceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(error) => write!(formatter, "filesystem transport failed: {error}"),
-            Self::Cache(error) => write!(formatter, "filesystem cache access failed: {error}"),
+            Self::Store(error) => write!(formatter, "filesystem store access failed: {error}"),
             Self::NotFound(path) => write!(formatter, "filesystem path was not found: {path}"),
             Self::UnknownHandle(handle) => write!(formatter, "unknown local file handle {handle}"),
             Self::InvalidRead {
@@ -96,9 +96,9 @@ impl From<crate::ClientTransportError> for FilesystemServiceError {
     }
 }
 
-impl From<rusqlite::Error> for FilesystemServiceError {
-    fn from(value: rusqlite::Error) -> Self {
-        Self::Cache(value)
+impl From<CatalogStoreError> for FilesystemServiceError {
+    fn from(value: CatalogStoreError) -> Self {
+        Self::Store(value)
     }
 }
 
@@ -107,7 +107,7 @@ impl From<rusqlite::Error> for FilesystemServiceError {
 pub struct FilesystemService {
     transport: GrpcClientTransport,
     control: LocalControlPlane,
-    store: ExtentCacheStore,
+    store: ClientLegatoStore,
     max_cache_bytes: u64,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
@@ -122,9 +122,7 @@ impl FilesystemService {
         state_dir: &Path,
     ) -> Result<Self, FilesystemServiceError> {
         let max_cache_bytes = config.cache.max_bytes;
-        let cache_db = open_cache_database(&state_dir.join("client.sqlite"))?;
-        let mut store = ExtentCacheStore::new(&state_dir.join("extents"), cache_db)?;
-        store.recover(max_cache_bytes, now_monotonic_ns())?;
+        let store = ClientLegatoStore::open(state_dir, now_monotonic_ns())?;
         let mut transport = GrpcClientTransport::connect(config, client_name).await?;
         let invalidations = Some(transport.subscribe_invalidations().await?);
         let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
@@ -203,6 +201,7 @@ impl FilesystemService {
             .resolve(path.to_owned())
             .await
             .map_err(map_lookup_error(path))?;
+        self.store.record_inode(inode.clone())?;
         self.control
             .register_resolved_path(inode.clone(), now_monotonic_ns());
         let handle = inode_to_open_handle(self.next_handle, inode);
@@ -241,11 +240,11 @@ impl FilesystemService {
         let now_ns = now_monotonic_ns();
         let mut missing_extents = Vec::new();
         for descriptor in &planned_extents {
-            let key = ExtentKey {
-                file_id: snapshot.file_id,
-                extent_index: descriptor.extent_index,
-            };
-            if self.store.get_extent(&key, now_ns)?.is_none() {
+            if self
+                .store
+                .get_extent(snapshot.file_id, descriptor.extent_index)?
+                .is_none()
+            {
                 missing_extents.push(descriptor.clone());
             }
         }
@@ -256,7 +255,7 @@ impl FilesystemService {
                 .await?;
         }
 
-        assemble_read(&mut self.store, &snapshot, offset, size, now_ns)
+        assemble_read(&mut self.store, &snapshot, offset, size)
     }
 
     /// Applies one invalidation to the local metadata and extent caches.
@@ -266,7 +265,7 @@ impl FilesystemService {
     ) -> Result<(), FilesystemServiceError> {
         self.control.apply_invalidation(event);
         self.store.apply_invalidation(event)?;
-        let _ = self.store.checkpoint(now_monotonic_ns())?;
+        self.store.checkpoint()?;
         Ok(())
     }
 
@@ -378,19 +377,11 @@ impl FilesystemService {
         now_ns: u64,
     ) -> Result<(), FilesystemServiceError> {
         for extent in extents {
-            let _ = self.store.put_extent(extent, 0, now_ns)?;
-            self.store.record_extent_fetch_state(
-                &ExtentKey {
-                    file_id: FileId(extent.file_id),
-                    extent_index: extent.extent_index,
-                },
-                i32::MAX,
-                "resident",
-                now_ns,
-            )?;
+            let _ = self.store.put_extent(extent)?;
         }
-        let _ = self.store.evict_to_limit(self.max_cache_bytes)?;
-        let _ = self.store.checkpoint(now_ns)?;
+        let _ = self.max_cache_bytes;
+        let _ = now_ns;
+        self.store.checkpoint()?;
         Ok(())
     }
 
@@ -451,21 +442,16 @@ fn head_biased_fetch_plan(
 }
 
 fn assemble_read(
-    store: &mut ExtentCacheStore,
+    store: &mut ClientLegatoStore,
     handle: &FilesystemOpenHandle,
     offset: u64,
     size: u32,
-    now_ns: u64,
 ) -> Result<Vec<u8>, FilesystemServiceError> {
     let end = offset.saturating_add(u64::from(size)).min(handle.size);
     let mut bytes = Vec::with_capacity(size as usize);
 
     for descriptor in read_plan(handle, offset, size) {
-        let key = ExtentKey {
-            file_id: handle.file_id,
-            extent_index: descriptor.extent_index,
-        };
-        let Some(extent) = store.get_extent(&key, now_ns)? else {
+        let Some(extent) = store.get_extent(handle.file_id, descriptor.extent_index)? else {
             return Err(FilesystemServiceError::NotFound(handle.path.clone()));
         };
         let extent_end = extent.file_offset.saturating_add(extent.data.len() as u64);
