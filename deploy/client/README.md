@@ -33,9 +33,11 @@ This document defines the installation and upgrade shape for the native Legato c
 - Installer output: `artifacts/macos/*.pkg`
 - Client-bundle install command:
   `legatofs install --bundle-dir <bundle>`
+- Mount-agent registration:
+  `legatofs service install`
 - Packaged registration helper:
   `legato-register-client --bundle-dir <bundle>`
-- Startup model: packaged binary plus bundle/config hydration through the shared install command. Automatic startup is not implemented yet.
+- Startup model: user launchd agent running the installed binary with `LEGATO_FS_CONFIG` pointed at the generated config.
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
   - replace the binary in place
@@ -58,8 +60,10 @@ This document defines the installation and upgrade shape for the native Legato c
   - mount point
 - Client-bundle install command:
   `legatofs.exe install --bundle-dir <bundle>`
+- Mount-agent registration:
+  `legatofs.exe service install`
 - If the installer is given a valid bundle directory, it runs `legatofs.exe install` automatically during setup.
-- Startup model: packaged binary plus install-time bundle/config hydration through the shared install command. Automatic startup is not implemented yet.
+- Startup model: per-user scheduled task running the installed binary with `LEGATO_FS_CONFIG` pointed at the generated config.
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
   - replace the binary in place
