@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         let adapter = legato_fs_macos::MacosFilesystem::new(startup.mount_point.clone());
-        let _ = &mut control;
+        let _ = control;
         if !legato_fs_macos::mount_runtime_available() {
             return Err("macFUSE runtime not detected on this host".into());
         }
@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     {
         let adapter = legato_fs_windows::WindowsFilesystem::new(startup.mount_point.clone());
-        let _ = &mut control;
+        let _ = control;
         if !legato_fs_windows::mount_runtime_available() {
             return Err("WinFSP runtime not detected on this host".into());
         }
