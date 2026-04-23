@@ -612,6 +612,8 @@ impl LocalControlPlane {
                 mtime_ns: metadata.mtime_ns,
                 is_dir: metadata.is_dir,
                 layout: None,
+                inode_generation: 1,
+                content_hash: metadata.content_hash,
             },
             now_ns,
         );
@@ -731,7 +733,7 @@ fn inode_metadata_to_file_metadata(inode: &InodeMetadata) -> FileMetadata {
         path: inode.path.clone(),
         size: inode.size,
         mtime_ns: inode.mtime_ns,
-        content_hash: Vec::new(),
+        content_hash: inode.content_hash.clone(),
         is_dir: inode.is_dir,
     }
 }
@@ -1136,6 +1138,8 @@ mod tests {
                         },
                     ],
                 }),
+                inode_generation: 1,
+                content_hash: b"prefetch-content".to_vec(),
             },
             100,
         );
@@ -1234,6 +1238,8 @@ mod tests {
                     },
                 ],
             }),
+            inode_generation: 1,
+            content_hash: b"prefetch-content".to_vec(),
         }
     }
 

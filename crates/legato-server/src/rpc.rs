@@ -289,6 +289,9 @@ impl Legato for LiveServer {
             let inode = catalog
                 .resolve_file_id(FileId(extent.file_id))
                 .ok_or_else(|| Status::not_found("file id not found"))?;
+            if inode.inode_generation != extent.inode_generation {
+                return Err(Status::failed_precondition("stale inode generation"));
+            }
             let catalog_extent = inode
                 .extents
                 .iter()
@@ -296,6 +299,8 @@ impl Legato for LiveServer {
                     candidate.extent_index == extent.extent_index
                         && candidate.file_offset == extent.file_offset
                         && candidate.length == extent.length
+                        && (extent.extent_hash.is_empty()
+                            || candidate.payload_hash == extent.extent_hash)
                 })
                 .ok_or_else(|| Status::not_found("extent not found"))?;
             let started = Instant::now();
@@ -476,7 +481,7 @@ fn catalog_inode_to_metadata(inode: CatalogInode) -> FileMetadata {
         path: inode.path,
         size: inode.size,
         mtime_ns: inode.mtime_ns as u64,
-        content_hash: Vec::new(),
+        content_hash: inode.content_hash,
         is_dir: inode.is_dir,
     }
 }
@@ -583,9 +588,11 @@ mod tests {
             .await
             .expect("stat should succeed")
             .into_inner();
+        let stat_metadata = stat.metadata.expect("metadata should be present");
+        assert_eq!(stat_metadata.path, "/Kontakt/piano.nki");
         assert_eq!(
-            stat.metadata.expect("metadata should be present").path,
-            "/Kontakt/piano.nki"
+            stat_metadata.content_hash,
+            blake3::hash(b"hello legato").as_bytes()
         );
 
         let inode = client
@@ -609,6 +616,8 @@ mod tests {
                     extent_index: extent.extent_index,
                     file_offset: extent.file_offset,
                     length: extent.length,
+                    inode_generation: inode.inode_generation,
+                    extent_hash: extent.extent_hash.clone(),
                 }],
             })
             .await
@@ -721,6 +730,8 @@ mod tests {
                     extent_index: 0,
                     file_offset: 0,
                     length: inode.size,
+                    inode_generation: inode.inode_generation,
+                    extent_hash: layout.extents[0].extent_hash.clone(),
                 }],
             })
             .await

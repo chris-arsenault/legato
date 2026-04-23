@@ -45,14 +45,37 @@ pub struct CatalogInode {
     pub file_id: FileId,
     /// Absolute virtual library path.
     pub path: String,
+    /// Monotonic inode generation for fetch binding.
+    #[serde(default = "default_inode_generation")]
+    pub inode_generation: u64,
     /// File size in bytes.
     pub size: u64,
     /// Modification time in nanoseconds.
     pub mtime_ns: i64,
     /// True for directories.
     pub is_dir: bool,
+    /// Hash of the full file contents when known.
+    #[serde(default)]
+    pub content_hash: Vec<u8>,
     /// Assigned transfer class.
     pub transfer_class: i32,
+    /// Authoritative extent map for regular files.
+    pub extents: Vec<CatalogExtent>,
+}
+
+/// File-specific inode metadata and extent layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogFileState {
+    /// Monotonic inode generation for fetch binding.
+    pub inode_generation: u64,
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time in nanoseconds.
+    pub mtime_ns: i64,
+    /// Hash of the full file contents.
+    pub content_hash: Vec<u8>,
+    /// Assigned transfer class.
+    pub transfer_class: TransferClass,
     /// Authoritative extent map for regular files.
     pub extents: Vec<CatalogExtent>,
 }
@@ -64,9 +87,11 @@ impl CatalogInode {
         Self {
             file_id,
             path: path.into(),
+            inode_generation: default_inode_generation(),
             size: 0,
             mtime_ns,
             is_dir: true,
+            content_hash: Vec::new(),
             transfer_class: TransferClass::Unitary as i32,
             extents: Vec::new(),
         }
@@ -74,22 +99,17 @@ impl CatalogInode {
 
     /// Creates a file inode.
     #[must_use]
-    pub fn file(
-        file_id: FileId,
-        path: impl Into<String>,
-        size: u64,
-        mtime_ns: i64,
-        transfer_class: TransferClass,
-        extents: Vec<CatalogExtent>,
-    ) -> Self {
+    pub fn file(file_id: FileId, path: impl Into<String>, state: CatalogFileState) -> Self {
         Self {
             file_id,
             path: path.into(),
-            size,
-            mtime_ns,
+            inode_generation: state.inode_generation,
+            size: state.size,
+            mtime_ns: state.mtime_ns,
             is_dir: false,
-            transfer_class: transfer_class as i32,
-            extents,
+            content_hash: state.content_hash,
+            transfer_class: state.transfer_class as i32,
+            extents: state.extents,
         }
     }
 }
@@ -562,6 +582,8 @@ fn change_record_from_store_record(
                     transfer_class: TransferClass::Unitary as i32,
                     extents: Vec::new(),
                 }),
+                inode_generation: default_inode_generation(),
+                content_hash: Vec::new(),
             }),
         }),
         CatalogRecordPayload::Tombstone(tombstone) => Some(ChangeRecord {
@@ -605,7 +627,13 @@ pub fn inode_to_proto(inode: CatalogInode) -> InodeMetadata {
                 })
                 .collect(),
         }),
+        inode_generation: inode.inode_generation,
+        content_hash: inode.content_hash,
     }
+}
+
+fn default_inode_generation() -> u64 {
+    1
 }
 
 fn load_checkpoint_file(
@@ -732,8 +760,8 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::{
-        CatalogDirectory, CatalogDirectoryEntry, CatalogExtent, CatalogInode, CatalogStore,
-        CatalogTombstone,
+        CatalogDirectory, CatalogDirectoryEntry, CatalogExtent, CatalogFileState, CatalogInode,
+        CatalogStore, CatalogTombstone,
     };
     use crate::segment::SegmentWriter;
     use legato_proto::TransferClass;
@@ -852,18 +880,22 @@ mod tests {
         CatalogInode::file(
             FileId(7),
             "/piano.wav",
-            4096,
-            11,
-            TransferClass::Streamed,
-            vec![CatalogExtent {
-                extent_index: 0,
-                file_offset: 0,
-                length: 4096,
-                segment_id: 9,
-                segment_offset: 128,
-                payload_hash: blake3::hash(b"payload").as_bytes().to_vec(),
-                transfer_class: TransferClass::Streamed as i32,
-            }],
+            CatalogFileState {
+                inode_generation: 1,
+                size: 4096,
+                mtime_ns: 11,
+                content_hash: b"payload".to_vec(),
+                transfer_class: TransferClass::Streamed,
+                extents: vec![CatalogExtent {
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: 4096,
+                    segment_id: 9,
+                    segment_offset: 128,
+                    payload_hash: blake3::hash(b"payload").as_bytes().to_vec(),
+                    transfer_class: TransferClass::Streamed as i32,
+                }],
+            },
         )
     }
 }

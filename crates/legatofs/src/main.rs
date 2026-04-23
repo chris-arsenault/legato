@@ -1568,6 +1568,8 @@ mod tests {
                         extent_hash: Vec::new(),
                     }],
                 }),
+                inode_generation: 1,
+                content_hash: b"fixture".to_vec(),
             })
             .expect("inode should be recorded");
         store

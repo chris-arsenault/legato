@@ -101,12 +101,16 @@ mod tests {
                         },
                     ],
                 }),
+                inode_generation: 3,
+                content_hash: b"content-hash".to_vec(),
             }),
         };
 
         let inode = response.inode.expect("inode should be present");
         let layout = inode.layout.expect("layout should be present");
         assert_eq!(inode.path, request.path);
+        assert_eq!(inode.inode_generation, 3);
+        assert_eq!(inode.content_hash, b"content-hash".to_vec());
         assert_eq!(layout.transfer_class, TransferClass::Streamed as i32);
         assert_eq!(layout.extents.len(), 2);
     }

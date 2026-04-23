@@ -37,6 +37,8 @@ pub struct FilesystemOpenHandle {
     pub path: String,
     /// Stable server file identifier.
     pub file_id: FileId,
+    /// Versioned inode generation bound to future fetches.
+    pub inode_generation: u64,
     /// Logical file size in bytes.
     pub size: u64,
     /// Modification time in nanoseconds since the Unix epoch.
@@ -339,6 +341,8 @@ impl FilesystemService {
                 extent_index: extent.extent_index,
                 file_offset: extent.file_offset,
                 length: extent.length,
+                inode_generation: handle.inode_generation,
+                extent_hash: extent.extent_hash.clone(),
             })
             .collect::<Vec<_>>();
         match self.transport.fetch_extents(request_extents).await {
@@ -361,6 +365,8 @@ impl FilesystemService {
                         extent_index: extent.extent_index,
                         file_offset: extent.file_offset,
                         length: extent.length,
+                        inode_generation: refreshed.inode_generation,
+                        extent_hash: extent.extent_hash.clone(),
                     })
                     .collect::<Vec<_>>();
                 let extents = self.transport.fetch_extents(retry_extents).await?;
@@ -490,6 +496,7 @@ fn inode_to_open_handle(local_handle: u64, inode: InodeMetadata) -> FilesystemOp
         local_handle,
         path: inode.path,
         file_id: FileId(inode.file_id),
+        inode_generation: inode.inode_generation,
         size: inode.size,
         mtime_ns: inode.mtime_ns,
         transfer_class,
@@ -824,11 +831,14 @@ mod tests {
                         extent_hash: Vec::new(),
                     }],
                 }),
+                inode_generation: 3,
+                content_hash: b"legato-hash".to_vec(),
             },
         );
 
         assert_eq!(handle.local_handle, 7);
         assert_eq!(handle.file_id.0, 42);
+        assert_eq!(handle.inode_generation, 3);
         assert_eq!(handle.mtime_ns, 123);
         assert_eq!(handle.transfer_class, TransferClass::Streamed);
         assert_eq!(handle.extents.len(), 1);
@@ -867,6 +877,8 @@ mod tests {
                         },
                     ],
                 }),
+                inode_generation: 1,
+                content_hash: b"streamed-content".to_vec(),
             },
         );
 

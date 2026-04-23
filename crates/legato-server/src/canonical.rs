@@ -9,8 +9,8 @@ use std::{
 };
 
 use legato_client_cache::catalog::{
-    CatalogDirectory, CatalogDirectoryEntry, CatalogExtent, CatalogInode, CatalogStore,
-    CatalogStoreError, CatalogTombstone,
+    CatalogDirectory, CatalogDirectoryEntry, CatalogExtent, CatalogFileState, CatalogInode,
+    CatalogStore, CatalogStoreError, CatalogTombstone,
 };
 use legato_proto::TransferClass;
 use legato_types::FileId;
@@ -99,11 +99,20 @@ fn reconcile_directory(
         source,
     })?;
     let path_string = logical_path(library_root, path)?;
-    let inode = CatalogInode::directory(
-        identities.file_id_for(path, &metadata, true)?,
-        &path_string,
-        mtime_ns(&metadata)?,
-    );
+    let file_id = identities.file_id_for(path, &metadata, true)?;
+    let existing_by_id = catalog.resolve_file_id(file_id).cloned();
+    let generation = next_inode_generation(existing_by_id.as_ref(), None, &path_string, true);
+    let inode = CatalogInode {
+        file_id,
+        path: path_string.clone(),
+        inode_generation: generation,
+        size: 0,
+        mtime_ns: mtime_ns(&metadata)?,
+        is_dir: true,
+        content_hash: Vec::new(),
+        transfer_class: TransferClass::Unitary as i32,
+        extents: Vec::new(),
+    };
     let existing_inode = catalog.resolve_path(&path_string).cloned();
     if existing_inode.as_ref() != Some(&inode) {
         if existing_inode.is_some() {
@@ -140,19 +149,31 @@ fn reconcile_file(
     })?;
     let path_string = logical_path(library_root, path)?;
     let decision = policy.file_decision(&path.to_string_lossy(), metadata.len(), false);
-    let extents = append_file_extents(
+    let file_payload = append_file_extents(
         catalog,
         path,
         &decision.transfer_class,
         decision.extent_bytes,
     )?;
-    let inode = CatalogInode::file(
-        identities.file_id_for(path, &metadata, false)?,
+    let file_id = identities.file_id_for(path, &metadata, false)?;
+    let existing_by_id = catalog.resolve_file_id(file_id).cloned();
+    let generation = next_inode_generation(
+        existing_by_id.as_ref(),
+        Some(file_payload.content_hash.as_slice()),
         &path_string,
-        metadata.len(),
-        mtime_ns(&metadata)?,
-        decision.transfer_class,
-        extents,
+        false,
+    );
+    let inode = CatalogInode::file(
+        file_id,
+        &path_string,
+        CatalogFileState {
+            inode_generation: generation,
+            size: metadata.len(),
+            mtime_ns: mtime_ns(&metadata)?,
+            content_hash: file_payload.content_hash,
+            transfer_class: decision.transfer_class,
+            extents: file_payload.extents,
+        },
     );
     let existing = catalog.resolve_path(&path_string).cloned();
     if existing.as_ref() == Some(&inode) {
@@ -172,7 +193,7 @@ fn append_file_extents(
     path: &Path,
     transfer_class: &TransferClass,
     extent_bytes: u64,
-) -> Result<Vec<CatalogExtent>, CanonicalStoreError> {
+) -> Result<AppendedFilePayload, CanonicalStoreError> {
     let mut file = fs::File::open(path).map_err(|source| CanonicalStoreError::Io {
         path: path.to_path_buf(),
         source,
@@ -194,6 +215,7 @@ fn append_file_extents(
         size.div_ceil(extent_length)
     };
     let mut extents = Vec::with_capacity(extent_count as usize);
+    let mut content_hasher = blake3::Hasher::new();
     for extent_index in 0..extent_count {
         let file_offset = extent_index * extent_length;
         let length = if size == 0 {
@@ -212,6 +234,7 @@ fn append_file_extents(
                 path: path.to_path_buf(),
                 source,
             })?;
+        content_hasher.update(&payload);
         extents.push(catalog.append_extent_payload(
             extent_index as u32,
             file_offset,
@@ -219,7 +242,10 @@ fn append_file_extents(
             &payload,
         )?);
     }
-    Ok(extents)
+    Ok(AppendedFilePayload {
+        extents,
+        content_hash: content_hasher.finalize().as_bytes().to_vec(),
+    })
 }
 
 fn directory_entries(
@@ -274,6 +300,34 @@ fn entries_to_map(entries: Vec<CatalogDirectoryEntry>) -> BTreeMap<String, Catal
         .into_iter()
         .map(|entry| (entry.name.clone(), entry))
         .collect()
+}
+
+#[derive(Debug)]
+struct AppendedFilePayload {
+    extents: Vec<CatalogExtent>,
+    content_hash: Vec<u8>,
+}
+
+fn next_inode_generation(
+    existing: Option<&CatalogInode>,
+    content_hash: Option<&[u8]>,
+    path: &str,
+    is_dir: bool,
+) -> u64 {
+    let Some(existing) = existing else {
+        return 1;
+    };
+    let same_generation = if is_dir {
+        existing.path == path
+    } else {
+        existing.path == path
+            && content_hash.is_some_and(|hash| existing.content_hash.as_slice() == hash)
+    };
+    if same_generation {
+        existing.inode_generation
+    } else {
+        existing.inode_generation.saturating_add(1)
+    }
 }
 
 pub(crate) fn logical_request_path(

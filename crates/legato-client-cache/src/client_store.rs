@@ -6,7 +6,8 @@ use legato_proto::{ExtentRecord, InodeMetadata, InvalidationEvent, InvalidationK
 use legato_types::FileId;
 
 use crate::catalog::{
-    CatalogExtent, CatalogInode, CatalogStore, CatalogStoreError, CatalogTombstone, inode_to_proto,
+    CatalogExtent, CatalogFileState, CatalogInode, CatalogStore, CatalogStoreError,
+    CatalogTombstone, inode_to_proto,
 };
 
 /// Summary returned by client store maintenance operations.
@@ -155,13 +156,17 @@ impl ClientLegatoStore {
             CatalogInode::file(
                 file_id,
                 format!("file:{file_id:?}"),
-                record.file_offset.saturating_add(record.data.len() as u64),
-                0,
-                record
-                    .transfer_class
-                    .try_into()
-                    .unwrap_or(legato_proto::TransferClass::Unspecified),
-                extents,
+                CatalogFileState {
+                    inode_generation: 1,
+                    size: record.file_offset.saturating_add(record.data.len() as u64),
+                    mtime_ns: 0,
+                    content_hash: Vec::new(),
+                    transfer_class: record
+                        .transfer_class
+                        .try_into()
+                        .unwrap_or(legato_proto::TransferClass::Unspecified),
+                    extents,
+                },
             )
         };
         let _ = self.catalog.append_inode(inode)?;
@@ -299,9 +304,11 @@ fn proto_to_catalog_inode(
     CatalogInode {
         file_id: FileId(inode.file_id),
         path: inode.path,
+        inode_generation: inode.inode_generation,
         size: inode.size,
         mtime_ns: inode.mtime_ns as i64,
         is_dir: inode.is_dir,
+        content_hash: inode.content_hash,
         transfer_class: inode.layout.map_or(0, |layout| layout.transfer_class),
         extents,
     }
@@ -412,6 +419,8 @@ mod tests {
                     extent_hash: Vec::new(),
                 }],
             }),
+            inode_generation: 1,
+            content_hash: b"resident-data".to_vec(),
         }
     }
 
@@ -454,6 +463,8 @@ mod tests {
                     },
                 ],
             }),
+            inode_generation: 1,
+            content_hash: b"firstsecond".to_vec(),
         }
     }
 }

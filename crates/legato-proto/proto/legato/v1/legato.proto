@@ -97,6 +97,8 @@ message InodeMetadata {
   uint64 mtime_ns = 4;
   bool is_dir = 5;
   FileLayout layout = 6;
+  uint64 inode_generation = 7;
+  bytes content_hash = 8;
 }
 
 message ResolveRequest {
@@ -112,6 +114,8 @@ message ExtentRef {
   uint32 extent_index = 2;
   uint64 file_offset = 3;
   uint64 length = 4;
+  uint64 inode_generation = 5;
+  bytes extent_hash = 6;
 }
 
 message FetchRequest {
