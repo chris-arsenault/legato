@@ -346,7 +346,10 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             )?;
             let report = match action {
                 CacheCommand::Status => cache_status_report(&process_config.mount)?,
-                CacheCommand::Repair => cache_repair_report(&process_config.mount)?,
+                CacheCommand::Repair => cache_repair_report(
+                    &process_config.mount,
+                    process_config.client.cache.max_bytes,
+                )?,
             };
             println!("{report}");
             Ok(())
@@ -504,14 +507,27 @@ fn cache_status_report(mount: &MountConfig) -> Result<String, Box<dyn std::error
     ))
 }
 
-fn cache_repair_report(mount: &MountConfig) -> Result<String, Box<dyn std::error::Error>> {
+fn cache_repair_report(
+    mount: &MountConfig,
+    max_cache_bytes: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut store = ClientLegatoStore::open(&mount.state_dir, now_unix_ns())?;
-    store.checkpoint()?;
+    let repair = store.repair()?;
+    let compact = store.compact()?;
+    let eviction = store.evict_to_limit(max_cache_bytes)?;
 
     Ok(format!(
-        "legatofs store repair\ncheckpoint written\nresident_extents {}\nresident_bytes {}",
-        store.resident_extent_count(),
-        store.resident_bytes()
+        "legatofs store repair\ncheckpoint written\nresident_extents {}\nresident_bytes {}\nresident_extents_removed {}\nresident_bytes_removed {}",
+        eviction.resident_extents_after,
+        eviction.resident_bytes_after,
+        repair
+            .resident_extents_removed
+            .saturating_add(compact.resident_extents_removed)
+            .saturating_add(eviction.resident_extents_removed),
+        repair
+            .resident_bytes_removed
+            .saturating_add(compact.resident_bytes_removed)
+            .saturating_add(eviction.resident_bytes_removed)
     ))
 }
 
@@ -1566,7 +1582,7 @@ mod tests {
             .expect("extent should be stored");
 
         let status = cache_status_report(&mount).expect("status should render");
-        let repair = cache_repair_report(&mount).expect("repair should render");
+        let repair = cache_repair_report(&mount, 1024).expect("repair should render");
 
         assert!(status.contains("resident_extents 1"));
         assert!(status.contains("resident_bytes 7"));

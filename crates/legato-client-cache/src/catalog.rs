@@ -339,6 +339,12 @@ impl CatalogStore {
         self.state.paths.keys().cloned().collect()
     }
 
+    /// Returns active inode records in stable file-id order.
+    #[must_use]
+    pub fn active_inodes(&self) -> Vec<CatalogInode> {
+        self.state.inodes.values().cloned().collect()
+    }
+
     /// Reads and verifies one resident extent payload from its canonical segment.
     pub fn read_extent_payload(
         &self,

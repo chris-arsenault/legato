@@ -9,6 +9,23 @@ use crate::catalog::{
     CatalogExtent, CatalogInode, CatalogStore, CatalogStoreError, CatalogTombstone, inode_to_proto,
 };
 
+/// Summary returned by client store maintenance operations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientStoreMaintenanceReport {
+    /// Resident extent references before the operation.
+    pub resident_extents_before: usize,
+    /// Resident extent references after the operation.
+    pub resident_extents_after: usize,
+    /// Logical resident bytes before the operation.
+    pub resident_bytes_before: u64,
+    /// Logical resident bytes after the operation.
+    pub resident_bytes_after: u64,
+    /// Number of resident extent references removed.
+    pub resident_extents_removed: usize,
+    /// Logical resident bytes removed from active inode maps.
+    pub resident_bytes_removed: u64,
+}
+
 /// Resident extent loaded from the local partial replica.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResidentExtent {
@@ -180,6 +197,84 @@ impl ClientLegatoStore {
         let _ = self.catalog.checkpoint()?;
         Ok(())
     }
+
+    /// Repairs replayable state and writes a fresh checkpoint.
+    pub fn repair(&mut self) -> Result<ClientStoreMaintenanceReport, CatalogStoreError> {
+        let report = self.current_report();
+        self.checkpoint()?;
+        Ok(report)
+    }
+
+    /// Writes a fresh checkpoint for currently active records.
+    pub fn compact(&mut self) -> Result<ClientStoreMaintenanceReport, CatalogStoreError> {
+        let report = self.current_report();
+        self.checkpoint()?;
+        Ok(report)
+    }
+
+    /// Drops resident extent references until logical resident bytes fit the configured limit.
+    pub fn evict_to_limit(
+        &mut self,
+        max_resident_bytes: u64,
+    ) -> Result<ClientStoreMaintenanceReport, CatalogStoreError> {
+        let before = self.current_report();
+        if before.resident_bytes_before <= max_resident_bytes {
+            return Ok(before);
+        }
+
+        let mut remaining = before.resident_bytes_before;
+        let mut removed_extents = 0_usize;
+        let mut removed_bytes = 0_u64;
+        for mut inode in self.catalog.active_inodes() {
+            if remaining <= max_resident_bytes {
+                break;
+            }
+            if inode.is_dir || inode.extents.is_empty() {
+                continue;
+            }
+
+            inode.extents.sort_by_key(|extent| {
+                (
+                    std::cmp::Reverse(extent.file_offset),
+                    std::cmp::Reverse(extent.extent_index),
+                )
+            });
+            let mut retained = Vec::new();
+            for extent in inode.extents {
+                if remaining > max_resident_bytes {
+                    remaining = remaining.saturating_sub(extent.length);
+                    removed_extents += 1;
+                    removed_bytes = removed_bytes.saturating_add(extent.length);
+                } else {
+                    retained.push(extent);
+                }
+            }
+            retained.sort_by_key(|extent| extent.extent_index);
+            inode.extents = retained;
+            let _ = self.catalog.append_inode(inode)?;
+        }
+        self.checkpoint()?;
+
+        Ok(ClientStoreMaintenanceReport {
+            resident_extents_before: before.resident_extents_before,
+            resident_extents_after: self.resident_extent_count(),
+            resident_bytes_before: before.resident_bytes_before,
+            resident_bytes_after: self.resident_bytes(),
+            resident_extents_removed: removed_extents,
+            resident_bytes_removed: removed_bytes,
+        })
+    }
+
+    fn current_report(&self) -> ClientStoreMaintenanceReport {
+        ClientStoreMaintenanceReport {
+            resident_extents_before: self.resident_extent_count(),
+            resident_extents_after: self.resident_extent_count(),
+            resident_bytes_before: self.resident_bytes(),
+            resident_bytes_after: self.resident_bytes(),
+            resident_extents_removed: 0,
+            resident_bytes_removed: 0,
+        }
+    }
 }
 
 fn proto_to_catalog_inode(
@@ -277,6 +372,30 @@ mod tests {
         assert!(error.to_string().contains("hash mismatch"));
     }
 
+    #[test]
+    fn client_store_evicts_resident_extents_to_limit() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(two_extent_inode())
+            .expect("inode should record");
+        store
+            .put_extent(&sample_extent_at(0, 0, b"first"))
+            .expect("first extent should store");
+        store
+            .put_extent(&sample_extent_at(1, 5, b"second"))
+            .expect("second extent should store");
+
+        let report = store.evict_to_limit(5).expect("eviction should succeed");
+
+        assert_eq!(report.resident_extents_before, 2);
+        assert_eq!(report.resident_extents_after, 1);
+        assert_eq!(report.resident_bytes_after, 5);
+        assert!(store.get_extent(FileId(7), 0).expect("lookup").is_some());
+        assert!(store.get_extent(FileId(7), 1).expect("lookup").is_none());
+    }
+
     fn sample_inode() -> InodeMetadata {
         InodeMetadata {
             file_id: 7,
@@ -297,13 +416,44 @@ mod tests {
     }
 
     fn sample_extent(data: &[u8]) -> ExtentRecord {
+        sample_extent_at(0, 0, data)
+    }
+
+    fn sample_extent_at(extent_index: u32, file_offset: u64, data: &[u8]) -> ExtentRecord {
         ExtentRecord {
             file_id: 7,
-            extent_index: 0,
-            file_offset: 0,
+            extent_index,
+            file_offset,
             data: data.to_vec(),
             extent_hash: blake3::hash(data).as_bytes().to_vec(),
             transfer_class: TransferClass::Streamed as i32,
+        }
+    }
+
+    fn two_extent_inode() -> InodeMetadata {
+        InodeMetadata {
+            file_id: 7,
+            path: String::from("/library/piano.wav"),
+            size: 11,
+            mtime_ns: 123,
+            is_dir: false,
+            layout: Some(FileLayout {
+                transfer_class: TransferClass::Streamed as i32,
+                extents: vec![
+                    ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 5,
+                        extent_hash: Vec::new(),
+                    },
+                    ExtentDescriptor {
+                        extent_index: 1,
+                        file_offset: 5,
+                        length: 6,
+                        extent_hash: Vec::new(),
+                    },
+                ],
+            }),
         }
     }
 }
