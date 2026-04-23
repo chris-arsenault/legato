@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     time::Duration,
+    time::Instant,
 };
 
 use tokio::{
@@ -30,8 +31,8 @@ use legato_proto::{
 };
 
 use crate::{
-    CatalogEntry, InvalidationHub, MetadataService, Server, ServerConfig, WatchBackend,
-    create_poll_watcher, create_recommended_watcher, open_metadata_database,
+    CatalogEntry, InvalidationHub, MetadataService, Server, ServerConfig, ServerRuntimeMetrics,
+    WatchBackend, create_poll_watcher, create_recommended_watcher, open_metadata_database,
     reconcile_library_root,
 };
 
@@ -94,14 +95,27 @@ pub struct LiveServer {
     config: ServerConfig,
     metadata: Arc<Mutex<MetadataService>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
+    metrics: Option<ServerRuntimeMetrics>,
 }
 
 impl LiveServer {
     /// Bootstraps the live server state from the configured library and state directories.
     pub fn bootstrap(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::bootstrap_with_metrics(config, None)
+    }
+
+    /// Bootstraps the live server state from the configured library and state directories.
+    pub fn bootstrap_with_metrics(
+        config: ServerConfig,
+        metrics: Option<ServerRuntimeMetrics>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let database_path = Path::new(&config.state_dir).join("server.sqlite");
         let mut connection = open_metadata_database(&database_path)?;
-        reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
+        let started = Instant::now();
+        let stats = reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
+        if let Some(metrics) = &metrics {
+            metrics.record_bootstrap_reconcile(&stats, started.elapsed().as_nanos() as u64);
+        }
         let metadata = MetadataService::new(connection);
         let invalidations = InvalidationHub::new(config.library_root.clone());
 
@@ -110,6 +124,7 @@ impl LiveServer {
             config,
             metadata: Arc::new(Mutex::new(metadata)),
             invalidations: Arc::new(Mutex::new(invalidations)),
+            metrics,
         })
     }
 
@@ -268,10 +283,17 @@ impl Legato for LiveServer {
                 .resolve_catalog_file_id(extent.file_id)
                 .map_err(map_storage_error)?
                 .ok_or_else(|| Status::not_found("file id not found"))?;
-            let record = extent_store
+            let fetched = extent_store
                 .fetch_extent(&entry, &extent)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            records.push(record);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_extent_fetch(
+                    fetched.source,
+                    fetched.record.data.len(),
+                    fetched.elapsed_ns,
+                );
+            }
+            records.push(fetched.record);
         }
         let stream = tokio_stream::iter(records.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))

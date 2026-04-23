@@ -1,11 +1,13 @@
-//! Criterion benchmarks for the core MVP Legato server workloads.
+//! Criterion benchmarks for the extent-oriented Legato server workloads.
 #![allow(missing_docs)]
 
 use std::fs;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use legato_proto::{BlockRequest, OpenRequest, ReadBlocksRequest};
-use legato_server::{MetadataService, open_metadata_database, reconcile_library_root};
+use legato_proto::{ExtentRef, OpenRequest};
+use legato_server::{
+    MetadataService, ServerExtentStore, open_metadata_database, reconcile_library_root,
+};
 use tempfile::tempdir;
 
 fn benchmark_library_scan(c: &mut Criterion) {
@@ -30,11 +32,12 @@ fn benchmark_library_scan(c: &mut Criterion) {
     });
 }
 
-fn benchmark_cold_open_and_read(c: &mut Criterion) {
+fn benchmark_cold_open_and_extent_fetch(c: &mut Criterion) {
     let temp = tempdir().expect("tempdir should be created");
     let library_root = temp.path().join("library");
     create_library_fixture(&library_root, 12, 8, 256 * 1024);
     let sample_path = library_root.join("bank-00").join("sample-0000.wav");
+    let state_dir = temp.path().join("state");
 
     let database_path = temp.path().join("runtime.sqlite");
     let mut connection = open_metadata_database(&database_path).expect("database should open");
@@ -59,31 +62,66 @@ fn benchmark_cold_open_and_read(c: &mut Criterion) {
         )
     });
 
-    c.bench_function("read_blocks/playback_time_block_reads", |b| {
+    c.bench_function("extent_fetch/cold_materialization", |b| {
         b.iter_batched(
             || {
-                let mut service = MetadataService::new(
+                let service = MetadataService::new(
                     open_metadata_database(&database_path).expect("database should reopen"),
                 );
-                let open = service
-                    .open(OpenRequest {
-                        path: sample_path.to_string_lossy().into_owned(),
-                    })
-                    .expect("open should succeed")
+                let entry = service
+                    .resolve_catalog_path(&sample_path.to_string_lossy())
+                    .expect("resolve should succeed")
                     .expect("sample should exist");
-                (service, open.file_handle)
+                let extent_store = ServerExtentStore::new(&state_dir);
+                let extent_ref = ExtentRef {
+                    file_id: entry.metadata.file_id,
+                    extent_index: 0,
+                    file_offset: 0,
+                    length: entry.extent_bytes.expect("extent size should be set"),
+                };
+                let _ = fs::remove_dir_all(
+                    state_dir
+                        .join("extents")
+                        .join(entry.metadata.file_id.to_string()),
+                );
+                (extent_store, entry, extent_ref)
             },
-            |(service, file_handle)| {
-                let blocks = service
-                    .read_blocks(ReadBlocksRequest {
-                        ranges: vec![BlockRequest {
-                            file_handle,
-                            start_offset: 0,
-                            block_count: 4,
-                        }],
-                    })
+            |(extent_store, entry, extent_ref)| {
+                let extent = extent_store
+                    .fetch_extent(&entry, &extent_ref)
                     .expect("read_blocks should succeed");
-                criterion::black_box(blocks);
+                criterion::black_box(extent);
+            },
+            BatchSize::SmallInput,
+        )
+    });
+
+    c.bench_function("extent_fetch/warm_materialized_hit", |b| {
+        let service = MetadataService::new(
+            open_metadata_database(&database_path).expect("database should reopen"),
+        );
+        let entry = service
+            .resolve_catalog_path(&sample_path.to_string_lossy())
+            .expect("resolve should succeed")
+            .expect("sample should exist");
+        let extent_store = ServerExtentStore::new(&state_dir);
+        let extent_ref = ExtentRef {
+            file_id: entry.metadata.file_id,
+            extent_index: 0,
+            file_offset: 0,
+            length: entry.extent_bytes.expect("extent size should be set"),
+        };
+        extent_store
+            .fetch_extent(&entry, &extent_ref)
+            .expect("warmup extent fetch should succeed");
+
+        b.iter_batched(
+            || (extent_store.clone(), entry.clone(), extent_ref),
+            |(extent_store, entry, extent_ref)| {
+                let extent = extent_store
+                    .fetch_extent(&entry, &extent_ref)
+                    .expect("warm fetch should succeed");
+                criterion::black_box(extent);
             },
             BatchSize::SmallInput,
         )
@@ -111,6 +149,6 @@ fn create_library_fixture(
 criterion_group!(
     server_workloads,
     benchmark_library_scan,
-    benchmark_cold_open_and_read
+    benchmark_cold_open_and_extent_fetch
 );
 criterion_main!(server_workloads);

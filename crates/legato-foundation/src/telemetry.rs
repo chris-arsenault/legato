@@ -260,6 +260,12 @@ impl ProcessTelemetry {
         self.registry.clone()
     }
 
+    /// Returns the metrics configuration associated with this process.
+    #[must_use]
+    pub fn metrics_config(&self) -> MetricsConfig {
+        self.metrics.clone()
+    }
+
     /// Emits baseline startup metrics for the process.
     pub fn record_startup(&self) {
         let start_time = SystemTime::now()

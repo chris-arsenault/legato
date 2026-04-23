@@ -9,8 +9,8 @@ use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_server::{
-    LiveServer, ServerConfig, build_tls_server_config, ensure_server_tls_materials,
-    issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
+    LiveServer, ServerConfig, ServerRuntimeMetrics, build_tls_server_config,
+    ensure_server_tls_materials, issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
 };
 use serde::Deserialize;
 
@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_address = parse_bind_address(&process_config.server.bind_address)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
-    let server = LiveServer::bootstrap(process_config.server)?;
+    let server = LiveServer::bootstrap_with_metrics(
+        process_config.server,
+        Some(ServerRuntimeMetrics::new(telemetry.clone())),
+    )?;
     let bound = server.bind(listener, Some(runtime_tls)).await?;
     telemetry.set_lifecycle_state("ready", 1);
     println!("legato-server bootstrap ready");
