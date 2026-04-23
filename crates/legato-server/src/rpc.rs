@@ -22,8 +22,6 @@ use tonic::{
 };
 
 use legato_client_cache::catalog::{CatalogInode, CatalogStore, inode_to_proto};
-#[cfg(test)]
-use legato_proto::InodeMetadata;
 use legato_proto::{
     AttachRequest, AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, FetchRequest,
     FileMetadata, HintRequest, HintResponse, ListDirRequest, ListDirResponse, ResolvePathRequest,
@@ -464,29 +462,6 @@ fn catalog_inode_to_metadata(inode: CatalogInode) -> FileMetadata {
 }
 
 #[cfg(test)]
-fn metadata_to_inode(entry: crate::CatalogEntry) -> InodeMetadata {
-    let layout =
-        entry
-            .transfer_class
-            .zip(entry.extent_bytes)
-            .map(|(transfer_class, extent_bytes)| {
-                crate::LayoutDecision {
-                    transfer_class,
-                    extent_bytes,
-                }
-                .file_layout(entry.metadata.size, entry.metadata.is_dir)
-            });
-    InodeMetadata {
-        file_id: entry.metadata.file_id,
-        path: entry.metadata.path,
-        size: entry.metadata.size,
-        mtime_ns: entry.metadata.mtime_ns,
-        is_dir: entry.metadata.is_dir,
-        layout,
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::{fs, path::Path, sync::Arc, time::Duration};
 
@@ -502,10 +477,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use super::{LiveServer, load_runtime_tls, metadata_to_inode, spawn_watch_task};
+    use super::{LiveServer, load_runtime_tls, spawn_watch_task};
     use crate::{
-        CatalogEntry, InvalidationHub, ServerConfig, ensure_server_tls_materials,
-        reconcile_library_root_to_store,
+        InvalidationHub, ServerConfig, ensure_server_tls_materials, reconcile_library_root_to_store,
     };
 
     #[tokio::test]
@@ -642,60 +616,6 @@ mod tests {
             .shutdown()
             .await
             .expect("server should shut down cleanly");
-    }
-
-    #[test]
-    fn metadata_to_inode_uses_catalog_persisted_transfer_classes() {
-        let unitary = metadata_to_inode(CatalogEntry {
-            metadata: legato_proto::FileMetadata {
-                file_id: 1,
-                path: String::from("/srv/libraries/Kontakt/piano.nki"),
-                size: 512 * 1024,
-                mtime_ns: 0,
-                content_hash: Vec::new(),
-                is_dir: false,
-            },
-            transfer_class: Some(TransferClass::Unitary),
-            extent_bytes: Some(512 * 1024),
-        });
-        let unitary_layout = unitary.layout.expect("layout should be present");
-        assert_eq!(unitary_layout.transfer_class, TransferClass::Unitary as i32);
-        assert_eq!(unitary_layout.extents.len(), 1);
-
-        let streamed = metadata_to_inode(CatalogEntry {
-            metadata: legato_proto::FileMetadata {
-                file_id: 2,
-                path: String::from("/srv/libraries/Samples/legato.wav"),
-                size: 32 * 1024 * 1024,
-                mtime_ns: 0,
-                content_hash: Vec::new(),
-                is_dir: false,
-            },
-            transfer_class: Some(TransferClass::Streamed),
-            extent_bytes: Some(4 * 1024 * 1024),
-        });
-        let streamed_layout = streamed.layout.expect("layout should be present");
-        assert_eq!(
-            streamed_layout.transfer_class,
-            TransferClass::Streamed as i32
-        );
-        assert_eq!(streamed_layout.extents.len(), 8);
-
-        let random = metadata_to_inode(CatalogEntry {
-            metadata: legato_proto::FileMetadata {
-                file_id: 3,
-                path: String::from("/srv/libraries/Containers/library.bin"),
-                size: 512 * 1024 * 1024,
-                mtime_ns: 0,
-                content_hash: Vec::new(),
-                is_dir: false,
-            },
-            transfer_class: Some(TransferClass::Random),
-            extent_bytes: Some(1024 * 1024),
-        });
-        let random_layout = random.layout.expect("layout should be present");
-        assert_eq!(random_layout.transfer_class, TransferClass::Random as i32);
-        assert_eq!(random_layout.extents[0].length, 1024 * 1024);
     }
 
     #[tokio::test]

@@ -4,10 +4,8 @@
 use std::fs;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use legato_proto::ExtentRef;
-use legato_server::{
-    MetadataService, ServerExtentStore, open_metadata_database, reconcile_library_root,
-};
+use legato_client_cache::catalog::CatalogStore;
+use legato_server::reconcile_library_root_to_store;
 use tempfile::tempdir;
 
 fn benchmark_library_scan(c: &mut Criterion) {
@@ -18,12 +16,12 @@ fn benchmark_library_scan(c: &mut Criterion) {
     c.bench_function("library_scan/reconcile_full_tree", |b| {
         b.iter_batched(
             || {
-                let database_path = temp.path().join("scan.sqlite");
-                let _ = fs::remove_file(&database_path);
-                open_metadata_database(&database_path).expect("database should open")
+                let state_dir = temp.path().join("scan-store");
+                let _ = fs::remove_dir_all(&state_dir);
+                state_dir
             },
-            |mut connection| {
-                let stats = reconcile_library_root(&mut connection, &library_root)
+            |state_dir| {
+                let stats = reconcile_library_root_to_store(&state_dir, &library_root)
                     .expect("reconcile should succeed");
                 criterion::black_box(stats);
             },
@@ -39,87 +37,34 @@ fn benchmark_cold_resolve_and_extent_fetch(c: &mut Criterion) {
     let sample_path = library_root.join("bank-00").join("sample-0000.wav");
     let state_dir = temp.path().join("state");
 
-    let database_path = temp.path().join("runtime.sqlite");
-    let mut connection = open_metadata_database(&database_path).expect("database should open");
-    reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
+    reconcile_library_root_to_store(&state_dir, &library_root).expect("reconcile should succeed");
 
-    c.bench_function("client_resolve/cold_metadata_resolve", |b| {
+    c.bench_function("client_resolve/cold_catalog_resolve", |b| {
         b.iter_batched(
-            || {
-                MetadataService::new(
-                    open_metadata_database(&database_path).expect("database should reopen"),
-                )
-            },
-            |service| {
-                let response = service
-                    .resolve_catalog_path(&sample_path.to_string_lossy())
-                    .expect("resolve should succeed");
+            || CatalogStore::open(&state_dir, 0).expect("catalog should reopen"),
+            |catalog| {
+                let response = catalog.resolve_path(sample_path.to_string_lossy().as_ref());
                 criterion::black_box(response);
             },
             BatchSize::SmallInput,
         )
     });
 
-    c.bench_function("extent_fetch/cold_materialization", |b| {
+    c.bench_function("extent_fetch/canonical_segment_read", |b| {
         b.iter_batched(
             || {
-                let service = MetadataService::new(
-                    open_metadata_database(&database_path).expect("database should reopen"),
-                );
-                let entry = service
-                    .resolve_catalog_path(&sample_path.to_string_lossy())
-                    .expect("resolve should succeed")
+                let catalog = CatalogStore::open(&state_dir, 0).expect("catalog should reopen");
+                let inode = catalog
+                    .resolve_path(sample_path.to_string_lossy().as_ref())
                     .expect("sample should exist");
-                let extent_store = ServerExtentStore::new(&state_dir);
-                let extent_ref = ExtentRef {
-                    file_id: entry.metadata.file_id,
-                    extent_index: 0,
-                    file_offset: 0,
-                    length: entry.extent_bytes.expect("extent size should be set"),
-                };
-                let _ = fs::remove_dir_all(
-                    state_dir
-                        .join("extents")
-                        .join(entry.metadata.file_id.to_string()),
-                );
-                (extent_store, entry, extent_ref)
+                let extent = inode.extents.first().expect("extent should exist").clone();
+                (catalog, extent)
             },
-            |(extent_store, entry, extent_ref)| {
-                let extent = extent_store
-                    .fetch_extent(&entry, &extent_ref)
-                    .expect("extent fetch should succeed");
-                criterion::black_box(extent);
-            },
-            BatchSize::SmallInput,
-        )
-    });
-
-    c.bench_function("extent_fetch/warm_materialized_hit", |b| {
-        let service = MetadataService::new(
-            open_metadata_database(&database_path).expect("database should reopen"),
-        );
-        let entry = service
-            .resolve_catalog_path(&sample_path.to_string_lossy())
-            .expect("resolve should succeed")
-            .expect("sample should exist");
-        let extent_store = ServerExtentStore::new(&state_dir);
-        let extent_ref = ExtentRef {
-            file_id: entry.metadata.file_id,
-            extent_index: 0,
-            file_offset: 0,
-            length: entry.extent_bytes.expect("extent size should be set"),
-        };
-        extent_store
-            .fetch_extent(&entry, &extent_ref)
-            .expect("warmup extent fetch should succeed");
-
-        b.iter_batched(
-            || (extent_store.clone(), entry.clone(), extent_ref),
-            |(extent_store, entry, extent_ref)| {
-                let extent = extent_store
-                    .fetch_extent(&entry, &extent_ref)
+            |(catalog, extent)| {
+                let data = catalog
+                    .read_extent_payload(&extent)
                     .expect("warm fetch should succeed");
-                criterion::black_box(extent);
+                criterion::black_box(data);
             },
             BatchSize::SmallInput,
         )

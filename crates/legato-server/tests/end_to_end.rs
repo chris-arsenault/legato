@@ -3,15 +3,18 @@
 use std::{fs, io::Write, path::Path};
 
 use flate2::{Compression, write::GzEncoder};
-use legato_client_cache::{MetadataCache, MetadataCachePolicy, client_store::ClientLegatoStore};
+use legato_client_cache::{
+    MetadataCache, MetadataCachePolicy,
+    catalog::{CatalogStore, inode_to_proto},
+    client_store::ClientLegatoStore,
+};
 use legato_client_core::{
     ClientConfig, ClientTlsConfig, FilesystemService, LocalControlPlane, RetryPolicy,
 };
 use legato_prefetch::analyze_project;
-use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
 use legato_server::{
-    LiveServer, MetadataService, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
-    issue_client_tls_bundle, load_runtime_tls, open_metadata_database, reconcile_library_root,
+    LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
+    issue_client_tls_bundle, load_runtime_tls, reconcile_library_root_to_store,
 };
 use legato_types::{ExtentRange, FileId, PrefetchHintPath, PrefetchPriority};
 use tempfile::tempdir;
@@ -27,18 +30,14 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
         .expect("library fixture directory should be created");
     fs::write(&sample_path, vec![0x5a; 8192]).expect("sample fixture should be written");
 
-    let database_path = temp.path().join("server.sqlite");
-    let mut connection = open_metadata_database(&database_path).expect("database should open");
-    reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
-
-    let service = MetadataService::new(
-        open_metadata_database(&database_path).expect("database should reopen"),
-    );
-    let inode = catalog_entry_to_inode(
-        service
-            .resolve_catalog_path(sample_path.to_string_lossy().as_ref())
-            .expect("resolve should succeed")
-            .expect("sample should resolve"),
+    let store_root = temp.path().join("server-state");
+    reconcile_library_root_to_store(&store_root, &library_root).expect("reconcile should succeed");
+    let catalog = CatalogStore::open(&store_root, 0).expect("catalog should open");
+    let inode = inode_to_proto(
+        catalog
+            .resolve_path(sample_path.to_string_lossy().as_ref())
+            .expect("sample should resolve")
+            .clone(),
     );
     let mut store =
         ClientLegatoStore::open(temp.path().join("client-state"), 1).expect("store should open");
@@ -99,23 +98,20 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
     fs::write(&project_path, encoder.finish().expect("gzip should finish"))
         .expect("project fixture should be written");
 
-    let database_path = temp.path().join("server.sqlite");
-    let mut connection = open_metadata_database(&database_path).expect("database should open");
-    reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
+    let store_root = temp.path().join("server-state");
+    reconcile_library_root_to_store(&store_root, &library_root).expect("reconcile should succeed");
     let analysis = analyze_project(&project_path).expect("analysis should succeed");
     let hint = analysis
         .hints
         .first()
         .expect("analysis should emit one hint");
 
-    let service = MetadataService::new(
-        open_metadata_database(&database_path).expect("database should reopen"),
-    );
-    let inode = catalog_entry_to_inode(
-        service
-            .resolve_catalog_path(&hint.path)
-            .expect("resolve should succeed")
-            .expect("sample should resolve"),
+    let catalog = CatalogStore::open(&store_root, 0).expect("catalog should open");
+    let inode = inode_to_proto(
+        catalog
+            .resolve_path(&hint.path)
+            .expect("sample should resolve")
+            .clone(),
     );
     let mut store =
         ClientLegatoStore::open(temp.path().join("client-state"), 1).expect("store should open");
@@ -253,52 +249,6 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
 
     drop(restarted_service);
     bound.shutdown().await.expect("server should shut down");
-}
-
-fn catalog_entry_to_inode(entry: legato_server::CatalogEntry) -> InodeMetadata {
-    let layout =
-        entry
-            .transfer_class
-            .zip(entry.extent_bytes)
-            .map(|(transfer_class, extent_bytes)| FileLayout {
-                transfer_class: transfer_class as i32,
-                extents: build_extents(entry.metadata.size, extent_bytes),
-            });
-    InodeMetadata {
-        file_id: entry.metadata.file_id,
-        path: entry.metadata.path,
-        size: entry.metadata.size,
-        mtime_ns: entry.metadata.mtime_ns,
-        is_dir: entry.metadata.is_dir,
-        layout,
-    }
-}
-
-fn build_extents(size: u64, extent_bytes: u64) -> Vec<ExtentDescriptor> {
-    if size == 0 {
-        return vec![ExtentDescriptor {
-            extent_index: 0,
-            file_offset: 0,
-            length: 1,
-            extent_hash: Vec::new(),
-        }];
-    }
-
-    let mut extents = Vec::new();
-    let mut file_offset = 0_u64;
-    let mut extent_index = 0_u32;
-    while file_offset < size {
-        let length = extent_bytes.max(1).min(size - file_offset);
-        extents.push(ExtentDescriptor {
-            extent_index,
-            file_offset,
-            length,
-            extent_hash: Vec::new(),
-        });
-        file_offset += length;
-        extent_index += 1;
-    }
-    extents
 }
 
 fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
