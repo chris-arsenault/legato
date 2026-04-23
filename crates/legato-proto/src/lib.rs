@@ -23,7 +23,6 @@ pub fn default_capabilities() -> Vec<i32> {
     vec![
         Capability::Metadata as i32,
         Capability::Resolve as i32,
-        Capability::BlockStreaming as i32,
         Capability::ExtentFetch as i32,
         Capability::Prefetch as i32,
         Capability::Hint as i32,

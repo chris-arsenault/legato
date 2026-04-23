@@ -11,17 +11,13 @@ service Legato {
   rpc Stat(StatRequest) returns (StatResponse);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
   rpc ResolvePath(ResolvePathRequest) returns (ResolvePathResponse);
-  rpc Open(OpenRequest) returns (OpenResponse);
-  rpc ReadBlocks(ReadBlocksRequest) returns (stream BlockResponse);
-  rpc Prefetch(PrefetchRequest) returns (PrefetchResponse);
   rpc Subscribe(SubscribeRequest) returns (stream InvalidationEvent);
-  rpc Close(CloseRequest) returns (CloseResponse);
 }
 
 enum Capability {
   CAPABILITY_UNSPECIFIED = 0;
   CAPABILITY_METADATA = 1;
-  CAPABILITY_BLOCK_STREAMING = 2;
+  reserved 2;
   CAPABILITY_PREFETCH = 3;
   CAPABILITY_INVALIDATIONS = 4;
   CAPABILITY_RESOLVE = 5;
@@ -79,7 +75,7 @@ message FileMetadata {
   uint64 mtime_ns = 4;
   bytes content_hash = 5;
   bool is_dir = 6;
-  uint32 block_size = 7;
+  reserved 7;
 }
 
 message ExtentDescriptor {
@@ -194,55 +190,6 @@ message ResolvePathResponse {
   FileMetadata metadata = 1;
 }
 
-message OpenRequest {
-  string path = 1;
-}
-
-message OpenResponse {
-  uint64 file_handle = 1;
-  uint64 file_id = 2;
-  uint64 size = 3;
-  uint64 mtime_ns = 4;
-  bytes content_hash = 5;
-  uint32 block_size = 6;
-}
-
-message BlockRequest {
-  uint64 file_handle = 1;
-  uint64 start_offset = 2;
-  uint32 block_count = 3;
-}
-
-message ReadBlocksRequest {
-  repeated BlockRequest ranges = 1;
-}
-
-message BlockResponse {
-  uint64 file_handle = 1;
-  uint64 offset = 2;
-  bytes data = 3;
-  bytes block_hash = 4;
-}
-
-message PrefetchRange {
-  uint64 file_id = 1;
-  uint64 start_offset = 2;
-  uint32 block_count = 3;
-  PrefetchPriority priority = 4;
-  uint64 deadline_unix_ms = 5;
-}
-
-message PrefetchRequest {
-  repeated PrefetchRange ranges = 1;
-  bool wait_for_residency = 2;
-  PrefetchPriority wait_through_priority = 3;
-}
-
-message PrefetchResponse {
-  repeated PrefetchRange accepted = 1;
-  repeated PrefetchRange completed = 2;
-}
-
 message SubscribeRequest {}
 
 message InvalidationEvent {
@@ -250,9 +197,3 @@ message InvalidationEvent {
   string path = 2;
   uint64 file_id = 3;
 }
-
-message CloseRequest {
-  uint64 file_handle = 1;
-}
-
-message CloseResponse {}

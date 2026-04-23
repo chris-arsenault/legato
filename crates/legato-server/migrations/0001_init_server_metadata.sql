@@ -12,7 +12,6 @@ CREATE TABLE files (
   size               INTEGER NOT NULL,
   mtime_ns           INTEGER NOT NULL,
   content_hash       BLOB,
-  block_size         INTEGER NOT NULL DEFAULT 1048576,
   created_at_ns      INTEGER NOT NULL DEFAULT 0,
   updated_at_ns      INTEGER NOT NULL DEFAULT 0
 );

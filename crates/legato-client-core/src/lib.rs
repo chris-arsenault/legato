@@ -10,7 +10,7 @@ use legato_client_cache::{
 };
 use legato_proto::{
     AttachRequest, DirectoryEntry, ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata,
-    InvalidationEvent, InvalidationKind, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+    InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
     PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
 };
 use legato_types::{
@@ -149,8 +149,6 @@ pub struct ReconnectPlan {
     pub attach: AttachRequest,
     /// Whether the invalidation subscription should be re-established.
     pub resubscribe: bool,
-    /// File reopen requests required to replace stale server-local handles.
-    pub reopen_requests: Vec<OpenRequest>,
 }
 
 /// Result of applying reconnect completion work after a new transport is established.
@@ -196,21 +194,6 @@ impl std::fmt::Display for ClientTlsError {
 
 impl std::error::Error for ClientTlsError {}
 
-/// State for one logical open file that must be refreshed after reconnect.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OpenFileState {
-    /// Canonical library path used to re-open the file after reconnect.
-    pub path: String,
-    /// Stable file identifier returned by the server.
-    pub file_id: u64,
-    /// Current server-local file handle.
-    pub file_handle: u64,
-    /// Server-advertised block size used by the read path.
-    pub block_size: u32,
-    /// Whether the handle became stale due to transport loss.
-    pub stale: bool,
-}
-
 /// Stateful runtime shell for attach, reconnect, and stale-handle recovery planning.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientRuntime {
@@ -218,7 +201,6 @@ pub struct ClientRuntime {
     generation: u64,
     session_status: SessionStatus,
     failure_count: u32,
-    open_files: HashMap<String, OpenFileState>,
 }
 
 impl ClientRuntime {
@@ -230,7 +212,6 @@ impl ClientRuntime {
             generation: 0,
             session_status: SessionStatus::Disconnected,
             failure_count: 0,
-            open_files: HashMap::new(),
         }
     }
 
@@ -268,37 +249,6 @@ impl ClientRuntime {
         }
     }
 
-    /// Marks one tracked handle stale, typically after a server-side restart or ESTALE response.
-    pub fn mark_handle_stale(&mut self, path: &str) {
-        if let Some(open_file) = self.open_files.get_mut(path) {
-            open_file.stale = true;
-        }
-    }
-
-    /// Records one open file handle that should be re-opened after reconnect.
-    pub fn record_open_handle(&mut self, path: &str, response: &OpenResponse) {
-        self.open_files.insert(
-            String::from(path),
-            OpenFileState {
-                path: String::from(path),
-                file_id: response.file_id,
-                file_handle: response.file_handle,
-                block_size: response.block_size,
-                stale: false,
-            },
-        );
-    }
-
-    /// Updates the tracked handle after a successful reopen.
-    pub fn refresh_open_handle(&mut self, path: &str, response: &OpenResponse) {
-        self.record_open_handle(path, response);
-    }
-
-    /// Stops tracking an open handle after the client releases it locally.
-    pub fn close_open_handle(&mut self, path: &str) {
-        self.open_files.remove(path);
-    }
-
     /// Marks the transport unavailable and returns the next reconnect delay.
     pub fn mark_transport_unavailable(&mut self) -> u64 {
         self.failure_count = self.failure_count.saturating_add(1);
@@ -307,10 +257,6 @@ impl ClientRuntime {
             attempt: self.failure_count,
             delay_ms,
         };
-
-        for open_file in self.open_files.values_mut() {
-            open_file.stale = true;
-        }
 
         delay_ms
     }
@@ -329,50 +275,17 @@ impl ClientRuntime {
     /// Builds the reconnect work needed to restore subscriptions and stale handles.
     #[must_use]
     pub fn reconnect_plan(&self, client_name: &str) -> ReconnectPlan {
-        let resubscribe = matches!(
-            self.session_status,
-            SessionStatus::Connected {
-                subscription_active: true,
-                ..
-            }
-        ) || self.open_files.values().any(|open_file| open_file.stale);
-
-        let mut reopen_requests = self
-            .open_files
-            .values()
-            .filter(|open_file| open_file.stale)
-            .map(|open_file| OpenRequest {
-                path: open_file.path.clone(),
-            })
-            .collect::<Vec<_>>();
-        reopen_requests.sort_by(|left, right| left.path.cmp(&right.path));
-
         ReconnectPlan {
             attach: self.attach_request(client_name),
-            resubscribe,
-            reopen_requests,
+            resubscribe: true,
         }
     }
 
     /// Applies reconnect results and returns any invalidation required for local caches.
     #[must_use]
-    pub fn complete_reconnect(
-        &mut self,
-        reopened: &[(String, OpenResponse)],
-        invalidation_root: Option<&str>,
-    ) -> RecoveryCompletion {
-        for (path, response) in reopened {
-            self.refresh_open_handle(path, response);
-        }
-
-        let mut reopened_paths = reopened
-            .iter()
-            .map(|(path, _response)| path.clone())
-            .collect::<Vec<_>>();
-        reopened_paths.sort();
-
+    pub fn complete_reconnect(&mut self, invalidation_root: Option<&str>) -> RecoveryCompletion {
         RecoveryCompletion {
-            reopened_paths,
+            reopened_paths: Vec::new(),
             invalidation: invalidation_root.map(|path| InvalidationEvent {
                 kind: InvalidationKind::Subtree as i32,
                 path: String::from(path),
@@ -391,12 +304,6 @@ impl ClientRuntime {
     #[must_use]
     pub fn session_status(&self) -> &SessionStatus {
         &self.session_status
-    }
-
-    /// Returns the tracked open file state for the given path.
-    #[must_use]
-    pub fn open_file(&self, path: &str) -> Option<&OpenFileState> {
-        self.open_files.get(path)
     }
 }
 
@@ -836,11 +743,6 @@ fn inode_metadata_to_file_metadata(inode: &InodeMetadata) -> FileMetadata {
         mtime_ns: inode.mtime_ns,
         content_hash: Vec::new(),
         is_dir: inode.is_dir,
-        block_size: inode
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.extents.first())
-            .map_or(0, |extent| extent.length.min(u64::from(u32::MAX)) as u32),
     }
 }
 
@@ -953,7 +855,7 @@ mod tests {
     };
     use legato_proto::{
         ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata, InvalidationEvent,
-        InvalidationKind, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+        InvalidationKind, PROTOCOL_VERSION,
     };
     use legato_types::{
         ExtentRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
@@ -988,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_and_reconnect_plan_restore_subscription_and_stale_handles() {
+    fn connect_and_reconnect_plan_restores_subscription() {
         let root = tempdir().expect("tempdir should be created");
         let tls = ClientTlsConfig::local_dev(root.path(), "legato.lan");
         fs::write(&tls.ca_cert_path, TEST_CERT_PEM).expect("ca cert should be written");
@@ -1011,26 +913,9 @@ mod tests {
         );
 
         runtime.mark_subscription_active();
-        runtime.record_open_handle(
-            "/srv/libraries/Kontakt/piano.nki",
-            &OpenResponse {
-                file_handle: 7,
-                file_id: 42,
-                size: 1024,
-                mtime_ns: 77,
-                content_hash: Vec::new(),
-                block_size: 4096,
-            },
-        );
 
         let delay_ms = runtime.mark_transport_unavailable();
         assert_eq!(delay_ms, 250);
-        assert!(
-            runtime
-                .open_file("/srv/libraries/Kontakt/piano.nki")
-                .expect("open file should be tracked")
-                .stale
-        );
 
         let plan = runtime.reconnect_plan("legatofs");
         assert_eq!(
@@ -1038,95 +923,29 @@ mod tests {
             ReconnectPlan {
                 attach: runtime.attach_request("legatofs"),
                 resubscribe: true,
-                reopen_requests: vec![OpenRequest {
-                    path: String::from("/srv/libraries/Kontakt/piano.nki"),
-                }],
             }
-        );
-
-        runtime.refresh_open_handle(
-            "/srv/libraries/Kontakt/piano.nki",
-            &OpenResponse {
-                file_handle: 8,
-                file_id: 42,
-                size: 1024,
-                mtime_ns: 77,
-                content_hash: Vec::new(),
-                block_size: 4096,
-            },
-        );
-        assert_eq!(
-            runtime
-                .open_file("/srv/libraries/Kontakt/piano.nki")
-                .expect("open file should be refreshed")
-                .file_handle,
-            8
-        );
-        assert!(
-            !runtime
-                .open_file("/srv/libraries/Kontakt/piano.nki")
-                .expect("open file should be refreshed")
-                .stale
         );
     }
 
     #[test]
-    fn explicit_stale_handle_recovery_refreshes_handles_and_invalidates_root() {
+    fn reconnect_completion_invalidates_root_without_server_handles() {
         let mut runtime = ClientRuntime::new(ClientConfig::default());
         runtime.mark_transport_ready(true);
-        runtime.record_open_handle(
-            "/srv/libraries/Kontakt/piano.nki",
-            &OpenResponse {
-                file_handle: 10,
-                file_id: 42,
-                size: 1024,
-                mtime_ns: 77,
-                content_hash: Vec::new(),
-                block_size: 4096,
-            },
-        );
-        runtime.mark_handle_stale("/srv/libraries/Kontakt/piano.nki");
 
         let plan = runtime.reconnect_plan("legatofs");
-        let completion = runtime.complete_reconnect(
-            &[(
-                String::from("/srv/libraries/Kontakt/piano.nki"),
-                OpenResponse {
-                    file_handle: 22,
-                    file_id: 42,
-                    size: 1024,
-                    mtime_ns: 78,
-                    content_hash: Vec::new(),
-                    block_size: 4096,
-                },
-            )],
-            Some("/srv/libraries"),
-        );
+        let completion = runtime.complete_reconnect(Some("/srv/libraries"));
 
-        assert_eq!(plan.reopen_requests.len(), 1);
+        assert!(plan.resubscribe);
         assert_eq!(
             completion,
             RecoveryCompletion {
-                reopened_paths: vec![String::from("/srv/libraries/Kontakt/piano.nki")],
+                reopened_paths: Vec::new(),
                 invalidation: Some(InvalidationEvent {
                     kind: InvalidationKind::Subtree as i32,
                     path: String::from("/srv/libraries"),
                     file_id: 0,
                 }),
             }
-        );
-        assert_eq!(
-            runtime
-                .open_file("/srv/libraries/Kontakt/piano.nki")
-                .expect("open file should still exist")
-                .file_handle,
-            22
-        );
-        assert!(
-            !runtime
-                .open_file("/srv/libraries/Kontakt/piano.nki")
-                .expect("open file should still exist")
-                .stale
         );
     }
 
@@ -1411,17 +1230,6 @@ mod tests {
     fn reconnect_completion_can_drive_control_plane_refresh_end_to_end() {
         let mut runtime = ClientRuntime::new(ClientConfig::default());
         runtime.mark_transport_ready(true);
-        runtime.record_open_handle(
-            "/srv/libraries/Strings/long.ncw",
-            &OpenResponse {
-                file_handle: 100,
-                file_id: 11,
-                size: 64,
-                mtime_ns: 1,
-                content_hash: Vec::new(),
-                block_size: 1 << 20,
-            },
-        );
         runtime.mark_transport_unavailable();
 
         let mut control =
@@ -1434,24 +1242,10 @@ mod tests {
                 mtime_ns: 1,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
             },
             10,
         );
-        let completion = runtime.complete_reconnect(
-            &[(
-                String::from("/srv/libraries/Strings/long.ncw"),
-                OpenResponse {
-                    file_handle: 200,
-                    file_id: 11,
-                    size: 64,
-                    mtime_ns: 2,
-                    content_hash: Vec::new(),
-                    block_size: 1 << 20,
-                },
-            )],
-            Some("/srv/libraries"),
-        );
+        let completion = runtime.complete_reconnect(Some("/srv/libraries"));
 
         control.apply_invalidation(
             &completion
@@ -1472,7 +1266,6 @@ mod tests {
                 mtime_ns: 2,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
             },
             12,
         );
@@ -1480,13 +1273,6 @@ mod tests {
             control
                 .resolve_path("/srv/libraries/Strings/long.ncw", 13)
                 .is_some()
-        );
-        assert_eq!(
-            runtime
-                .open_file("/srv/libraries/Strings/long.ncw")
-                .expect("open file should exist")
-                .file_handle,
-            200
         );
     }
 

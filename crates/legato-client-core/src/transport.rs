@@ -12,9 +12,8 @@ use tonic::{
 
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
-    AttachResponse, ChangeRecord, CloseRequest, CloseResponse, DirectoryEntry, ExtentRecord,
-    ExtentRef, FetchRequest, FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest,
-    OpenRequest, OpenResponse, PROTOCOL_VERSION, PrefetchRequest, PrefetchResponse,
+    AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, ExtentRef, FetchRequest,
+    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, PROTOCOL_VERSION,
     ResolvePathRequest, ResolveRequest, StatRequest, SubscribeChangesRequest, SubscribeRequest,
     legato_client::LegatoClient,
 };
@@ -208,14 +207,7 @@ impl GrpcClientTransport {
         let attach = attach_session(&mut client, plan.attach).await?;
         self.runtime.mark_transport_ready(false);
 
-        let mut reopened = Vec::with_capacity(plan.reopen_requests.len());
-        for request in plan.reopen_requests {
-            let path = request.path.clone();
-            let response = client.open(request).await?.into_inner();
-            reopened.push((path, response));
-        }
-
-        let recovery = self.runtime.complete_reconnect(&reopened, None);
+        let recovery = self.runtime.complete_reconnect(None);
         self.client = client;
         self.attach = attach;
         Ok(recovery)
@@ -277,29 +269,6 @@ impl GrpcClientTransport {
         response
             .inode
             .ok_or(ClientTransportError::MissingField("resolve.inode"))
-    }
-
-    /// Opens one remote file and records the returned server-local handle.
-    pub async fn open(
-        &mut self,
-        path: impl Into<String>,
-    ) -> Result<OpenResponse, ClientTransportError> {
-        let path = path.into();
-        let response = self
-            .client
-            .open(OpenRequest { path: path.clone() })
-            .await?
-            .into_inner();
-        self.runtime.record_open_handle(&path, &response);
-        Ok(response)
-    }
-
-    /// Sends a prefetch request to the remote server.
-    pub async fn prefetch(
-        &mut self,
-        request: PrefetchRequest,
-    ) -> Result<PrefetchResponse, ClientTransportError> {
-        Ok(self.client.prefetch(request).await?.into_inner())
     }
 
     /// Fetches one or more semantic extents from the remote server.
@@ -375,15 +344,6 @@ impl GrpcClientTransport {
             }
         });
         Ok(GrpcInvalidationSubscription { receiver, task })
-    }
-
-    /// Closes one remote file handle.
-    pub async fn close(&mut self, file_handle: u64) -> Result<CloseResponse, ClientTransportError> {
-        Ok(self
-            .client
-            .close(CloseRequest { file_handle })
-            .await?
-            .into_inner())
     }
 }
 

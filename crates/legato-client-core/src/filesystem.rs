@@ -37,8 +37,6 @@ pub struct FilesystemOpenHandle {
     pub path: String,
     /// Stable server file identifier.
     pub file_id: FileId,
-    /// Current remote server-local handle when the transport still uses one.
-    pub server_handle: Option<u64>,
     /// Logical file size in bytes.
     pub size: u64,
     /// Modification time in nanoseconds since the Unix epoch.
@@ -219,10 +217,7 @@ impl FilesystemService {
         let Some(handle) = self.open_handles.remove(&local_handle) else {
             return Err(FilesystemServiceError::UnknownHandle(local_handle));
         };
-        if let Some(server_handle) = handle.server_handle {
-            self.transport.close(server_handle).await?;
-        }
-        self.transport.runtime_mut().close_open_handle(&handle.path);
+        let _ = handle;
         Ok(())
     }
 
@@ -494,7 +489,7 @@ fn metadata_to_attributes(metadata: FileMetadata) -> FilesystemAttributes {
         is_dir: metadata.is_dir,
         size: metadata.size,
         mtime_ns: metadata.mtime_ns,
-        block_size: metadata.block_size,
+        block_size: 4096,
         read_only: true,
     }
 }
@@ -509,7 +504,6 @@ fn inode_to_open_handle(local_handle: u64, inode: InodeMetadata) -> FilesystemOp
         local_handle,
         path: inode.path,
         file_id: FileId(inode.file_id),
-        server_handle: None,
         size: inode.size,
         mtime_ns: inode.mtime_ns,
         transfer_class,
@@ -849,7 +843,6 @@ mod tests {
 
         assert_eq!(handle.local_handle, 7);
         assert_eq!(handle.file_id.0, 42);
-        assert_eq!(handle.server_handle, None);
         assert_eq!(handle.mtime_ns, 123);
         assert_eq!(handle.transfer_class, TransferClass::Streamed);
         assert_eq!(handle.extents.len(), 1);

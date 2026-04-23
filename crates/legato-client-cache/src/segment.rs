@@ -78,6 +78,8 @@ pub struct StoreRecord {
     pub kind: StoreRecordKind,
     /// Globally ordered record sequence number.
     pub sequence: u64,
+    /// Byte offset where the record frame begins inside the segment.
+    pub segment_offset: u64,
     /// Payload bytes.
     pub payload: Vec<u8>,
     /// BLAKE3 hash of the payload bytes.
@@ -92,6 +94,7 @@ impl StoreRecord {
         Self {
             kind,
             sequence,
+            segment_offset: 0,
             payload,
             payload_hash,
         }
@@ -194,7 +197,9 @@ impl SegmentWriter {
             });
         }
 
-        let record = StoreRecord::new(kind, sequence, payload.to_vec());
+        let segment_offset = self.current_offset()?;
+        let mut record = StoreRecord::new(kind, sequence, payload.to_vec());
+        record.segment_offset = segment_offset;
         self.file
             .write_all(RECORD_MAGIC)
             .and_then(|()| self.file.write_all(&[u8::from(kind)]))
@@ -413,6 +418,7 @@ fn read_record_body(
     Ok(TailRead::Complete(StoreRecord {
         kind,
         sequence,
+        segment_offset: record_start,
         payload,
         payload_hash,
     }))

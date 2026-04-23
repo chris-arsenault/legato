@@ -4,7 +4,7 @@
 use std::fs;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use legato_proto::{ExtentRef, OpenRequest};
+use legato_proto::ExtentRef;
 use legato_server::{
     MetadataService, ServerExtentStore, open_metadata_database, reconcile_library_root,
 };
@@ -32,7 +32,7 @@ fn benchmark_library_scan(c: &mut Criterion) {
     });
 }
 
-fn benchmark_cold_open_and_extent_fetch(c: &mut Criterion) {
+fn benchmark_cold_resolve_and_extent_fetch(c: &mut Criterion) {
     let temp = tempdir().expect("tempdir should be created");
     let library_root = temp.path().join("library");
     create_library_fixture(&library_root, 12, 8, 256 * 1024);
@@ -43,19 +43,17 @@ fn benchmark_cold_open_and_extent_fetch(c: &mut Criterion) {
     let mut connection = open_metadata_database(&database_path).expect("database should open");
     reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
 
-    c.bench_function("client_open/cold_metadata_open", |b| {
+    c.bench_function("client_resolve/cold_metadata_resolve", |b| {
         b.iter_batched(
             || {
                 MetadataService::new(
                     open_metadata_database(&database_path).expect("database should reopen"),
                 )
             },
-            |mut service| {
+            |service| {
                 let response = service
-                    .open(OpenRequest {
-                        path: sample_path.to_string_lossy().into_owned(),
-                    })
-                    .expect("open should succeed");
+                    .resolve_catalog_path(&sample_path.to_string_lossy())
+                    .expect("resolve should succeed");
                 criterion::black_box(response);
             },
             BatchSize::SmallInput,
@@ -89,7 +87,7 @@ fn benchmark_cold_open_and_extent_fetch(c: &mut Criterion) {
             |(extent_store, entry, extent_ref)| {
                 let extent = extent_store
                     .fetch_extent(&entry, &extent_ref)
-                    .expect("read_blocks should succeed");
+                    .expect("extent fetch should succeed");
                 criterion::black_box(extent);
             },
             BatchSize::SmallInput,
@@ -149,6 +147,6 @@ fn create_library_fixture(
 criterion_group!(
     server_workloads,
     benchmark_library_scan,
-    benchmark_cold_open_and_extent_fetch
+    benchmark_cold_resolve_and_extent_fetch
 );
 criterion_main!(server_workloads);

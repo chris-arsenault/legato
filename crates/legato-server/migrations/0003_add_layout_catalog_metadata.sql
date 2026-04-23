@@ -1,8 +1,2 @@
 ALTER TABLE files ADD COLUMN transfer_class INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE files ADD COLUMN extent_bytes INTEGER NOT NULL DEFAULT 1048576;
-
-UPDATE files
-SET extent_bytes = CASE
-  WHEN block_size > 0 THEN block_size
-  ELSE 1048576
-END;

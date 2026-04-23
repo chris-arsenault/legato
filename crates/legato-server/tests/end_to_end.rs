@@ -10,7 +10,7 @@ use legato_client_core::{
     ClientConfig, ClientTlsConfig, FilesystemService, LocalControlPlane, RetryPolicy,
 };
 use legato_prefetch::analyze_project;
-use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata, OpenRequest};
+use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
 use legato_server::{
     LiveServer, MetadataService, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
     issue_client_tls_bundle, load_runtime_tls, open_metadata_database, reconcile_library_root,
@@ -33,7 +33,7 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
     let mut connection = open_metadata_database(&database_path).expect("database should open");
     reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
 
-    let mut service = MetadataService::new(
+    let service = MetadataService::new(
         open_metadata_database(&database_path).expect("database should reopen"),
     );
     let inode = catalog_entry_to_inode(
@@ -42,13 +42,6 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
             .expect("resolve should succeed")
             .expect("sample should resolve"),
     );
-    let _open = service
-        .open(OpenRequest {
-            path: sample_path.to_string_lossy().into_owned(),
-        })
-        .expect("resolve should succeed")
-        .expect("sample should open");
-
     let client_db =
         open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =
@@ -119,7 +112,7 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
         .first()
         .expect("analysis should emit one hint");
 
-    let mut service = MetadataService::new(
+    let service = MetadataService::new(
         open_metadata_database(&database_path).expect("database should reopen"),
     );
     let inode = catalog_entry_to_inode(
@@ -128,13 +121,6 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
             .expect("resolve should succeed")
             .expect("sample should resolve"),
     );
-    let _open = service
-        .open(OpenRequest {
-            path: hint.path.clone(),
-        })
-        .expect("resolve should succeed")
-        .expect("sample should open");
-
     let client_db =
         open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =

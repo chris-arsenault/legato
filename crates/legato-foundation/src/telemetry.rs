@@ -437,13 +437,13 @@ mod tests {
             &metrics,
             "cache_hit_total",
             "Cache hits recorded by the client.",
-            &[("service", "legatofs"), ("cache", "blocks")],
+            &[("service", "legatofs"), ("cache", "extents")],
             2,
         );
         registry.set_gauge(
             &metrics,
-            "resident_blocks",
-            "Resident block count.",
+            "resident_extents",
+            "Resident extent count.",
             &[("service", "legatofs")],
             7,
         );
@@ -452,10 +452,10 @@ mod tests {
 
         assert!(rendered.contains("# TYPE legato_cache_hit_total counter"));
         assert!(
-            rendered.contains(r#"legato_cache_hit_total{cache="blocks",service="legatofs"} 2"#)
+            rendered.contains(r#"legato_cache_hit_total{cache="extents",service="legatofs"} 2"#)
         );
-        assert!(rendered.contains("# TYPE legato_resident_blocks gauge"));
-        assert!(rendered.contains(r#"legato_resident_blocks{service="legatofs"} 7"#));
+        assert!(rendered.contains("# TYPE legato_resident_extents gauge"));
+        assert!(rendered.contains(r#"legato_resident_extents{service="legatofs"} 7"#));
     }
 
     #[test]

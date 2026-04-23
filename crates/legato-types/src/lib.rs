@@ -20,17 +20,6 @@ pub enum PrefetchPriority {
     P3,
 }
 
-/// Fixed-size block range retained for block-transport compatibility.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct BlockRange {
-    /// The stable identifier of the target file.
-    pub file_id: FileId,
-    /// The inclusive starting byte offset.
-    pub start_offset: u64,
-    /// Number of fixed-size blocks requested from the start offset.
-    pub block_count: u32,
-}
-
 /// Semantic extent range tied to a stable file identifier.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExtentRange {

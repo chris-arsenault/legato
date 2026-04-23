@@ -1,4 +1,4 @@
-CREATE TABLE extent_entries (
+CREATE TABLE IF NOT EXISTS extent_entries (
   file_id              INTEGER NOT NULL,
   extent_index         INTEGER NOT NULL,
   file_offset          INTEGER NOT NULL,
@@ -13,7 +13,7 @@ CREATE TABLE extent_entries (
   PRIMARY KEY (file_id, extent_index)
 );
 
-CREATE TABLE extent_fetch_state (
+CREATE TABLE IF NOT EXISTS extent_fetch_state (
   file_id              INTEGER NOT NULL,
   extent_index         INTEGER NOT NULL,
   priority             INTEGER NOT NULL,
@@ -22,11 +22,11 @@ CREATE TABLE extent_fetch_state (
   PRIMARY KEY (file_id, extent_index)
 );
 
-CREATE INDEX extent_entries_last_access_idx
+CREATE INDEX IF NOT EXISTS extent_entries_last_access_idx
   ON extent_entries(last_access_ns);
 
-CREATE INDEX extent_entries_pin_generation_idx
+CREATE INDEX IF NOT EXISTS extent_entries_pin_generation_idx
   ON extent_entries(pin_generation);
 
-CREATE INDEX extent_fetch_state_state_idx
+CREATE INDEX IF NOT EXISTS extent_fetch_state_state_idx
   ON extent_fetch_state(state);

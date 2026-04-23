@@ -21,22 +21,24 @@ use tonic::{
     transport::{Certificate, Identity, Server as TransportServer, ServerTlsConfig},
 };
 
+use legato_client_cache::catalog::{CatalogStore, inode_to_proto};
+#[cfg(test)]
+use legato_proto::InodeMetadata;
 use legato_proto::{
-    AttachRequest, AttachResponse, BlockResponse, ChangeRecord, CloseRequest, CloseResponse,
-    ExtentRecord, FetchRequest, HintRequest, HintResponse, InodeMetadata, ListDirRequest,
-    ListDirResponse, OpenRequest, OpenResponse, PrefetchRequest, PrefetchResponse,
-    ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, ResolveRequest, ResolveResponse,
-    StatRequest, StatResponse, SubscribeChangesRequest, SubscribeRequest,
+    AttachRequest, AttachResponse, ChangeRecord, ExtentRecord, FetchRequest, HintRequest,
+    HintResponse, ListDirRequest, ListDirResponse, ResolvePathRequest, ResolvePathResponse,
+    ResolveRequest, ResolveResponse, StatRequest, StatResponse, SubscribeChangesRequest,
+    SubscribeRequest,
     legato_server::{Legato, LegatoServer},
 };
+use legato_types::FileId;
 
 use crate::{
-    CatalogEntry, InvalidationHub, MetadataService, Server, ServerConfig, ServerRuntimeMetrics,
-    WatchBackend, create_poll_watcher, create_recommended_watcher, open_metadata_database,
-    reconcile_library_root,
+    InvalidationHub, MetadataService, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend,
+    create_poll_watcher, create_recommended_watcher, open_metadata_database,
+    reconcile_library_root, reconcile_library_root_to_store,
 };
 
-type BlockStream = Pin<Box<dyn Stream<Item = Result<BlockResponse, Status>> + Send + 'static>>;
 type InvalidationStream =
     Pin<Box<dyn Stream<Item = Result<legato_proto::InvalidationEvent, Status>> + Send + 'static>>;
 type FetchStream = Pin<Box<dyn Stream<Item = Result<ExtentRecord, Status>> + Send + 'static>>;
@@ -94,6 +96,7 @@ pub struct LiveServer {
     shell: Server,
     config: ServerConfig,
     metadata: Arc<Mutex<MetadataService>>,
+    catalog: Arc<Mutex<CatalogStore>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
     metrics: Option<ServerRuntimeMetrics>,
 }
@@ -113,6 +116,11 @@ impl LiveServer {
         let mut connection = open_metadata_database(&database_path)?;
         let started = Instant::now();
         let stats = reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
+        let _canonical_stats = reconcile_library_root_to_store(
+            Path::new(&config.state_dir),
+            Path::new(&config.library_root),
+        )?;
+        let catalog = CatalogStore::open(Path::new(&config.state_dir), 0)?;
         if let Some(metrics) = &metrics {
             metrics.record_bootstrap_reconcile(&stats, started.elapsed().as_nanos() as u64);
         }
@@ -123,6 +131,7 @@ impl LiveServer {
             shell: Server::new(config.clone()),
             config,
             metadata: Arc::new(Mutex::new(metadata)),
+            catalog: Arc::new(Mutex::new(catalog)),
             invalidations: Arc::new(Mutex::new(invalidations)),
             metrics,
         })
@@ -146,7 +155,9 @@ impl LiveServer {
         let watch_task = spawn_watch_task(
             watch_receiver,
             PathBuf::from(&self.config.library_root),
+            PathBuf::from(&self.config.state_dir),
             Arc::clone(&self.metadata),
+            Some(Arc::clone(&self.catalog)),
             Arc::clone(&self.invalidations),
         );
 
@@ -219,7 +230,9 @@ impl ActiveWatcher {
 fn spawn_watch_task(
     mut receiver: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     library_root: PathBuf,
+    state_dir: PathBuf,
     metadata: Arc<Mutex<MetadataService>>,
+    catalog: Option<Arc<Mutex<CatalogStore>>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -231,6 +244,12 @@ fn spawn_watch_task(
                     Err(_error) => continue,
                 }
             };
+            if let Some(catalog) = &catalog
+                && reconcile_library_root_to_store(&state_dir, &library_root).is_ok()
+                && let Ok(reopened_catalog) = CatalogStore::open(&state_dir, 0)
+            {
+                *catalog.lock().await = reopened_catalog;
+            }
 
             if !invalidation_events.is_empty() {
                 let mut hub = invalidations.lock().await;
@@ -242,7 +261,6 @@ fn spawn_watch_task(
 
 #[tonic::async_trait]
 impl Legato for LiveServer {
-    type ReadBlocksStream = BlockStream;
     type SubscribeStream = InvalidationStream;
     type FetchStream = FetchStream;
     type SubscribeChangesStream = ChangeStream;
@@ -260,13 +278,13 @@ impl Legato for LiveServer {
     ) -> Result<Response<ResolveResponse>, Status> {
         let path = request.into_inner().path;
         let inode = self
-            .metadata
+            .catalog
             .lock()
             .await
-            .resolve_catalog_path(&path)
-            .map_err(map_storage_error)?
+            .resolve_path(&path)
+            .cloned()
             .ok_or_else(|| Status::not_found("path not found"))
-            .map(metadata_to_inode)?;
+            .map(inode_to_proto)?;
         Ok(Response::new(ResolveResponse { inode: Some(inode) }))
     }
 
@@ -275,25 +293,40 @@ impl Legato for LiveServer {
         request: Request<FetchRequest>,
     ) -> Result<Response<Self::FetchStream>, Status> {
         let request = request.into_inner();
-        let extent_store = crate::extent::ServerExtentStore::new(Path::new(&self.config.state_dir));
-        let metadata = self.metadata.lock().await;
+        let catalog = self.catalog.lock().await;
         let mut records = Vec::with_capacity(request.extents.len());
         for extent in request.extents {
-            let entry = metadata
-                .resolve_catalog_file_id(extent.file_id)
-                .map_err(map_storage_error)?
+            let inode = catalog
+                .resolve_file_id(FileId(extent.file_id))
                 .ok_or_else(|| Status::not_found("file id not found"))?;
-            let fetched = extent_store
-                .fetch_extent(&entry, &extent)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let catalog_extent = inode
+                .extents
+                .iter()
+                .find(|candidate| {
+                    candidate.extent_index == extent.extent_index
+                        && candidate.file_offset == extent.file_offset
+                        && candidate.length == extent.length
+                })
+                .ok_or_else(|| Status::not_found("extent not found"))?;
+            let started = Instant::now();
+            let data = catalog
+                .read_extent_payload(catalog_extent)
+                .map_err(map_catalog_error)?;
             if let Some(metrics) = &self.metrics {
                 metrics.record_extent_fetch(
-                    fetched.source,
-                    fetched.record.data.len(),
-                    fetched.elapsed_ns,
+                    crate::ExtentFetchSource::CacheHit,
+                    data.len(),
+                    started.elapsed().as_nanos() as u64,
                 );
             }
-            records.push(fetched.record);
+            records.push(ExtentRecord {
+                file_id: inode.file_id.0,
+                extent_index: catalog_extent.extent_index,
+                file_offset: catalog_extent.file_offset,
+                extent_hash: catalog_extent.payload_hash.clone(),
+                transfer_class: catalog_extent.transfer_class,
+                data,
+            });
         }
         let stream = tokio_stream::iter(records.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
@@ -313,11 +346,11 @@ impl Legato for LiveServer {
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
         let since_sequence = request.into_inner().since_sequence;
         let records = self
-            .metadata
+            .catalog
             .lock()
             .await
             .change_records_since(since_sequence)
-            .map_err(map_storage_error)?;
+            .map_err(map_catalog_error)?;
         let stream = tokio_stream::iter(records.into_iter().map(Ok));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -361,44 +394,6 @@ impl Legato for LiveServer {
         Ok(Response::new(response))
     }
 
-    async fn open(&self, request: Request<OpenRequest>) -> Result<Response<OpenResponse>, Status> {
-        let response = self
-            .metadata
-            .lock()
-            .await
-            .open(request.into_inner())
-            .map_err(map_storage_error)?
-            .ok_or_else(|| Status::not_found("file not found"))?;
-        Ok(Response::new(response))
-    }
-
-    async fn read_blocks(
-        &self,
-        request: Request<ReadBlocksRequest>,
-    ) -> Result<Response<Self::ReadBlocksStream>, Status> {
-        // Legacy compatibility surface. The native client path uses Resolve + Fetch extents.
-        let blocks = self
-            .metadata
-            .lock()
-            .await
-            .read_blocks(request.into_inner())
-            .map_err(map_storage_error)?;
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            blocks.into_iter().map(Ok),
-        ))))
-    }
-
-    async fn prefetch(
-        &self,
-        request: Request<PrefetchRequest>,
-    ) -> Result<Response<PrefetchResponse>, Status> {
-        let request = request.into_inner();
-        Ok(Response::new(PrefetchResponse {
-            accepted: request.ranges,
-            completed: Vec::new(),
-        }))
-    }
-
     async fn subscribe(
         &self,
         _request: Request<SubscribeRequest>,
@@ -432,14 +427,6 @@ impl Legato for LiveServer {
 
         Ok(Response::new(Box::pin(stream)))
     }
-
-    async fn close(
-        &self,
-        request: Request<CloseRequest>,
-    ) -> Result<Response<CloseResponse>, Status> {
-        let response = self.metadata.lock().await.close(request.into_inner());
-        Ok(Response::new(response))
-    }
 }
 
 /// Loads the PEM materials needed by tonic's transport TLS configuration.
@@ -465,7 +452,12 @@ fn map_storage_error(error: rusqlite::Error) -> Status {
     }
 }
 
-fn metadata_to_inode(entry: CatalogEntry) -> InodeMetadata {
+fn map_catalog_error(error: legato_client_cache::catalog::CatalogStoreError) -> Status {
+    Status::internal(error.to_string())
+}
+
+#[cfg(test)]
+fn metadata_to_inode(entry: crate::CatalogEntry) -> InodeMetadata {
     let layout =
         entry
             .transfer_class
@@ -654,7 +646,6 @@ mod tests {
                 mtime_ns: 0,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
             },
             transfer_class: Some(TransferClass::Unitary),
             extent_bytes: Some(512 * 1024),
@@ -671,7 +662,6 @@ mod tests {
                 mtime_ns: 0,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
             },
             transfer_class: Some(TransferClass::Streamed),
             extent_bytes: Some(4 * 1024 * 1024),
@@ -691,7 +681,6 @@ mod tests {
                 mtime_ns: 0,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 1 << 20,
             },
             transfer_class: Some(TransferClass::Random),
             extent_bytes: Some(1024 * 1024),
@@ -773,7 +762,7 @@ mod tests {
             .into_inner();
         let inode = resolved.inode.expect("inode should be present");
         let layout = inode.layout.expect("layout should be present");
-        assert_eq!(inode.file_id, 1);
+        assert_ne!(inode.file_id, 0);
         assert_eq!(layout.transfer_class, TransferClass::Unitary as i32);
         assert_eq!(layout.extents.len(), 1);
 
@@ -842,7 +831,9 @@ mod tests {
         let watch_task = spawn_watch_task(
             receiver,
             library_root.clone(),
+            fixture.path().join("state"),
             Arc::clone(&metadata),
+            None,
             Arc::clone(&invalidations),
         );
 

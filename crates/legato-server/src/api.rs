@@ -1,16 +1,10 @@
 //! Metadata RPC implementations over the server metadata database.
 
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{self, Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::path::Path;
 
 use legato_proto::{
-    BlockResponse, ChangeKind, ChangeRecord, CloseRequest, CloseResponse, DirectoryEntry,
-    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, ListDirResponse, OpenRequest,
-    OpenResponse, ReadBlocksRequest, ResolvePathRequest, ResolvePathResponse, StatRequest,
+    ChangeKind, ChangeRecord, DirectoryEntry, FileMetadata, InodeMetadata, InvalidationEvent,
+    ListDirRequest, ListDirResponse, ResolvePathRequest, ResolvePathResponse, StatRequest,
     StatResponse, TransferClass,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -24,8 +18,6 @@ use crate::{
 #[derive(Debug)]
 pub struct MetadataService {
     connection: Connection,
-    next_handle: u64,
-    open_handles: HashMap<u64, OpenHandle>,
 }
 
 /// Catalog-backed metadata for one resolved path.
@@ -39,22 +31,11 @@ pub struct CatalogEntry {
     pub extent_bytes: Option<u64>,
 }
 
-#[derive(Debug)]
-struct OpenHandle {
-    file_id: u64,
-    path: String,
-    block_size: u32,
-}
-
 impl MetadataService {
     /// Creates a metadata service backed by the provided SQLite connection.
     #[must_use]
     pub fn new(connection: Connection) -> Self {
-        Self {
-            connection,
-            next_handle: 1,
-            open_handles: HashMap::new(),
-        }
+        Self { connection }
     }
 
     /// Returns metadata for the requested path when it exists.
@@ -199,101 +180,6 @@ impl MetadataService {
         Ok(Some(ListDirResponse { entries }))
     }
 
-    /// Opens a file path and returns a server-local handle.
-    pub fn open(&mut self, request: OpenRequest) -> rusqlite::Result<Option<OpenResponse>> {
-        let Some(metadata) = lookup_file_only_metadata(&self.connection, &request.path)? else {
-            return Ok(None);
-        };
-
-        let file_handle = self.next_handle;
-        self.next_handle += 1;
-        self.open_handles.insert(
-            file_handle,
-            OpenHandle {
-                file_id: metadata.metadata.file_id,
-                path: metadata.metadata.path.clone(),
-                block_size: metadata.metadata.block_size,
-            },
-        );
-
-        Ok(Some(OpenResponse {
-            file_handle,
-            file_id: metadata.metadata.file_id,
-            size: metadata.metadata.size,
-            mtime_ns: metadata.metadata.mtime_ns,
-            content_hash: metadata.metadata.content_hash,
-            block_size: metadata.metadata.block_size,
-        }))
-    }
-
-    /// Legacy compatibility RPC for aligned block ranges from already opened file handles.
-    ///
-    /// New client code should resolve paths and fetch semantic extents instead.
-    pub fn read_blocks(&self, request: ReadBlocksRequest) -> rusqlite::Result<Vec<BlockResponse>> {
-        let mut responses = Vec::new();
-
-        for range in request.ranges {
-            let handle = self.open_handles.get(&range.file_handle).ok_or_else(|| {
-                invalid_request_error(format!("unknown file handle {}", range.file_handle))
-            })?;
-            let block_size = u64::from(handle.block_size);
-
-            if block_size == 0 {
-                return Err(invalid_request_error(format!(
-                    "file handle {} has an invalid block size",
-                    range.file_handle
-                )));
-            }
-            if range.start_offset % block_size != 0 {
-                return Err(invalid_request_error(format!(
-                    "start offset {} is not aligned to block size {} for file handle {}",
-                    range.start_offset, block_size, range.file_handle
-                )));
-            }
-
-            let mut file = File::open(&handle.path).map_err(io_error)?;
-            file.seek(SeekFrom::Start(range.start_offset))
-                .map_err(io_error)?;
-
-            for block_index in 0..range.block_count {
-                let offset = range.start_offset + u64::from(block_index) * block_size;
-                let Some(data) = read_block(&mut file, handle.block_size)? else {
-                    break;
-                };
-
-                responses.push(BlockResponse {
-                    file_handle: range.file_handle,
-                    offset,
-                    block_hash: blake3::hash(&data).as_bytes().to_vec(),
-                    data,
-                });
-            }
-        }
-
-        Ok(responses)
-    }
-
-    /// Closes a previously issued file handle.
-    #[must_use]
-    pub fn close(&mut self, request: CloseRequest) -> CloseResponse {
-        self.open_handles.remove(&request.file_handle);
-        CloseResponse {}
-    }
-
-    /// Returns whether a handle is still open.
-    #[must_use]
-    pub fn is_handle_open(&self, file_handle: u64) -> bool {
-        self.open_handles.contains_key(&file_handle)
-    }
-
-    /// Returns the file ID associated with an open handle.
-    #[must_use]
-    pub fn file_id_for_handle(&self, file_handle: u64) -> Option<u64> {
-        self.open_handles
-            .get(&file_handle)
-            .map(|handle| handle.file_id)
-    }
-
     /// Applies one filesystem notification result and returns the resulting stats and invalidations.
     pub fn apply_notification(
         &mut self,
@@ -342,7 +228,6 @@ fn lookup_directory_metadata(
                         mtime_ns: mtime_ns as u64,
                         content_hash: Vec::new(),
                         is_dir: true,
-                        block_size: 0,
                     },
                     transfer_class: None,
                     extent_bytes: None,
@@ -368,7 +253,7 @@ fn lookup_file_only_metadata_by_id(
 ) -> rusqlite::Result<Option<CatalogEntry>> {
     connection
         .query_row(
-            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''), block_size,
+            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''),
                     transfer_class, extent_bytes
              FROM files
              WHERE file_id = ?1",
@@ -379,9 +264,8 @@ fn lookup_file_only_metadata_by_id(
                 let size: i64 = row.get(2)?;
                 let mtime_ns: i64 = row.get(3)?;
                 let content_hash: Vec<u8> = row.get(4)?;
-                let block_size: i64 = row.get(5)?;
-                let transfer_class: i64 = row.get(6)?;
-                let extent_bytes: i64 = row.get(7)?;
+                let transfer_class: i64 = row.get(5)?;
+                let extent_bytes: i64 = row.get(6)?;
                 Ok(CatalogEntry {
                     metadata: FileMetadata {
                         file_id: file_id as u64,
@@ -390,7 +274,6 @@ fn lookup_file_only_metadata_by_id(
                         mtime_ns: mtime_ns as u64,
                         content_hash,
                         is_dir: false,
-                        block_size: block_size as u32,
                     },
                     transfer_class: TransferClass::try_from(transfer_class as i32).ok(),
                     extent_bytes: Some(extent_bytes as u64),
@@ -406,7 +289,7 @@ fn lookup_file_only_metadata(
 ) -> rusqlite::Result<Option<CatalogEntry>> {
     connection
         .query_row(
-            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''), block_size,
+            "SELECT file_id, path, size, mtime_ns, COALESCE(content_hash, x''),
                     transfer_class, extent_bytes
              FROM files
              WHERE path = ?1",
@@ -417,9 +300,8 @@ fn lookup_file_only_metadata(
                 let size: i64 = row.get(2)?;
                 let mtime_ns: i64 = row.get(3)?;
                 let content_hash: Vec<u8> = row.get(4)?;
-                let block_size: i64 = row.get(5)?;
-                let transfer_class: i64 = row.get(6)?;
-                let extent_bytes: i64 = row.get(7)?;
+                let transfer_class: i64 = row.get(5)?;
+                let extent_bytes: i64 = row.get(6)?;
                 Ok(CatalogEntry {
                     metadata: FileMetadata {
                         file_id: file_id as u64,
@@ -428,7 +310,6 @@ fn lookup_file_only_metadata(
                         mtime_ns: mtime_ns as u64,
                         content_hash,
                         is_dir: false,
-                        block_size: block_size as u32,
                     },
                     transfer_class: TransferClass::try_from(transfer_class as i32).ok(),
                     extent_bytes: Some(extent_bytes as u64),
@@ -446,31 +327,11 @@ fn entry_name(path: &str) -> String {
         .unwrap_or_else(|| String::from(path))
 }
 
-fn read_block(file: &mut File, block_size: u32) -> rusqlite::Result<Option<Vec<u8>>> {
-    let mut buffer = vec![0_u8; block_size as usize];
-    let bytes_read = file.read(&mut buffer).map_err(io_error)?;
-    if bytes_read == 0 {
-        return Ok(None);
-    }
-    buffer.truncate(bytes_read);
-    Ok(Some(buffer))
-}
-
-fn io_error(error: io::Error) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-}
-
-fn invalid_request_error(message: String) -> rusqlite::Error {
-    rusqlite::Error::InvalidParameterName(message)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use legato_proto::{
-        CloseRequest, ListDirRequest, OpenRequest, ResolvePathRequest, StatRequest, TransferClass,
-    };
+    use legato_proto::{ListDirRequest, ResolvePathRequest, StatRequest, TransferClass};
     use tempfile::{TempDir, tempdir};
 
     use super::MetadataService;
@@ -561,25 +422,6 @@ mod tests {
         assert_eq!(kontakt_names, vec![sample_path]);
     }
 
-    #[test]
-    fn open_and_close_manage_server_side_handles() {
-        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
-            build_service_fixture();
-
-        let open = service
-            .open(OpenRequest { path: sample_path })
-            .expect("open should succeed")
-            .expect("sample file should open");
-
-        assert!(service.is_handle_open(open.file_handle));
-
-        let _ = service.close(CloseRequest {
-            file_handle: open.file_handle,
-        });
-
-        assert!(!service.is_handle_open(open.file_handle));
-    }
-
     fn build_service_fixture() -> (
         TempDir,
         TempDir,
@@ -597,13 +439,6 @@ mod tests {
         let mut connection =
             open_metadata_database(&db_dir.path().join("server.sqlite")).expect("db should open");
         reconcile_library_root(&mut connection, &library_root).expect("reconcile should succeed");
-        connection
-            .execute(
-                "UPDATE files SET block_size = 4 WHERE path = ?1",
-                [sample_path.to_string_lossy().as_ref()],
-            )
-            .expect("test block size should update");
-
         (
             fixture,
             db_dir,

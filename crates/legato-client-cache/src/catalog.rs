@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use legato_proto::TransferClass;
+use legato_proto::{
+    ChangeKind, ChangeRecord, ExtentDescriptor, FileLayout, InodeMetadata, TransferClass,
+};
 use legato_types::FileId;
 use serde::{Deserialize, Serialize};
 
@@ -337,6 +339,52 @@ impl CatalogStore {
         self.state.paths.keys().cloned().collect()
     }
 
+    /// Reads and verifies one resident extent payload from its canonical segment.
+    pub fn read_extent_payload(
+        &self,
+        extent: &CatalogExtent,
+    ) -> Result<Vec<u8>, CatalogStoreError> {
+        let path = self
+            .root_dir
+            .join("segments")
+            .join(segment_file_name(extent.segment_id));
+        let scan = repair_incomplete_tail(&path)?;
+        let record = scan
+            .records
+            .into_iter()
+            .find(|record| {
+                record.kind == StoreRecordKind::Extent
+                    && record.segment_offset == extent.segment_offset
+                    && record.payload_hash.as_slice() == extent.payload_hash.as_slice()
+            })
+            .ok_or(CatalogStoreError::MissingExtent {
+                segment_id: extent.segment_id,
+                segment_offset: extent.segment_offset,
+            })?;
+        Ok(record.payload)
+    }
+
+    /// Loads ordered catalog change records after the supplied sequence cursor.
+    pub fn change_records_since(
+        &self,
+        since_sequence: u64,
+    ) -> Result<Vec<ChangeRecord>, CatalogStoreError> {
+        let mut records = Vec::new();
+        for path in segment_paths(&self.root_dir.join("segments"))? {
+            let scan = repair_incomplete_tail(&path)?;
+            for record in scan.records {
+                if record.sequence <= since_sequence {
+                    continue;
+                }
+                if let Some(change) = change_record_from_store_record(record)? {
+                    records.push(change);
+                }
+            }
+        }
+        records.sort_by_key(|record| record.sequence);
+        Ok(records)
+    }
+
     fn append_payload(
         &mut self,
         kind: StoreRecordKind,
@@ -380,6 +428,19 @@ impl CatalogState {
 }
 
 fn replay_segments(segment_dir: &Path, state: &mut CatalogState) -> Result<(), CatalogStoreError> {
+    for path in segment_paths(segment_dir)? {
+        let scan = repair_incomplete_tail(&path)?;
+        for record in scan.records {
+            if record.sequence <= state.last_sequence {
+                continue;
+            }
+            replay_record(state, record)?;
+        }
+    }
+    Ok(())
+}
+
+fn segment_paths(segment_dir: &Path) -> Result<Vec<PathBuf>, CatalogStoreError> {
     let mut segment_paths = fs::read_dir(segment_dir)
         .map_err(|source| CatalogStoreError::Io {
             path: segment_dir.to_path_buf(),
@@ -399,17 +460,7 @@ fn replay_segments(segment_dir: &Path, state: &mut CatalogState) -> Result<(), C
             .is_some_and(|extension| extension == "lseg")
     });
     segment_paths.sort();
-
-    for path in segment_paths {
-        let scan = repair_incomplete_tail(&path)?;
-        for record in scan.records {
-            if record.sequence <= state.last_sequence {
-                continue;
-            }
-            replay_record(state, record)?;
-        }
-    }
-    Ok(())
+    Ok(segment_paths)
 }
 
 fn replay_record(state: &mut CatalogState, record: StoreRecord) -> Result<(), CatalogStoreError> {
@@ -460,6 +511,83 @@ fn apply_catalog_payload(state: &mut CatalogState, sequence: u64, payload: Catal
         }
     }
     state.last_sequence = sequence;
+}
+
+fn change_record_from_store_record(
+    record: StoreRecord,
+) -> Result<Option<ChangeRecord>, CatalogStoreError> {
+    if record.kind == StoreRecordKind::Extent {
+        return Ok(None);
+    }
+    let payload = serde_json::from_slice::<CatalogRecordPayload>(&record.payload)
+        .map_err(CatalogStoreError::Json)?;
+    let change = match payload {
+        CatalogRecordPayload::Inode(inode) => Some(ChangeRecord {
+            sequence: record.sequence,
+            kind: ChangeKind::Upsert as i32,
+            file_id: inode.file_id.0,
+            path: inode.path.clone(),
+            inode: Some(inode_to_proto(inode)),
+        }),
+        CatalogRecordPayload::Directory(directory) => Some(ChangeRecord {
+            sequence: record.sequence,
+            kind: ChangeKind::Upsert as i32,
+            file_id: directory.directory_id.0,
+            path: directory.path.clone(),
+            inode: Some(InodeMetadata {
+                file_id: directory.directory_id.0,
+                path: directory.path,
+                size: 0,
+                mtime_ns: 0,
+                is_dir: true,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: Vec::new(),
+                }),
+            }),
+        }),
+        CatalogRecordPayload::Tombstone(tombstone) => Some(ChangeRecord {
+            sequence: record.sequence,
+            kind: ChangeKind::Delete as i32,
+            file_id: tombstone.file_id.map_or(0, |file_id| file_id.0),
+            path: tombstone.path,
+            inode: None,
+        }),
+        CatalogRecordPayload::Checkpoint(checkpoint) => Some(ChangeRecord {
+            sequence: record.sequence,
+            kind: ChangeKind::Checkpoint as i32,
+            file_id: 0,
+            path: format!("checkpoint:{}", checkpoint.sequence),
+            inode: None,
+        }),
+        CatalogRecordPayload::Cursor(_) => None,
+    };
+    Ok(change)
+}
+
+/// Converts a catalog inode into protocol metadata.
+#[must_use]
+pub fn inode_to_proto(inode: CatalogInode) -> InodeMetadata {
+    InodeMetadata {
+        file_id: inode.file_id.0,
+        path: inode.path,
+        size: inode.size,
+        mtime_ns: inode.mtime_ns as u64,
+        is_dir: inode.is_dir,
+        layout: Some(FileLayout {
+            transfer_class: inode.transfer_class,
+            extents: inode
+                .extents
+                .into_iter()
+                .map(|extent| ExtentDescriptor {
+                    extent_index: extent.extent_index,
+                    file_offset: extent.file_offset,
+                    length: extent.length,
+                    extent_hash: extent.payload_hash,
+                })
+                .collect(),
+        }),
+    }
 }
 
 fn load_checkpoint_file(
@@ -532,6 +660,13 @@ pub enum CatalogStoreError {
     Segment(SegmentStoreError),
     /// Catalog JSON serialization failed.
     Json(serde_json::Error),
+    /// Expected extent payload was not present in the referenced segment.
+    MissingExtent {
+        /// Segment identifier.
+        segment_id: u64,
+        /// Segment byte offset.
+        segment_offset: u64,
+    },
 }
 
 impl From<SegmentStoreError> for CatalogStoreError {
@@ -552,6 +687,13 @@ impl std::fmt::Display for CatalogStoreError {
             }
             Self::Segment(source) => write!(formatter, "{source}"),
             Self::Json(source) => write!(formatter, "catalog JSON failed: {source}"),
+            Self::MissingExtent {
+                segment_id,
+                segment_offset,
+            } => write!(
+                formatter,
+                "missing extent payload in segment {segment_id} at offset {segment_offset}"
+            ),
         }
     }
 }
@@ -562,6 +704,7 @@ impl std::error::Error for CatalogStoreError {
             Self::Io { source, .. } => Some(source),
             Self::Segment(source) => Some(source),
             Self::Json(source) => Some(source),
+            Self::MissingExtent { .. } => None,
         }
     }
 }

@@ -30,15 +30,12 @@ const EXTENT_STORE_PIN_GENERATION_KEY: &str = "extent_store.pin_generation";
 pub struct CacheConfig {
     /// Total maximum size of the cache in bytes.
     pub max_bytes: u64,
-    /// Default chunk size used by local fetch/cache planning.
-    pub block_size: u32,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_bytes: 1_500 * 1024 * 1024 * 1024,
-            block_size: 1 << 20,
         }
     }
 }
@@ -881,8 +878,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn cache_config_defaults_to_large_local_store_and_megabyte_chunks() {
-        assert_eq!(CacheConfig::default().block_size, 1 << 20);
+    fn cache_config_defaults_to_large_local_store() {
         assert!(CacheConfig::default().max_bytes > 1_000_000_000);
     }
 
@@ -901,7 +897,6 @@ mod tests {
                 mtime_ns: 3,
                 content_hash: Vec::new(),
                 is_dir: false,
-                block_size: 4096,
             }),
             100,
         );
@@ -961,7 +956,7 @@ mod tests {
         let mut statement = connection
             .prepare(
                 "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name IN ('cache_entries', 'client_state', 'extent_entries', 'extent_fetch_state', 'fetch_state', 'pins') \
+                 WHERE type = 'table' AND name IN ('client_state', 'extent_entries', 'extent_fetch_state', 'pins') \
                  ORDER BY name",
             )
             .expect("table inspection statement should prepare");
@@ -976,11 +971,9 @@ mod tests {
         assert_eq!(
             table_names,
             vec![
-                String::from("cache_entries"),
                 String::from("client_state"),
                 String::from("extent_entries"),
                 String::from("extent_fetch_state"),
-                String::from("fetch_state"),
                 String::from("pins"),
             ]
         );

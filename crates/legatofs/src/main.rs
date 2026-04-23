@@ -829,7 +829,7 @@ fn mount_root_attributes(mount: &MountConfig, semantics: FilesystemSemantics) ->
         is_dir: true,
         size: 0,
         mtime_ns: 0,
-        block_size: 1 << 20,
+        block_size: 4096,
         read_only: semantics.read_only,
     };
 
@@ -840,7 +840,6 @@ fn mount_root_attributes(mount: &MountConfig, semantics: FilesystemSemantics) ->
         mtime_ns: attributes.mtime_ns,
         content_hash: Vec::new(),
         is_dir: attributes.is_dir,
-        block_size: attributes.block_size,
     }
 }
 
@@ -1204,7 +1203,7 @@ fn render_client_config(
         "[common.tracing]\njson = false\nlevel = \"info\"\n\n\
          [common.metrics]\nprefix = \"legatofs\"\n\n\
          [client]\nendpoint = \"{endpoint}\"\n\n\
-         [client.cache]\nmax_bytes = 1610612736000\nblock_size = 1048576\n\n\
+         [client.cache]\nmax_bytes = 1610612736000\n\n\
          [client.tls]\nca_cert_path = \"{ca_cert_path}\"\n\
          client_cert_path = \"{client_cert_path}\"\n\
          client_key_path = \"{client_key_path}\"\n\

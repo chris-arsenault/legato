@@ -12,7 +12,7 @@ pub struct Migration {
 }
 
 /// Current schema version for the client cache database.
-pub const CLIENT_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const CLIENT_CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Returns the ordered list of migrations for the client cache database.
 #[must_use]
@@ -27,6 +27,11 @@ pub fn cache_migrations() -> &'static [Migration] {
             version: 2,
             name: "add_extent_store",
             sql: include_str!("../migrations/0002_add_extent_store.sql"),
+        },
+        Migration {
+            version: 3,
+            name: "drop_block_cache_tables",
+            sql: include_str!("../migrations/0003_drop_block_cache_tables.sql"),
         },
     ]
 }
