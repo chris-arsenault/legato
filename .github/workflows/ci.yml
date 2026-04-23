@@ -45,17 +45,18 @@ jobs:
       - name: Install WinFsp
         shell: pwsh
         run: |
-          $installed = $false
-          for ($attempt = 1; $attempt -le 5; $attempt++) {
-            choco install winfsp --no-progress -y
-            if ($LASTEXITCODE -eq 0) {
-              $installed = $true
-              break
-            }
-            Start-Sleep -Seconds (10 * $attempt)
-          }
-          if (-not $installed) {
-            throw "WinFsp Chocolatey install failed after retries."
+          $msiPath = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile $msiPath
+
+          $install = Start-Process `
+            -FilePath "msiexec.exe" `
+            -ArgumentList "/i `"$msiPath`" /qn /norestart ADDLOCAL=ALL" `
+            -Wait `
+            -PassThru
+          if (($install.ExitCode -ne 0) -and ($install.ExitCode -ne 3010)) {
+            throw "WinFsp MSI install failed with exit code $($install.ExitCode)."
           }
 
           $installDirCandidates = @(
