@@ -15,6 +15,7 @@ This document defines the installation and upgrade shape for the native Legato c
 - Checkpoint root: `<state_dir>/checkpoints`
 - Certificate root: `<state_dir>/certs`
 - Generated client config: `<state_dir>/legatofs.toml`
+- Mounted-runtime control manifest: `<state_dir>/prefetch-control.json`
 - Certificates:
   - server CA under the client certificate root
   - client certificate under the client certificate root
@@ -79,6 +80,7 @@ This document defines the installation and upgrade shape for the native Legato c
 - `certs/` stores the server CA plus issued client certificate and key.
 - `bundle.json` in the issued bundle can carry install-time defaults such as endpoint and server name.
 - `legatofs.toml` is generated from the install command and should be preserved across upgrades.
+- `prefetch-control.json` is written only while `legatofs` is running and allows manual `legato-prefetch run` requests to route through the mounted runtime instead of acting as a second writer.
 
 ## Store Integrity Rules
 

@@ -25,7 +25,7 @@ This document is the deployment and recovery guide for running Legato as a Docke
 5. Expose the metrics port only on trusted networks if `common.metrics.bind_address` is configured.
 6. Run the container as the same numeric UID/GID that owns the mounted datasets. The compose file defaults to `42173:42173`; override `LEGATO_UID` and `LEGATO_GID` in Komodo if your TrueNAS-side owner differs.
 
-For the `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`.
+For the `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`. The helper defaults to the same `42173:42173` UID/GID as [compose.yaml](/home/dev/repos/legato/compose.yaml) and creates a local UNIX account by default; set `LEGATO_SMB_USER=true` and `LEGATO_SMB_PASSWORD=...` if you also want a TrueNAS SMB-enabled account created for that identity.
 
 The canonical host-to-container mount mapping for that layout is:
 
@@ -105,14 +105,10 @@ Recommended defaults:
 
 Under `/var/lib/legato`, the expected durable layout is:
 
-- `catalog/`
-  Current catalog checkpoints and compacted catalog files.
 - `segments/`
   Append-only segment files containing canonical records.
 - `checkpoints/`
   Recovery boundaries and replay metadata.
-- `tmp/`
-  Temporary files used during compaction and atomic replacement.
 
 Under `/etc/legato/certs`, the expected durable layout is:
 
@@ -159,6 +155,8 @@ Under the chosen client state root, the expected durable layout is:
   Issued client bundle content.
 - `legatofs.toml`
   Generated client config.
+- `prefetch-control.json`
+  Loopback control-endpoint manifest written while the mounted runtime is active so manual `legato-prefetch run` requests can route through the runtime-owned cache writer.
 
 ## Observability
 

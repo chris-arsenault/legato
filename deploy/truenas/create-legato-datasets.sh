@@ -31,8 +31,10 @@ SHARES_ROOT_DATASET="${SHARES_ROOT_DATASET:-${POOL}/shares}"
 
 LEGATO_USER="${LEGATO_USER:-legato}"
 LEGATO_GROUP="${LEGATO_GROUP:-legato}"
-LEGATO_UID="${LEGATO_UID:-10001}"
-LEGATO_GID="${LEGATO_GID:-10001}"
+LEGATO_UID="${LEGATO_UID:-42173}"
+LEGATO_GID="${LEGATO_GID:-42173}"
+LEGATO_SMB_USER="${LEGATO_SMB_USER:-false}"
+LEGATO_SMB_PASSWORD="${LEGATO_SMB_PASSWORD:-}"
 
 APP_DATASET="${APP_DATASET:-${APPS_ROOT_DATASET}/legato}"
 APP_CONFIG_DATASET="${APP_CONFIG_DATASET:-${APP_DATASET}/config}"
@@ -101,7 +103,11 @@ ensure_group() {
 
   echo "creating group: ${LEGATO_GROUP} (${LEGATO_GID})"
   if command -v midclt >/dev/null 2>&1; then
-    midclt call group.create "{\"gid\": ${LEGATO_GID}, \"name\": \"${LEGATO_GROUP}\", \"smb\": true}" >/dev/null
+    local smb_flag="false"
+    if [ "${LEGATO_SMB_USER}" = "true" ]; then
+      smb_flag="true"
+    fi
+    midclt call group.create "{\"gid\": ${LEGATO_GID}, \"name\": \"${LEGATO_GROUP}\", \"smb\": ${smb_flag}}" >/dev/null
   else
     groupadd -g "${LEGATO_GID}" "${LEGATO_GROUP}"
   fi
@@ -115,20 +121,42 @@ ensure_user() {
 
   echo "creating user: ${LEGATO_USER} (${LEGATO_UID})"
   if command -v midclt >/dev/null 2>&1; then
-    midclt call user.create "$(cat <<EOF
+    local group_id
+    group_id="$(getent group "${LEGATO_GROUP}" | cut -d: -f3)"
+    if [ "${LEGATO_SMB_USER}" = "true" ] && [ -z "${LEGATO_SMB_PASSWORD}" ]; then
+      echo "error: LEGATO_SMB_PASSWORD is required when LEGATO_SMB_USER=true" >&2
+      exit 1
+    fi
+    if [ "${LEGATO_SMB_USER}" = "true" ]; then
+      midclt call user.create "$(cat <<EOF
 {
   "uid": ${LEGATO_UID},
   "username": "${LEGATO_USER}",
   "group_create": false,
-  "group": $(getent group "${LEGATO_GROUP}" | cut -d: -f3),
-  "home": "/nonexistent",
+  "group": ${group_id},
+  "home": "/var/empty",
   "shell": "/usr/sbin/nologin",
   "full_name": "Legato Service User",
-  "password_disabled": true,
-  "smb": true
+  "smb": true,
+  "password": "${LEGATO_SMB_PASSWORD}"
 }
 EOF
 )" >/dev/null
+    else
+      midclt call user.create "$(cat <<EOF
+{
+  "uid": ${LEGATO_UID},
+  "username": "${LEGATO_USER}",
+  "group_create": false,
+  "group": ${group_id},
+  "home": "/var/empty",
+  "shell": "/usr/sbin/nologin",
+  "full_name": "Legato Service User",
+  "smb": false
+}
+EOF
+)" >/dev/null
+    fi
   else
     useradd \
       -u "${LEGATO_UID}" \
@@ -199,6 +227,15 @@ Share datasets:
 Next step:
   Create SMB share definitions in TrueNAS for the three share datasets if you
   want them exported over SMB.
+
+Identity defaults:
+  UID/GID default to ${LEGATO_UID}:${LEGATO_GID} so they match the repository
+  compose stack defaults.
+
+SMB account:
+  The helper creates a local UNIX user/group by default.
+  Set LEGATO_SMB_USER=true and LEGATO_SMB_PASSWORD=... if you also want a
+  TrueNAS SMB-enabled account created for ${LEGATO_USER}.
 EOF
 }
 

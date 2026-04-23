@@ -89,17 +89,15 @@ Suggested mount layout:
 ```text
 /mnt/pool/libraries            -> /srv/libraries:ro
 /mnt/pool/appdata/legato       -> /var/lib/legato
-/mnt/pool/appdata/legato/tls   -> /var/lib/legato/tls
+/mnt/pool/appdata/legato/tls   -> /etc/legato
 ```
 
 Suggested server state layout:
 
 ```text
 /var/lib/legato/
-  catalog/
   segments/
   checkpoints/
-  tmp/
 ```
 
 The deployment is intentionally a single server process for the local TrueNAS workflow.
@@ -122,6 +120,7 @@ Default client state layout:
   checkpoints/
   certs/
   legatofs.toml
+  prefetch-control.json
 ```
 
 Linux is not a primary client target.
