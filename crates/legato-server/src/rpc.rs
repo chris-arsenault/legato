@@ -21,22 +21,21 @@ use tonic::{
     transport::{Certificate, Identity, Server as TransportServer, ServerTlsConfig},
 };
 
-use legato_client_cache::catalog::{CatalogStore, inode_to_proto};
+use legato_client_cache::catalog::{CatalogInode, CatalogStore, inode_to_proto};
 #[cfg(test)]
 use legato_proto::InodeMetadata;
 use legato_proto::{
-    AttachRequest, AttachResponse, ChangeRecord, ExtentRecord, FetchRequest, HintRequest,
-    HintResponse, ListDirRequest, ListDirResponse, ResolvePathRequest, ResolvePathResponse,
-    ResolveRequest, ResolveResponse, StatRequest, StatResponse, SubscribeChangesRequest,
-    SubscribeRequest,
+    AttachRequest, AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, FetchRequest,
+    FileMetadata, HintRequest, HintResponse, ListDirRequest, ListDirResponse, ResolvePathRequest,
+    ResolvePathResponse, ResolveRequest, ResolveResponse, StatRequest, StatResponse,
+    SubscribeChangesRequest, SubscribeRequest,
     legato_server::{Legato, LegatoServer},
 };
 use legato_types::FileId;
 
 use crate::{
-    InvalidationHub, MetadataService, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend,
-    create_poll_watcher, create_recommended_watcher, open_metadata_database,
-    reconcile_library_root, reconcile_library_root_to_store,
+    InvalidationHub, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend, create_poll_watcher,
+    create_recommended_watcher, reconcile_library_root_to_store, subtree_invalidation,
 };
 
 type InvalidationStream =
@@ -95,7 +94,6 @@ impl BoundServer {
 pub struct LiveServer {
     shell: Server,
     config: ServerConfig,
-    metadata: Arc<Mutex<MetadataService>>,
     catalog: Arc<Mutex<CatalogStore>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
     metrics: Option<ServerRuntimeMetrics>,
@@ -112,11 +110,8 @@ impl LiveServer {
         config: ServerConfig,
         metrics: Option<ServerRuntimeMetrics>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let database_path = Path::new(&config.state_dir).join("server.sqlite");
-        let mut connection = open_metadata_database(&database_path)?;
         let started = Instant::now();
-        let stats = reconcile_library_root(&mut connection, Path::new(&config.library_root))?;
-        let _canonical_stats = reconcile_library_root_to_store(
+        let stats = reconcile_library_root_to_store(
             Path::new(&config.state_dir),
             Path::new(&config.library_root),
         )?;
@@ -124,13 +119,11 @@ impl LiveServer {
         if let Some(metrics) = &metrics {
             metrics.record_bootstrap_reconcile(&stats, started.elapsed().as_nanos() as u64);
         }
-        let metadata = MetadataService::new(connection);
         let invalidations = InvalidationHub::new(config.library_root.clone());
 
         Ok(Self {
             shell: Server::new(config.clone()),
             config,
-            metadata: Arc::new(Mutex::new(metadata)),
             catalog: Arc::new(Mutex::new(catalog)),
             invalidations: Arc::new(Mutex::new(invalidations)),
             metrics,
@@ -156,8 +149,7 @@ impl LiveServer {
             watch_receiver,
             PathBuf::from(&self.config.library_root),
             PathBuf::from(&self.config.state_dir),
-            Arc::clone(&self.metadata),
-            Some(Arc::clone(&self.catalog)),
+            Arc::clone(&self.catalog),
             Arc::clone(&self.invalidations),
         );
 
@@ -231,30 +223,25 @@ fn spawn_watch_task(
     mut receiver: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
     library_root: PathBuf,
     state_dir: PathBuf,
-    metadata: Arc<Mutex<MetadataService>>,
-    catalog: Option<Arc<Mutex<CatalogStore>>>,
+    catalog: Arc<Mutex<CatalogStore>>,
     invalidations: Arc<Mutex<InvalidationHub>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(result) = receiver.recv().await {
-            let invalidation_events = {
-                let mut metadata = metadata.lock().await;
-                match metadata.apply_notification(&library_root, result) {
-                    Ok((_stats, invalidation_events)) => invalidation_events,
-                    Err(_error) => continue,
-                }
-            };
-            if let Some(catalog) = &catalog
-                && reconcile_library_root_to_store(&state_dir, &library_root).is_ok()
-                && let Ok(reopened_catalog) = CatalogStore::open(&state_dir, 0)
-            {
+            if result.is_err() {
+                continue;
+            }
+            if reconcile_library_root_to_store(&state_dir, &library_root).is_err() {
+                continue;
+            }
+            if let Ok(reopened_catalog) = CatalogStore::open(&state_dir, 0) {
                 *catalog.lock().await = reopened_catalog;
-            }
+            } else {
+                continue;
+            };
 
-            if !invalidation_events.is_empty() {
-                let mut hub = invalidations.lock().await;
-                hub.publish_all(invalidation_events);
-            }
+            let mut hub = invalidations.lock().await;
+            hub.publish(subtree_invalidation(&library_root.to_string_lossy(), 0));
         }
     })
 }
@@ -357,11 +344,14 @@ impl Legato for LiveServer {
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
         let response = self
-            .metadata
+            .catalog
             .lock()
             .await
-            .stat(request.into_inner())
-            .map_err(map_storage_error)?
+            .resolve_path(&request.into_inner().path)
+            .cloned()
+            .map(|inode| StatResponse {
+                metadata: Some(catalog_inode_to_metadata(inode)),
+            })
             .ok_or_else(|| Status::not_found("path not found"))?;
         Ok(Response::new(response))
     }
@@ -371,11 +361,21 @@ impl Legato for LiveServer {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
         let response = self
-            .metadata
+            .catalog
             .lock()
             .await
-            .list_dir(request.into_inner())
-            .map_err(map_storage_error)?
+            .list_directory(&request.into_inner().path)
+            .map(|entries| ListDirResponse {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| DirectoryEntry {
+                        name: entry.name,
+                        path: entry.path,
+                        is_dir: entry.is_dir,
+                        file_id: entry.file_id.0,
+                    })
+                    .collect(),
+            })
             .ok_or_else(|| Status::not_found("directory not found"))?;
         Ok(Response::new(response))
     }
@@ -385,11 +385,14 @@ impl Legato for LiveServer {
         request: Request<ResolvePathRequest>,
     ) -> Result<Response<ResolvePathResponse>, Status> {
         let response = self
-            .metadata
+            .catalog
             .lock()
             .await
-            .resolve_path(request.into_inner())
-            .map_err(map_storage_error)?
+            .resolve_path(&request.into_inner().path)
+            .cloned()
+            .map(|inode| ResolvePathResponse {
+                metadata: Some(catalog_inode_to_metadata(inode)),
+            })
             .ok_or_else(|| Status::not_found("path not found"))?;
         Ok(Response::new(response))
     }
@@ -445,15 +448,19 @@ pub fn parse_bind_address(address: &str) -> Result<SocketAddr, std::net::AddrPar
     address.parse()
 }
 
-fn map_storage_error(error: rusqlite::Error) -> Status {
-    match error {
-        rusqlite::Error::InvalidParameterName(message) => Status::invalid_argument(message),
-        other => Status::internal(other.to_string()),
-    }
-}
-
 fn map_catalog_error(error: legato_client_cache::catalog::CatalogStoreError) -> Status {
     Status::internal(error.to_string())
+}
+
+fn catalog_inode_to_metadata(inode: CatalogInode) -> FileMetadata {
+    FileMetadata {
+        file_id: inode.file_id.0,
+        path: inode.path,
+        size: inode.size,
+        mtime_ns: inode.mtime_ns as u64,
+        content_hash: Vec::new(),
+        is_dir: inode.is_dir,
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +495,7 @@ mod tests {
     use tokio_stream::StreamExt;
     use tonic::transport::{Channel, ClientTlsConfig};
 
+    use legato_client_cache::catalog::CatalogStore;
     use legato_proto::{
         AttachRequest, Capability, ExtentRef, FetchRequest, ResolvePathRequest, ResolveRequest,
         StatRequest, SubscribeChangesRequest, TransferClass, legato_client::LegatoClient,
@@ -496,8 +504,8 @@ mod tests {
 
     use super::{LiveServer, load_runtime_tls, metadata_to_inode, spawn_watch_task};
     use crate::{
-        CatalogEntry, InvalidationHub, MetadataService, ServerConfig, ensure_server_tls_materials,
-        open_metadata_database, reconcile_library_root,
+        CatalogEntry, InvalidationHub, ServerConfig, ensure_server_tls_materials,
+        reconcile_library_root_to_store,
     };
 
     #[tokio::test]
@@ -817,12 +825,13 @@ mod tests {
         let existing_path = library_root.join("Kontakt").join("existing.nki");
         fs::write(&existing_path, b"existing").expect("existing file should be written");
 
-        let mut connection =
-            open_metadata_database(&fixture.path().join("server.sqlite")).expect("db should open");
-        reconcile_library_root(&mut connection, &library_root)
-            .expect("initial reconcile should succeed");
+        let state_dir = fixture.path().join("state");
+        reconcile_library_root_to_store(&state_dir, &library_root)
+            .expect("initial canonical reconcile should succeed");
 
-        let metadata = Arc::new(Mutex::new(MetadataService::new(connection)));
+        let catalog = Arc::new(Mutex::new(
+            CatalogStore::open(&state_dir, 0).expect("catalog should open"),
+        ));
         let invalidations = Arc::new(Mutex::new(InvalidationHub::new(
             library_root.to_string_lossy().into_owned(),
         )));
@@ -831,9 +840,8 @@ mod tests {
         let watch_task = spawn_watch_task(
             receiver,
             library_root.clone(),
-            fixture.path().join("state"),
-            Arc::clone(&metadata),
-            None,
+            state_dir.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&invalidations),
         );
 
@@ -850,12 +858,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 {
-                    let metadata = metadata.lock().await;
-                    if metadata
-                        .stat(StatRequest {
-                            path: new_path.to_string_lossy().into_owned(),
-                        })
-                        .expect("stat should succeed")
+                    let catalog = catalog.lock().await;
+                    if catalog
+                        .resolve_path(new_path.to_string_lossy().as_ref())
                         .is_some()
                     {
                         break;
@@ -872,17 +877,12 @@ mod tests {
             .await
             .drain(subscription.subscriber_id)
             .expect("subscriber should exist");
-        let expected_invalidation_path = new_path
-            .parent()
-            .expect("new file should have a parent directory")
-            .to_string_lossy()
-            .into_owned();
         assert!(
             queued
                 .iter()
-                .any(|event| event.path == expected_invalidation_path),
-            "expected invalidation for {}",
-            expected_invalidation_path
+                .any(|event| event.path == library_root.to_string_lossy()),
+            "expected root invalidation for {}",
+            library_root.display()
         );
 
         watch_task.abort();

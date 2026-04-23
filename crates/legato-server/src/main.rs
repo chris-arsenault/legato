@@ -5,13 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use legato_client_cache::catalog::CatalogStore;
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_server::{
-    ClientBundleManifest, LiveServer, SERVER_SCHEMA_VERSION, ServerConfig, ServerRuntimeMetrics,
-    build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
-    load_runtime_tls, open_metadata_database, parse_bind_address, write_client_bundle_manifest,
+    ClientBundleManifest, LiveServer, ServerConfig, ServerRuntimeMetrics, build_tls_server_config,
+    ensure_server_tls_materials, issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
+    write_client_bundle_manifest,
 };
 use serde::Deserialize;
 
@@ -212,17 +213,12 @@ fn server_doctor_report(config: &ServerConfig) -> Result<String, Box<dyn std::er
     build_tls_server_config(&config.tls)?;
     lines.push(format!("ok tls_dir {}", config.tls_dir));
 
-    let database_path = Path::new(&config.state_dir).join("server.sqlite");
-    let connection = open_metadata_database(&database_path)?;
-    let schema_version: u32 =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if schema_version != SERVER_SCHEMA_VERSION {
-        return Err(format!(
-            "server.sqlite schema version {schema_version} did not match expected {SERVER_SCHEMA_VERSION}"
-        )
-        .into());
-    }
-    lines.push(format!("ok catalog_db {}", database_path.display()));
+    let catalog = CatalogStore::open(&config.state_dir, 0)?;
+    lines.push(format!(
+        "ok canonical_store {} sequence={}",
+        config.state_dir,
+        catalog.last_sequence()
+    ));
 
     Ok(lines.join("\n"))
 }
@@ -310,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn server_doctor_report_checks_local_paths_and_schema() {
+    fn server_doctor_report_checks_local_paths_and_store() {
         let fixture = tempdir().expect("tempdir should be created");
         let library_root = fixture.path().join("library");
         let state_dir = fixture.path().join("state");
@@ -331,6 +327,6 @@ mod tests {
         assert!(report.contains("ok library_root"));
         assert!(report.contains("ok state_dir"));
         assert!(report.contains("ok tls_dir"));
-        assert!(report.contains("ok catalog_db"));
+        assert!(report.contains("ok canonical_store"));
     }
 }
