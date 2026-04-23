@@ -5,13 +5,14 @@ use std::{fs, path::Path};
 use legato_client_core::{
     ClientConfig, ClientTlsConfig, GrpcClientTransport, RetryPolicy, SessionStatus,
 };
-use legato_proto::{BlockRequest, Capability};
+use legato_proto::{BlockRequest, Capability, ChangeKind};
 use legato_server::{
     LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
     issue_client_tls_bundle, load_runtime_tls,
 };
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::time::{Duration, sleep};
 
 fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
     ClientConfig {
@@ -223,6 +224,95 @@ async fn grpc_client_transport_reconnects_and_reopens_stale_handles() {
     assert!(blocks.is_ok(), "reads should work after reconnect");
 
     second_bound
+        .shutdown()
+        .await
+        .expect("server should shut down cleanly");
+}
+
+#[tokio::test]
+async fn grpc_client_transport_streams_change_records_after_upstream_mutation() {
+    let fixture = tempdir().expect("tempdir should be created");
+    let library_root = fixture.path().join("library");
+    let state_dir = fixture.path().join("state");
+    let tls_dir = fixture.path().join("tls");
+    fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+    let sample_path = library_root.join("Kontakt").join("piano.nki");
+    fs::write(&sample_path, b"hello legato").expect("sample should be written");
+
+    let mut config = ServerConfig {
+        bind_address: String::from("127.0.0.1:0"),
+        library_root: library_root.to_string_lossy().into_owned(),
+        state_dir: state_dir.to_string_lossy().into_owned(),
+        tls_dir: tls_dir.to_string_lossy().into_owned(),
+        tls: ServerTlsConfig::local_dev(&tls_dir),
+    };
+    config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+    ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+        .expect("tls materials should be created");
+
+    let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener addr should be available");
+    let runtime_tls = load_runtime_tls(&config.tls).expect("runtime tls should load");
+    let bound = server
+        .bind(listener, Some(runtime_tls))
+        .await
+        .expect("server should bind");
+
+    let bundle_dir = fixture.path().join("bundle");
+    issue_client_tls_bundle(
+        Path::new(&config.tls_dir),
+        &config.tls,
+        "studio-sync",
+        &bundle_dir,
+    )
+    .expect("client bundle should be issued");
+
+    let client_config = local_client_config(address.to_string(), &bundle_dir, "localhost");
+    let mut transport = GrpcClientTransport::connect(client_config, "studio-sync")
+        .await
+        .expect("client should connect");
+    let baseline = transport
+        .change_records_since(0)
+        .await
+        .expect("baseline change records should load");
+    let baseline_sequence = baseline
+        .iter()
+        .map(|record| record.sequence)
+        .max()
+        .unwrap_or(0);
+
+    let new_sample_path = library_root.join("Kontakt").join("strings.nki");
+    fs::write(&new_sample_path, b"fresh catalog data").expect("new sample should be written");
+
+    let mut observed = Vec::new();
+    for _attempt in 0..20 {
+        observed = transport
+            .change_records_since(baseline_sequence)
+            .await
+            .expect("change records should load");
+        if observed
+            .iter()
+            .any(|record| record.path == new_sample_path.to_string_lossy())
+        {
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    assert!(
+        observed.iter().any(|record| {
+            record.path == new_sample_path.to_string_lossy()
+                && record.kind == ChangeKind::Upsert as i32
+        }),
+        "expected new file to appear in ordered change records"
+    );
+
+    bound
         .shutdown()
         .await
         .expect("server should shut down cleanly");

@@ -1,17 +1,24 @@
-//! Cross-crate integration coverage for the MVP server/client/prefetch flow.
+//! Cross-crate integration coverage for the v1 server/client/prefetch flow.
 
-use std::{fs, io::Write};
+use std::{fs, io::Write, path::Path};
 
 use flate2::{Compression, write::GzEncoder};
 use legato_client_cache::{
     ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
 };
-use legato_client_core::LocalControlPlane;
+use legato_client_core::{
+    ClientConfig, ClientTlsConfig, FilesystemService, LocalControlPlane, RetryPolicy,
+};
 use legato_prefetch::analyze_project;
 use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata, OpenRequest};
-use legato_server::{MetadataService, open_metadata_database, reconcile_library_root};
+use legato_server::{
+    LiveServer, MetadataService, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
+    issue_client_tls_bundle, load_runtime_tls, open_metadata_database, reconcile_library_root,
+};
 use legato_types::{ExtentRange, FileId, PrefetchHintPath, PrefetchPriority};
 use tempfile::tempdir;
+use tokio::net::TcpListener;
+use walkdir::WalkDir;
 
 #[test]
 fn indexed_server_and_client_prefetch_round_trip_sample_data() {
@@ -168,6 +175,106 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
     ));
 }
 
+#[tokio::test]
+async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() {
+    let fixture = tempdir().expect("tempdir should be created");
+    let library_root = fixture.path().join("library");
+    let state_dir = fixture.path().join("state");
+    let tls_dir = fixture.path().join("tls");
+    let client_state_dir = fixture.path().join("client-state");
+    fs::create_dir_all(library_root.join("Strings")).expect("library tree should be created");
+    let sample_path = library_root.join("Strings").join("long.ncw");
+    fs::write(&sample_path, vec![0x5a; 8192]).expect("sample should be written");
+
+    let mut config = ServerConfig {
+        bind_address: String::from("127.0.0.1:0"),
+        library_root: library_root.to_string_lossy().into_owned(),
+        state_dir: state_dir.to_string_lossy().into_owned(),
+        tls_dir: tls_dir.to_string_lossy().into_owned(),
+        tls: ServerTlsConfig::local_dev(&tls_dir),
+    };
+    config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+    ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+        .expect("tls materials should be created");
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("addr should be available");
+    let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+    let bound = server
+        .bind(
+            listener,
+            Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+        )
+        .await
+        .expect("server should bind");
+
+    let bundle_dir = fixture.path().join("bundle");
+    issue_client_tls_bundle(
+        Path::new(&config.tls_dir),
+        &config.tls,
+        "studio-restart",
+        &bundle_dir,
+    )
+    .expect("client bundle should be issued");
+
+    let mut first_service = FilesystemService::connect(
+        local_client_config(address.to_string(), &bundle_dir, "localhost"),
+        "studio-restart",
+        &client_state_dir,
+    )
+    .await
+    .expect("first service should connect");
+    let handle = first_service
+        .open(sample_path.to_string_lossy().as_ref())
+        .await
+        .expect("open should succeed");
+    let first_read = first_service
+        .read(handle.local_handle, 0, 4096)
+        .await
+        .expect("cold read should succeed");
+    assert_eq!(first_read, vec![0x5a; 4096]);
+    first_service
+        .release(handle.local_handle)
+        .await
+        .expect("release should succeed");
+    drop(first_service);
+
+    let extent_files_after_first_read = count_extent_files(&client_state_dir.join("extents"));
+    assert!(
+        extent_files_after_first_read > 0,
+        "cold read should materialize persisted extents"
+    );
+
+    let mut restarted_service = FilesystemService::connect(
+        local_client_config(address.to_string(), &bundle_dir, "localhost"),
+        "studio-restart",
+        &client_state_dir,
+    )
+    .await
+    .expect("restarted service should connect");
+    let reopened = restarted_service
+        .open(sample_path.to_string_lossy().as_ref())
+        .await
+        .expect("open after restart should succeed");
+    let second_read = restarted_service
+        .read(reopened.local_handle, 0, 4096)
+        .await
+        .expect("warm read after restart should succeed");
+    assert_eq!(second_read, first_read);
+    restarted_service
+        .release(reopened.local_handle)
+        .await
+        .expect("release should succeed");
+
+    let extent_files_after_restart = count_extent_files(&client_state_dir.join("extents"));
+    assert_eq!(extent_files_after_restart, extent_files_after_first_read);
+
+    drop(restarted_service);
+    bound.shutdown().await.expect("server should shut down");
+}
+
 fn catalog_entry_to_inode(entry: legato_server::CatalogEntry) -> InodeMetadata {
     let layout =
         entry
@@ -212,4 +319,29 @@ fn build_extents(size: u64, extent_bytes: u64) -> Vec<ExtentDescriptor> {
         extent_index += 1;
     }
     extents
+}
+
+fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
+    ClientConfig {
+        endpoint,
+        tls: ClientTlsConfig::local_dev(bundle_dir, server_name),
+        retry: RetryPolicy {
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+            multiplier: 2,
+        },
+        ..ClientConfig::default()
+    }
+}
+
+fn count_extent_files(root: &Path) -> usize {
+    if !root.exists() {
+        return 0;
+    }
+
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .count()
 }

@@ -12,11 +12,11 @@ use tonic::{
 
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
-    AttachResponse, BlockRequest, BlockResponse, CloseRequest, CloseResponse, DirectoryEntry,
-    ExtentRecord, ExtentRef, FetchRequest, FileMetadata, InodeMetadata, InvalidationEvent,
-    ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION, PrefetchRequest, PrefetchResponse,
-    ReadBlocksRequest, ResolvePathRequest, ResolveRequest, StatRequest, SubscribeRequest,
-    legato_client::LegatoClient,
+    AttachResponse, BlockRequest, BlockResponse, ChangeRecord, CloseRequest, CloseResponse,
+    DirectoryEntry, ExtentRecord, ExtentRef, FetchRequest, FileMetadata, InodeMetadata,
+    InvalidationEvent, ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION,
+    PrefetchRequest, PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, ResolveRequest,
+    StatRequest, SubscribeChangesRequest, SubscribeRequest, legato_client::LegatoClient,
 };
 
 /// Session metadata returned after a successful attach.
@@ -327,6 +327,23 @@ impl GrpcClientTransport {
         let mut stream = self
             .client
             .fetch(FetchRequest { extents })
+            .await?
+            .into_inner();
+        let mut records = Vec::new();
+        while let Some(record) = stream.message().await? {
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Loads ordered change records after the supplied sequence cursor.
+    pub async fn change_records_since(
+        &mut self,
+        since_sequence: u64,
+    ) -> Result<Vec<ChangeRecord>, ClientTransportError> {
+        let mut stream = self
+            .client
+            .subscribe_changes(SubscribeChangesRequest { since_sequence })
             .await?
             .into_inner();
         let mut records = Vec::new();
