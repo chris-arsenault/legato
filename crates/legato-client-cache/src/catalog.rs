@@ -235,6 +235,33 @@ impl CatalogStore {
         )
     }
 
+    /// Appends an extent payload record and returns its catalog location metadata.
+    pub fn append_extent_payload(
+        &mut self,
+        extent_index: u32,
+        file_offset: u64,
+        transfer_class: TransferClass,
+        payload: &[u8],
+    ) -> Result<CatalogExtent, CatalogStoreError> {
+        let sequence = self.next_sequence;
+        let segment_id = self.writer.segment_id();
+        let segment_offset = self.writer.current_offset()?;
+        let _ = self
+            .writer
+            .append(StoreRecordKind::Extent, sequence, payload)?;
+        self.state.last_sequence = sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(CatalogExtent {
+            extent_index,
+            file_offset,
+            length: payload.len() as u64,
+            segment_id,
+            segment_offset,
+            payload_hash: blake3::hash(payload).as_bytes().to_vec(),
+            transfer_class: transfer_class as i32,
+        })
+    }
+
     /// Appends a directory record and updates directory membership.
     pub fn append_directory(
         &mut self,
@@ -302,6 +329,12 @@ impl CatalogStore {
         self.resolve_path(path)
             .and_then(|inode| self.state.directories.get(&inode.file_id.0))
             .map(|directory| directory.entries.values().cloned().collect())
+    }
+
+    /// Returns active catalog paths.
+    #[must_use]
+    pub fn active_paths(&self) -> Vec<String> {
+        self.state.paths.keys().cloned().collect()
     }
 
     fn append_payload(
@@ -380,6 +413,10 @@ fn replay_segments(segment_dir: &Path, state: &mut CatalogState) -> Result<(), C
 }
 
 fn replay_record(state: &mut CatalogState, record: StoreRecord) -> Result<(), CatalogStoreError> {
+    if record.kind == StoreRecordKind::Extent {
+        state.last_sequence = record.sequence;
+        return Ok(());
+    }
     let payload = serde_json::from_slice::<CatalogRecordPayload>(&record.payload)
         .map_err(CatalogStoreError::Json)?;
     apply_catalog_payload(state, record.sequence, payload);

@@ -1,5 +1,7 @@
 //! Server-side bootstrap types for the Legato daemon.
 
+pub mod canonical;
+
 mod api;
 mod extent;
 mod index;
@@ -14,6 +16,7 @@ mod watcher;
 use std::{fs, path::Path};
 
 pub use api::{CatalogEntry, MetadataService};
+pub use canonical::{CanonicalStoreError, reconcile_library_root_to_store};
 pub use extent::{ExtentFetchSource, FetchedExtent, ServerExtentStore};
 pub use index::{ReconcileStats, reconcile_library_root, reconcile_paths};
 pub use invalidation::{InvalidationHub, InvalidationSubscription, subtree_invalidation};

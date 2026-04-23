@@ -116,6 +116,7 @@ pub struct SegmentScan {
 pub struct SegmentWriter {
     path: PathBuf,
     file: File,
+    segment_id: u64,
     record_count: u64,
     last_sequence: u64,
     sealed: bool,
@@ -157,10 +158,27 @@ impl SegmentWriter {
         Ok(Self {
             path: path.to_path_buf(),
             file,
+            segment_id,
             record_count: 0,
             last_sequence: 0,
             sealed: false,
         })
+    }
+
+    /// Returns the logical ID of the segment being written.
+    #[must_use]
+    pub fn segment_id(&self) -> u64 {
+        self.segment_id
+    }
+
+    /// Returns the byte offset where the next append will begin.
+    pub fn current_offset(&mut self) -> Result<u64, SegmentStoreError> {
+        self.file
+            .stream_position()
+            .map_err(|source| SegmentStoreError::Io {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     /// Appends one record to the segment.
