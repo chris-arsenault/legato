@@ -9,9 +9,9 @@ use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_server::{
-    ClientBundleManifest, LiveServer, ServerConfig, ServerRuntimeMetrics, build_tls_server_config,
-    ensure_server_tls_materials, issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
-    write_client_bundle_manifest,
+    ClientBundleManifest, LiveServer, SERVER_SCHEMA_VERSION, ServerConfig, ServerRuntimeMetrics,
+    build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
+    load_runtime_tls, open_metadata_database, parse_bind_address, write_client_bundle_manifest,
 };
 use serde::Deserialize;
 
@@ -25,13 +25,16 @@ struct ServerProcessConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let process_config = load_config::<ServerProcessConfig>(
-        Some(Path::new("/etc/legato/server.toml")),
-        "LEGATO_SERVER",
-    )
-    .unwrap_or_else(|_| ServerProcessConfig::default());
+    let command = parse_command()?;
+    let config_path = command
+        .as_ref()
+        .and_then(Command::config_path)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_path);
+    let process_config = load_config::<ServerProcessConfig>(Some(&config_path), "LEGATO_SERVER")
+        .unwrap_or_else(|_| ServerProcessConfig::default());
 
-    if let Some(command) = parse_command()? {
+    if let Some(command) = command {
         return run_command(command, &process_config);
     }
 
@@ -63,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+    Doctor {
+        config_path: Option<PathBuf>,
+    },
     IssueClient {
         name: String,
         output_dir: PathBuf,
@@ -71,6 +77,15 @@ enum Command {
         mount_point: Option<String>,
         library_root: Option<String>,
     },
+}
+
+impl Command {
+    fn config_path(&self) -> Option<&Path> {
+        match self {
+            Self::Doctor { config_path } => config_path.as_deref(),
+            Self::IssueClient { .. } => None,
+        }
+    }
 }
 
 fn parse_command() -> Result<Option<Command>, Box<dyn std::error::Error>> {
@@ -87,6 +102,16 @@ where
     };
 
     match command.as_str() {
+        "doctor" => {
+            let mut config_path = None;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--config" => config_path = arguments.next().map(PathBuf::from),
+                    other => return Err(format!("unsupported argument for doctor: {other}").into()),
+                }
+            }
+            Ok(Some(Command::Doctor { config_path }))
+        }
         "issue-client" => {
             let mut name = None;
             let mut output_dir = None;
@@ -131,6 +156,11 @@ fn run_command(
     process_config: &ServerProcessConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        Command::Doctor { .. } => {
+            let report = server_doctor_report(&process_config.server)?;
+            println!("{report}");
+            Ok(())
+        }
         Command::IssueClient {
             name,
             output_dir,
@@ -162,11 +192,64 @@ fn run_command(
     }
 }
 
+fn default_config_path() -> PathBuf {
+    PathBuf::from("/etc/legato/server.toml")
+}
+
+fn server_doctor_report(config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let mut lines = vec![String::from("legato-server doctor")];
+
+    require_directory("library_root", Path::new(&config.library_root))?;
+    lines.push(format!("ok library_root {}", config.library_root));
+
+    require_writable_directory("state_dir", Path::new(&config.state_dir))?;
+    lines.push(format!("ok state_dir {}", config.state_dir));
+
+    let bind_address = parse_bind_address(&config.bind_address)?;
+    lines.push(format!("ok bind_address {bind_address}"));
+
+    ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)?;
+    build_tls_server_config(&config.tls)?;
+    lines.push(format!("ok tls_dir {}", config.tls_dir));
+
+    let database_path = Path::new(&config.state_dir).join("server.sqlite");
+    let connection = open_metadata_database(&database_path)?;
+    let schema_version: u32 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != SERVER_SCHEMA_VERSION {
+        return Err(format!(
+            "server.sqlite schema version {schema_version} did not match expected {SERVER_SCHEMA_VERSION}"
+        )
+        .into());
+    }
+    lines.push(format!("ok catalog_db {}", database_path.display()));
+
+    Ok(lines.join("\n"))
+}
+
+fn require_directory(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.is_dir() {
+        return Err(format!("{label} is not a directory: {}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn require_writable_directory(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(path)?;
+    let probe = path.join(".legato-doctor-write");
+    std::fs::write(&probe, b"ok")
+        .map_err(|error| format!("{label} is not writable at {}: {error}", path.display()))?;
+    let _ = std::fs::remove_file(probe);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Command, parse_command_impl};
+    use super::{Command, parse_command_impl, server_doctor_report};
+    use legato_server::{ServerConfig, ServerTlsConfig};
+    use tempfile::tempdir;
 
     fn parse_command_from<I, S>(arguments: I) -> Result<Option<Command>, Box<dyn std::error::Error>>
     where
@@ -211,5 +294,43 @@ mod tests {
                 library_root: Some(String::from("/srv/libraries")),
             })
         );
+    }
+
+    #[test]
+    fn parse_doctor_command() {
+        let command = parse_command_from(["doctor", "--config", "/tmp/server.toml"])
+            .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Doctor {
+                config_path: Some(PathBuf::from("/tmp/server.toml")),
+            })
+        );
+    }
+
+    #[test]
+    fn server_doctor_report_checks_local_paths_and_schema() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        std::fs::create_dir_all(&library_root).expect("library root should be created");
+        let mut tls = ServerTlsConfig::local_dev(&tls_dir);
+        tls.server_names = vec![String::from("localhost")];
+        let config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls,
+        };
+
+        let report = server_doctor_report(&config).expect("doctor should pass");
+
+        assert!(report.contains("ok library_root"));
+        assert!(report.contains("ok state_dir"));
+        assert!(report.contains("ok tls_dir"));
+        assert!(report.contains("ok catalog_db"));
     }
 }

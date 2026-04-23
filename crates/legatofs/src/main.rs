@@ -18,6 +18,7 @@ use legato_types::{
     platform_error_code,
 };
 use serde::Deserialize;
+use tokio::{net::TcpStream, time::timeout};
 
 #[derive(Debug, Default, Deserialize)]
 struct ClientProcessConfig {
@@ -142,6 +143,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+    Cache {
+        action: CacheCommand,
+        config_path: Option<PathBuf>,
+    },
+    Doctor {
+        config_path: Option<PathBuf>,
+    },
     Install {
         bundle_dir: PathBuf,
         endpoint: Option<String>,
@@ -159,6 +167,12 @@ enum Command {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum CacheCommand {
+    Status,
+    Repair,
+}
+
 fn parse_command() -> Result<Option<Command>, Box<dyn std::error::Error>> {
     parse_command_impl(env::args().skip(1))
 }
@@ -173,6 +187,37 @@ where
     };
 
     match command.as_str() {
+        "cache" => {
+            let action = arguments
+                .next()
+                .ok_or("missing cache action: expected status or repair")?;
+            let action = match action.as_str() {
+                "status" => CacheCommand::Status,
+                "repair" => CacheCommand::Repair,
+                other => return Err(format!("unsupported cache action: {other}").into()),
+            };
+            let mut config_path = None;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--config" => config_path = arguments.next().map(PathBuf::from),
+                    other => return Err(format!("unsupported argument for cache: {other}").into()),
+                }
+            }
+            Ok(Some(Command::Cache {
+                action,
+                config_path,
+            }))
+        }
+        "doctor" => {
+            let mut config_path = None;
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--config" => config_path = arguments.next().map(PathBuf::from),
+                    other => return Err(format!("unsupported argument for doctor: {other}").into()),
+                }
+            }
+            Ok(Some(Command::Doctor { config_path }))
+        }
         "install" => {
             let mut bundle_dir = None;
             let mut endpoint = None;
@@ -246,6 +291,33 @@ where
 
 async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>> {
     match command {
+        Command::Cache {
+            action,
+            config_path,
+        } => {
+            let process_config = load_config::<ClientProcessConfig>(
+                config_path.as_deref().or(Some(default_config_path())),
+                "LEGATO_FS",
+            )?;
+            let report = match action {
+                CacheCommand::Status => cache_status_report(&process_config.mount)?,
+                CacheCommand::Repair => cache_repair_report(
+                    &process_config.mount,
+                    process_config.client.cache.max_bytes,
+                )?,
+            };
+            println!("{report}");
+            Ok(())
+        }
+        Command::Doctor { config_path } => {
+            let process_config = load_config::<ClientProcessConfig>(
+                config_path.as_deref().or(Some(default_config_path())),
+                "LEGATO_FS",
+            )?;
+            let report = client_doctor_report(&process_config).await?;
+            println!("{report}");
+            Ok(())
+        }
         Command::Install {
             bundle_dir,
             endpoint,
@@ -337,6 +409,99 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             Ok(())
         }
     }
+}
+
+async fn client_doctor_report(
+    process_config: &ClientProcessConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut lines = vec![String::from("legatofs doctor")];
+
+    require_readable_file(
+        "server CA",
+        Path::new(&process_config.client.tls.ca_cert_path),
+    )?;
+    require_readable_file(
+        "client certificate",
+        Path::new(&process_config.client.tls.client_cert_path),
+    )?;
+    require_readable_file(
+        "client private key",
+        Path::new(&process_config.client.tls.client_key_path),
+    )?;
+    lines.push(String::from("ok certs"));
+
+    require_writable_directory("state_dir", Path::new(&process_config.mount.state_dir))?;
+    require_writable_directory(
+        "extent_dir",
+        &Path::new(&process_config.mount.state_dir).join("extents"),
+    )?;
+    lines.push(format!("ok state_dir {}", process_config.mount.state_dir));
+
+    check_mount_prerequisite()?;
+    lines.push(String::from("ok mount_runtime"));
+
+    check_endpoint_reachable(&process_config.client.endpoint).await?;
+    lines.push(format!("ok endpoint {}", process_config.client.endpoint));
+
+    Ok(lines.join("\n"))
+}
+
+fn cache_status_report(mount: &MountConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
+    let store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
+    let extent_count: i64 =
+        store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM extent_entries", [], |row| row.get(0))?;
+    let bytes = store.total_size_bytes()?;
+    let dirty = store.is_dirty()?;
+    let checkpoint = store.load_checkpoint()?;
+    let checkpoint_text = checkpoint.map_or_else(
+        || String::from("none"),
+        |checkpoint| {
+            format!(
+                "version={} updated_at_ns={} extent_entries={} total_bytes={}",
+                checkpoint.version,
+                checkpoint.updated_at_ns,
+                checkpoint.extent_entries,
+                checkpoint.total_bytes
+            )
+        },
+    );
+
+    Ok(format!(
+        "legatofs cache status\nstate_dir {}\nextents {}\nbytes {}\ndirty {}\ncheckpoint {}",
+        mount.state_dir, extent_count, bytes, dirty, checkpoint_text
+    ))
+}
+
+fn cache_repair_report(
+    mount: &MountConfig,
+    max_cache_bytes: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
+    let mut store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let repair = store.repair()?;
+    let compaction = store.compact()?;
+    let eviction = store.evict_to_limit(max_cache_bytes)?;
+    let checkpoint = store.checkpoint(now_ns)?;
+
+    Ok(format!(
+        "legatofs cache repair\nrepaired_entries {}\nentries_removed {}\norphan_files_removed {}\nreclaimed_bytes {}\nstale_fetch_rows_removed {}\nstale_pins_removed {}\nempty_directories_removed {}\nevicted_entries {}\nbytes_after {}\ncheckpoint_updated_at_ns {}",
+        repair.repaired_entries,
+        repair.entries_removed,
+        repair.orphan_files_removed,
+        repair.reclaimed_bytes,
+        compaction.stale_fetch_rows_removed,
+        compaction.stale_pins_removed,
+        compaction.empty_directories_removed,
+        eviction.entries_removed,
+        checkpoint.total_bytes,
+        checkpoint.updated_at_ns
+    ))
 }
 
 fn startup_context(mount: &MountConfig) -> StartupContext {
@@ -505,6 +670,75 @@ fn install_client_bundle(
     Ok(())
 }
 
+fn require_readable_file(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.is_file() {
+        return Err(format!("{label} is not a readable file: {}", path.display()).into());
+    }
+    let _ = fs::File::open(path).map_err(|error| {
+        format!(
+            "{label} is not a readable file at {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn require_writable_directory(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(path)?;
+    let probe = path.join(".legato-doctor-write");
+    fs::write(&probe, b"ok")
+        .map_err(|error| format!("{label} is not writable at {}: {error}", path.display()))?;
+    let _ = fs::remove_file(probe);
+    Ok(())
+}
+
+fn check_mount_prerequisite() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        if !legato_fs_macos::mount_runtime_available() {
+            return Err("macFUSE runtime not detected".into());
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !legato_fs_windows::mount_runtime_available() {
+            return Err("WinFSP runtime not detected".into());
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = platform_error_code(ClientPlatform::Macos, FilesystemError::ReadOnly);
+    }
+    Ok(())
+}
+
+async fn check_endpoint_reachable(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = endpoint_socket(endpoint)?;
+    timeout(
+        std::time::Duration::from_secs(3),
+        TcpStream::connect(&socket),
+    )
+    .await
+    .map_err(|_| format!("endpoint timed out: {socket}"))?
+    .map_err(|error| format!("endpoint is not reachable at {socket}: {error}"))?;
+    Ok(())
+}
+
+fn endpoint_socket(endpoint: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let endpoint = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint);
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint.is_empty() {
+        return Err("client endpoint is empty".into());
+    }
+    if endpoint.rsplit_once(':').is_none() {
+        return Err(format!("client endpoint must include host:port: {endpoint}").into());
+    }
+    Ok(endpoint.to_owned())
+}
+
 fn copy_required_bundle_file(
     bundle_dir: &Path,
     cert_dir: &Path,
@@ -572,11 +806,14 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use super::{
-        ClientProcessConfig, Command, MountConfig, default_client_name, default_config_path,
-        default_library_root, default_mount_point, default_state_dir, install_client_bundle,
-        load_bundle_manifest, mount_root_attributes, parse_command_impl,
+        CacheCommand, ClientProcessConfig, Command, MountConfig, cache_repair_report,
+        cache_status_report, default_client_name, default_config_path, default_library_root,
+        default_mount_point, default_state_dir, endpoint_socket, install_client_bundle,
+        load_bundle_manifest, mount_root_attributes, open_cache_database, parse_command_impl,
         resolve_optional_install_value, resolve_required_install_value, startup_context,
     };
+    use legato_client_cache::ExtentCacheStore;
+    use legato_proto::{ExtentRecord, TransferClass};
     use legato_types::{FilesystemOperation, FilesystemSemantics};
     use tempfile::tempdir;
 
@@ -668,6 +905,51 @@ mod tests {
                 state_dir: PathBuf::from(default_state_dir()),
                 library_root: None,
                 force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_doctor_command() {
+        let command = parse_command_impl([
+            String::from("doctor"),
+            String::from("--config"),
+            String::from("/tmp/legatofs.toml"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Doctor {
+                config_path: Some(PathBuf::from("/tmp/legatofs.toml")),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cache_commands() {
+        let status = parse_command_impl([
+            String::from("cache"),
+            String::from("status"),
+            String::from("--config"),
+            String::from("/tmp/legatofs.toml"),
+        ])
+        .expect("status command should parse");
+        let repair = parse_command_impl([String::from("cache"), String::from("repair")])
+            .expect("repair command should parse");
+
+        assert_eq!(
+            status,
+            Some(Command::Cache {
+                action: CacheCommand::Status,
+                config_path: Some(PathBuf::from("/tmp/legatofs.toml")),
+            })
+        );
+        assert_eq!(
+            repair,
+            Some(Command::Cache {
+                action: CacheCommand::Repair,
+                config_path: None,
             })
         );
     }
@@ -779,5 +1061,59 @@ mod tests {
         assert!(config.contains("endpoint = \"legato.lan:7823\""));
         assert!(config.contains("server_name = \"legato.lan\""));
         assert!(config.contains("mount_point = \"/Volumes/Legato\""));
+    }
+
+    #[test]
+    fn endpoint_socket_accepts_plain_and_https_endpoints() {
+        assert_eq!(
+            endpoint_socket("legato.lan:7823").expect("endpoint should parse"),
+            "legato.lan:7823"
+        );
+        assert_eq!(
+            endpoint_socket("https://legato.lan:7823").expect("endpoint should parse"),
+            "legato.lan:7823"
+        );
+        assert!(endpoint_socket("legato.lan").is_err());
+    }
+
+    #[test]
+    fn cache_status_and_repair_report_extent_store_state() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let mount = MountConfig {
+            mount_point: String::from("/tmp/legato-mount"),
+            library_root: String::from("/srv/libraries"),
+            state_dir: fixture.path().join("state").to_string_lossy().into_owned(),
+        };
+        let database = open_cache_database(&PathBuf::from(&mount.state_dir).join("client.sqlite"))
+            .expect("cache database should open");
+        let mut store =
+            ExtentCacheStore::new(&PathBuf::from(&mount.state_dir).join("extents"), database)
+                .expect("extent store should open");
+        store
+            .put_extent(
+                &ExtentRecord {
+                    file_id: 7,
+                    extent_index: 0,
+                    file_offset: 0,
+                    data: b"fixture".to_vec(),
+                    extent_hash: Vec::new(),
+                    transfer_class: TransferClass::Unitary as i32,
+                },
+                1,
+                100,
+            )
+            .expect("extent should be stored");
+
+        let status = cache_status_report(&mount).expect("status should render");
+        let repair = cache_repair_report(&mount, 1024).expect("repair should render");
+
+        assert!(status.contains("extents 1"));
+        assert!(status.contains("dirty true"));
+        assert!(repair.contains("checkpoint_updated_at_ns"));
+        assert!(
+            cache_status_report(&mount)
+                .expect("status should render")
+                .contains("dirty false")
+        );
     }
 }
