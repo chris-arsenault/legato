@@ -45,7 +45,18 @@ jobs:
       - name: Install WinFsp
         shell: pwsh
         run: |
-          choco install winfsp --no-progress -y
+          $installed = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            choco install winfsp --no-progress -y
+            if ($LASTEXITCODE -eq 0) {
+              $installed = $true
+              break
+            }
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+          if (-not $installed) {
+            throw "WinFsp Chocolatey install failed after retries."
+          }
 
           $installDirCandidates = @(
             "${env:ProgramFiles(x86)}\WinFsp",
