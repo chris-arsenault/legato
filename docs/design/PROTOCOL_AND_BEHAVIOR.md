@@ -10,7 +10,7 @@ In scope:
 
 - read-only library access
 - native filesystem mounting on client machines
-- metadata resolution and block serving
+- metadata resolution and extent fetches
 - local caching
 - project-aware prefetch
 
@@ -37,7 +37,7 @@ Legato consists of:
 2. a native user-space filesystem client
 3. a project-aware prefetch tool
 
-The server indexes the library, serves metadata and file blocks, and emits invalidations. The client mounts the library, maintains the local cache, serves filesystem reads, and retries through reconnect or stale-handle cases. The prefetch tool analyzes project or plugin state and asks the local client runtime to warm the cache.
+The server indexes the library, serves metadata and semantic extents, and emits invalidations. The client mounts the library, maintains the local extent store, serves filesystem reads, and retries through reconnect or stale-handle cases. The prefetch tool analyzes project or plugin state and asks the local client runtime to warm the cache.
 
 ## Metadata And File Identity
 
@@ -51,15 +51,15 @@ The important behavioral rules are:
 
 File IDs are logical identifiers owned by the server index, not direct inode aliases.
 
-## Block Model
+## Extent Model
 
-Legato addresses data in block-aligned ranges:
+Legato addresses data in semantic extents:
 
-- blocks are keyed by file identity plus aligned offset
-- the current fixed block size is `1 MiB`
-- trailing blocks may be short at EOF
+- extents are keyed by file identity plus extent index
+- extent size is derived from the server-side layout decision
+- streamed files can be prefetched ahead of playback-sensitive reads
 
-The client cache stores those blocks locally and verifies integrity before use.
+The client extent store persists fetched extents locally and verifies integrity before use.
 
 ## Wire Behavior
 
@@ -69,14 +69,12 @@ The important request families are:
 
 - attach/session negotiation
 - stat, path resolution, and directory listing
-- open and close
-- streaming block reads
+- resolve and semantic extent fetch
 - explicit prefetch submission
 - invalidation subscription
 
 The key behavioral choices are:
 
-- block reads are server-streamed
 - path resolution exists independently of file open
 - prefetch is client-orchestrated and means client-cache residency, not just server warming
 - invalidations refresh correctness after library changes

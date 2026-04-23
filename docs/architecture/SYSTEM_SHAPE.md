@@ -111,11 +111,11 @@ Current crate roles:
 - `legato-types`
   Shared transport-neutral domain types.
 - `legato-server`
-  Server binary, metadata/index handling, block serving, invalidations, watcher behavior, and benchmarks/tests.
+  Server binary, metadata/index handling, extent fetches, invalidations, watcher behavior, and benchmarks/tests.
 - `legato-client-core`
   Shared client runtime, reconnect behavior, scheduling, invalidation handling, and local control-plane behavior.
 - `legato-client-cache`
-  Client-side block cache metadata, block storage, repair, and eviction logic.
+  Client-side extent metadata, local extent storage, repair, and eviction logic.
 - `legato-fs-macos`
   macOS adapter surface.
 - `legato-fs-windows`
@@ -244,6 +244,6 @@ These are intentional exclusions from the first implementation:
 - gRPC over a custom wire protocol:
   Chosen for typed contracts and simpler implementation unless a measured bottleneck proves otherwise.
 - Single server process over split services:
-  Chosen to keep deployment and debugging simple at MVP scope.
+  Chosen to keep deployment and debugging simple for a local single-user deployment.
 - Read-only semantics over write support:
-  Chosen because the primary product value is fast, predictable library reads rather than shared mutation workflows.
+  Chosen because the useful workflow is fast, predictable library reads rather than shared mutation workflows.

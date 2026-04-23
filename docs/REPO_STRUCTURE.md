@@ -14,7 +14,7 @@ This document describes the shape of the workspace so you can find the right cod
 ## Runtime Pieces
 
 - `crates/legato-server`
-  The server-side implementation. This is where library indexing, metadata APIs, block reads, invalidation fanout, TLS bootstrap, and watcher handling live.
+  The server-side implementation. This is where library indexing, metadata APIs, extent fetches, invalidation fanout, TLS bootstrap, and watcher handling live.
 - `crates/legatofs`
   The native client entrypoint. It wires together config loading, telemetry bootstrap, local cache/control-plane setup, and the platform adapter.
 - `crates/legato-prefetch`
@@ -25,7 +25,7 @@ This document describes the shape of the workspace so you can find the right cod
 - `crates/legato-client-core`
   Client runtime logic, reconnect handling, prefetch scheduling, and local control-plane behavior.
 - `crates/legato-client-cache`
-  SQLite-backed cache metadata, block storage, cache verification, eviction, and repair support.
+  SQLite-backed cache metadata, extent storage, cache verification, eviction, and repair support.
 
 ## Shared Foundations
 
@@ -48,7 +48,7 @@ This document describes the shape of the workspace so you can find the right cod
 - `crates/legato-server/tests/end_to_end.rs`
   Cross-crate integration coverage for the server, client cache/control plane, and prefetch path.
 - `crates/legato-server/benches/server_workloads.rs`
-  Benchmark targets for full scan, cold open, and playback-time block reads.
+  Benchmark targets for full scan, cold open, and semantic extent fetches.
 - Unit tests live alongside implementation files inside each crate.
 
 ## Deployment Docs

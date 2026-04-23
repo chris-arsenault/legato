@@ -28,7 +28,7 @@ cargo bench -p legato-server --no-run
 ## Shared CI Entry Points
 
 - `.github/workflows/ci.yml`
-  Minimal caller into Ahara's shared reusable workflow.
+  Shared CI plus native client package builds.
 - `platform.yml`
   Declares the project stack and deployable Rust binary artifact.
 - `Dockerfile`

@@ -4,7 +4,7 @@ Legato is a Rust workspace for serving a read-only sample library from a TrueNAS
 
 At a high level, this repo contains three things:
 
-- `legato-server`: the Docker-friendly server that indexes the library, serves metadata and blocks, and emits invalidations.
+- `legato-server`: the Docker-friendly server that indexes the library, serves metadata and extents, and emits invalidations.
 - `legatofs`: the native client binary that owns local cache state and mounts the remote library on end-user machines.
 - `legato-prefetch`: the project-aware helper that analyzes DAW or plugin state and warms the client cache before reads become latency-sensitive.
 
@@ -33,7 +33,7 @@ At a high level, this repo contains three things:
 - `crates/legato-client-core`
   Shared client runtime behavior, reconnect planning, prefetch scheduling, and local control-plane logic.
 - `crates/legato-client-cache`
-  SQLite-backed cache metadata, block storage, repair, and eviction primitives.
+  SQLite-backed cache metadata, extent storage, repair, and eviction primitives.
 - `crates/legato-foundation`
   Shared config loading, tracing, metrics, and shutdown helpers.
 - `crates/legato-proto`
@@ -56,13 +56,13 @@ At a high level, this repo contains three things:
 
 ## Current Scope
 
-This repository currently documents and implements the MVP shape:
+This repository is for a personal Legato deployment:
 
-- a Rust workspace
-- a SQLite-backed metadata and client-cache model
-- a Docker-oriented server deployment shape
-- native macOS and Windows client entrypoints
+- a Rust server container intended to run through Komodo on TrueNAS
+- a read-only sample-library view over the TrueNAS datasets
+- native macOS and Windows client binaries
+- SQLite-backed server/client metadata
+- local client extent storage for cached reads
 - project-aware prefetch planning
-- integration coverage and benchmark targets for the core flows
 
-The documentation here is meant to help you navigate the repo and understand its shape. It is not intended to replace reading the code in the crates that implement each subsystem.
+The docs should describe the local workflow and the repo structure. They are not a public release plan and should not invent optional deployment modes that are not needed for this setup.

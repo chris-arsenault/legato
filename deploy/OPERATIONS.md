@@ -112,10 +112,9 @@ The base example is [deploy/server/server.toml.example](/home/dev/repos/legato/d
 - `server.tls.*`: mTLS certificate chain and client CA
 - `common.metrics.bind_address`: optional Prometheus scrape endpoint
 
-Recommended overrides for production:
+Recommended defaults for this local deployment:
 
 - Keep `common.tracing.level=info` by default and raise to `debug` only during incident work.
-- Use a dedicated client CA for Legato mounts rather than a shared internal PKI root.
 - Keep the library mount read-only inside the container so the server cannot mutate the sample dataset.
 
 ## Server State Layout
@@ -143,14 +142,14 @@ Under `/etc/legato/certs`, the expected durable layout is:
 - macOS default mount point: `/Volumes/Legato`
 - Windows default mount point: `L:\Legato`
 
-Client validation flow:
+Client setup flow:
 
 1. Install the native binary.
 2. Issue a bundle from the server with `legato-server issue-client`.
 3. Run `legatofs install` with the issued bundle.
 4. Start the mount agent.
 5. Verify the mount root appears and resolves indexed paths.
-6. Run `legato-prefetch analyze <project>` against one representative session.
+6. Run `legato-prefetch analyze <project>` against one representative session if prefetch is part of the current workflow.
 
 Replacement flow:
 
@@ -199,17 +198,17 @@ Client-side cache maintenance now supports:
 Operational recovery steps:
 
 1. Stop the client service if corruption is suspected.
-2. Use surfaced client maintenance tooling once it exists, or remove only the local client state directory if a clean rebuild is faster.
+2. Until maintenance commands exist, remove only the local client state directory if a clean rebuild is faster.
 3. Restart the client and verify reconnect/open/prefetch flow.
 4. If the server restarted, expect a root invalidation and stale-handle reopen cycle on the client side.
 
 ## Benchmarking
 
-The benchmark suite currently focuses on the three workloads that matter for the current v1 store model:
+The benchmark suite currently focuses on the workloads useful for local tuning:
 
 - full library reconciliation scan
 - cold metadata open
-- playback-time aligned block reads
+- semantic extent fetches
 
 Run:
 
@@ -233,6 +232,7 @@ Those tests verify:
 
 - indexed server metadata can feed the client-side prefetch path
 - `legato-prefetch` analysis hints can drive a real prefetch execution against server reads
+- mounted cold reads reuse persisted client extent state after restart
 
 ## Upgrade Sequence
 

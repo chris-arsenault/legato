@@ -24,7 +24,7 @@ This document defines the installation and upgrade shape for the native Legato c
 
 ## macOS
 
-- Packaging format: signed `.pkg`
+- Packaging format: `.pkg`
 - Installed binary target: `/usr/local/bin/legatofs`
 - Installed registration helper: `/usr/local/bin/legato-register-client`
 - Config root: `/Library/Application Support/Legato`
@@ -35,7 +35,7 @@ This document defines the installation and upgrade shape for the native Legato c
   `legatofs install --bundle-dir <bundle>`
 - Packaged registration helper:
   `legato-register-client --bundle-dir <bundle>`
-- Startup model: packaged binary plus bundle/config hydration through the shared install command; persistent service registration remains a later step once the runtime is a persistent mount daemon
+- Startup model: packaged binary plus bundle/config hydration through the shared install command. Automatic startup is not implemented yet.
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
   - replace the binary in place
@@ -59,7 +59,7 @@ This document defines the installation and upgrade shape for the native Legato c
 - Client-bundle install command:
   `legatofs.exe install --bundle-dir <bundle>`
 - If the installer is given a valid bundle directory, it runs `legatofs.exe install` automatically during setup.
-- Startup model: packaged binary plus install-time bundle/config hydration through the shared install command; persistent service registration remains a later step once the runtime is a persistent mount daemon
+- Startup model: packaged binary plus install-time bundle/config hydration through the shared install command. Automatic startup is not implemented yet.
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
   - replace the binary in place
