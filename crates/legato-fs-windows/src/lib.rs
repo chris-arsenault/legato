@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
@@ -50,7 +51,7 @@ pub struct WindowsFilesystem {
 /// Shared mount state used by the Windows runtime adapter.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct WindowsMountService {
-    service: Mutex<FilesystemService>,
+    service: Arc<Mutex<FilesystemService>>,
     library_root: String,
     #[cfg(target_os = "windows")]
     runtime: Runtime,
@@ -279,9 +280,9 @@ impl WindowsFilesystem {
 impl WindowsMountService {
     /// Creates one shared mount service around the connected filesystem runtime.
     #[must_use]
-    pub fn new(service: FilesystemService, library_root: impl Into<String>) -> Self {
+    pub fn new(service: Arc<Mutex<FilesystemService>>, library_root: impl Into<String>) -> Self {
         Self {
-            service: Mutex::new(service),
+            service,
             library_root: library_root.into(),
             #[cfg(target_os = "windows")]
             runtime: Builder::new_current_thread()
@@ -307,7 +308,7 @@ pub fn mount_runtime_available() -> bool {
 /// Mounts the Legato filesystem on Windows and blocks until the mount exits.
 #[cfg(target_os = "windows")]
 pub async fn mount(
-    service: FilesystemService,
+    service: Arc<Mutex<FilesystemService>>,
     mount_point: impl AsRef<Path>,
     library_root: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {

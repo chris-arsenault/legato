@@ -11,7 +11,7 @@ This document is the deployment and recovery guide for running Legato as a Docke
 - The canonical Legato store lives under `/var/lib/legato`.
 - TLS materials live under `/etc/legato/certs`.
 - `legatofs` runs natively on client machines and maintains a local Legato store under the configured state root.
-- Supported project and preset opens trigger integrated prefetch through the mounted client. `legato-prefetch` remains available as optional manual tooling.
+- Supported project and preset opens trigger integrated prefetch through the mounted client. `legato-prefetch` remains available as optional manual tooling, but it requests warm-up through the mounted runtime rather than acting as a second cache writer.
 
 ## TrueNAS + Komodo
 
@@ -136,7 +136,7 @@ Client setup flow:
 3. Run `legatofs install` with the issued bundle.
 4. Start the mount agent.
 5. Verify the mount root appears and resolves indexed paths.
-6. Open one representative project or preset through the mounted filesystem and confirm its referenced sample content becomes resident. Use `legato-prefetch run <project> --config <path-to-legatofs.toml>` only as an explicit diagnostic or manual warm-up tool.
+6. Open one representative project or preset through the mounted filesystem and confirm its referenced sample content becomes resident. Use `legato-prefetch run <mounted-project-path> --config <path-to-legatofs.toml>` only as an explicit diagnostic or manual warm-up request while the mount agent is running.
 
 Replacement flow:
 

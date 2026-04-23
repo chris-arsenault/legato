@@ -6,7 +6,7 @@ At a high level, this repo contains three runtime pieces:
 
 - `legato-server`: the containerized TrueNAS-side daemon that serves the canonical store, publishes catalog records, streams extent records, and issues client bundles.
 - `legatofs`: the native client binary that mounts the library, maintains the local Legato store, and serves reads from resident extents.
-- `legato-prefetch`: the project-aware parser and prefetch engine used by mount-triggered project opens and optional manual tooling.
+- `legato-prefetch`: the project-aware parser and prefetch engine used by mount-triggered project opens and optional manual tooling routed through the mounted client runtime.
 
 ## Contents
 
@@ -28,7 +28,7 @@ At a high level, this repo contains three runtime pieces:
 - `crates/legatofs`
   Native client entrypoint and mount bootstrap for macOS and Windows adapters.
 - `crates/legato-prefetch`
-  Project parsing and prefetch logic for ALS, NKI, and plugin-state inputs, plus the optional CLI wrapper.
+  Project parsing and prefetch logic for ALS, NKI, and plugin-state inputs, plus the optional CLI wrapper that asks the mounted client runtime to warm residency.
 - `crates/legato-client-core`
   Shared client runtime behavior, reconnect planning, prefetch scheduling, and local control-plane logic.
 - `crates/legato-client-cache`

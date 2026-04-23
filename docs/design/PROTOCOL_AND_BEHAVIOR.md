@@ -102,7 +102,7 @@ Directory listing and stat calls are served from catalog state.
 
 ## Prefetch Behavior
 
-When the mounted client opens a supported project or preset, `legato-prefetch` analyzes that input and emits prioritized residency work. The same logic is also exposed as an optional CLI.
+When the mounted client opens a supported project or preset, `legato-prefetch` analyzes that input and emits prioritized residency work. The same logic is also exposed as an optional CLI, but manual requests are forwarded to the mounted client runtime instead of writing local residency state directly.
 
 Input families:
 

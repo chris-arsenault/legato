@@ -4,24 +4,28 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::client_store::ClientLegatoStore;
-use legato_client_core::{
-    ClientConfig, ClientRuntimeMetrics, FilesystemService, LocalControlPlane,
-};
+use legato_client_core::{ClientConfig, ClientRuntimeMetrics, FilesystemService};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
-use legato_proto::FileMetadata;
-use legato_server::ClientBundleManifest;
-use legato_types::{
-    ClientPlatform, FileId, FilesystemAttributes, FilesystemError, FilesystemSemantics,
-    platform_error_code,
+use legato_prefetch::{
+    PrefetchControlEndpoint, PrefetchControlRequest, PrefetchControlResponse,
+    prefetch_project_path, write_control_endpoint,
 };
+use legato_server::ClientBundleManifest;
+use legato_types::{ClientPlatform, FilesystemError, FilesystemSemantics, platform_error_code};
 use serde::Deserialize;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    sync::Mutex,
+    time::timeout,
+};
 
 #[derive(Debug, Default, Deserialize)]
 struct ClientProcessConfig {
@@ -77,26 +81,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
 
+    #[allow(unused_variables)]
     let startup = startup_context(&process_config.mount);
-    let control = control_plane_for_mount(&process_config.mount, startup.semantics)?;
     let client_name = default_client_name();
     let client_metrics = ClientRuntimeMetrics::new("legatofs", &telemetry);
-    let service = FilesystemService::connect_with_metrics(
-        process_config.client.clone(),
-        &client_name,
-        Path::new(&process_config.mount.state_dir),
-        Some(client_metrics),
-    )
-    .await?;
-    let server_name = service.server_name().to_owned();
+    let service = Arc::new(Mutex::new(
+        FilesystemService::connect_with_metrics(
+            process_config.client.clone(),
+            &client_name,
+            Path::new(&process_config.mount.state_dir),
+            Some(client_metrics),
+        )
+        .await?,
+    ));
+    let server_name = service.lock().await.server_name().to_owned();
 
     #[cfg(target_os = "macos")]
     {
         let adapter = legato_fs_macos::MacosFilesystem::new(startup.mount_point.clone());
-        let _ = control;
         if !legato_fs_macos::mount_runtime_available() {
             return Err("macFUSE runtime not detected on this host".into());
         }
+        let _prefetch_control =
+            spawn_prefetch_control_server(&process_config.mount, Arc::clone(&service)).await?;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and mounting on {} for {}",
@@ -115,10 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     {
         let adapter = legato_fs_windows::WindowsFilesystem::new(startup.mount_point.clone());
-        let _ = control;
         if !legato_fs_windows::mount_runtime_available() {
             return Err("WinFSP runtime not detected on this host".into());
         }
+        let _prefetch_control =
+            spawn_prefetch_control_server(&process_config.mount, Arc::clone(&service)).await?;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and mounting on {} for {}",
@@ -137,7 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = service;
-        let _ = control;
         telemetry.set_lifecycle_state("ready", 1);
         println!(
             "legatofs connected to {} and bootstrap ready for unsupported-host development",
@@ -787,17 +794,60 @@ fn startup_context(mount: &MountConfig) -> StartupContext {
     }
 }
 
-fn control_plane_for_mount(
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+async fn spawn_prefetch_control_server(
     mount: &MountConfig,
-    semantics: FilesystemSemantics,
-) -> Result<LocalControlPlane, Box<dyn std::error::Error>> {
-    let _store = ClientLegatoStore::open(&mount.state_dir, now_unix_ns())?;
-    let mut control = LocalControlPlane::new(legato_client_cache::MetadataCache::new(
-        legato_client_cache::MetadataCachePolicy::default(),
-    ));
-    let now_ns = now_unix_ns();
-    control.register_path(mount_root_attributes(mount, semantics), now_ns);
-    Ok(control)
+    service: Arc<Mutex<FilesystemService>>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let endpoint = PrefetchControlEndpoint {
+        host: String::from("127.0.0.1"),
+        port: listener.local_addr()?.port(),
+    };
+    write_control_endpoint(Path::new(&mount.state_dir), &endpoint)?;
+    Ok(tokio::spawn(async move {
+        loop {
+            let Ok((stream, _peer)) = listener.accept().await else {
+                break;
+            };
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                if let Err(error) = handle_prefetch_control_connection(stream, service).await {
+                    eprintln!("legatofs local prefetch control request failed: {error}");
+                }
+            });
+        }
+    }))
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+async fn handle_prefetch_control_connection(
+    stream: tokio::net::TcpStream,
+    service: Arc<Mutex<FilesystemService>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut request = Vec::new();
+    let mut reader = BufReader::new(stream);
+    reader.read_until(b'\n', &mut request).await?;
+    let mut stream = reader.into_inner();
+    let request: PrefetchControlRequest = serde_json::from_slice(&request)?;
+    let report = {
+        let mut service = service.lock().await;
+        prefetch_project_path(&mut service, &request.project_path).await
+    };
+    let response = match report {
+        Ok(report) => PrefetchControlResponse {
+            report: Some(report),
+            error: None,
+        },
+        Err(error) => PrefetchControlResponse {
+            report: None,
+            error: Some(error.to_string()),
+        },
+    };
+    let mut response = serde_json::to_vec(&response)?;
+    response.push(b'\n');
+    stream.write_all(&response).await?;
+    Ok(())
 }
 
 fn now_unix_ns() -> u64 {
@@ -806,9 +856,13 @@ fn now_unix_ns() -> u64 {
         .map_or(0, |duration| duration.as_nanos() as u64)
 }
 
-fn mount_root_attributes(mount: &MountConfig, semantics: FilesystemSemantics) -> FileMetadata {
-    let attributes = FilesystemAttributes {
-        file_id: FileId(1),
+#[cfg(test)]
+fn mount_root_attributes(
+    mount: &MountConfig,
+    semantics: FilesystemSemantics,
+) -> legato_proto::FileMetadata {
+    let attributes = legato_types::FilesystemAttributes {
+        file_id: legato_types::FileId(1),
         path: PathBuf::from(&mount.library_root),
         is_dir: true,
         size: 0,
@@ -817,7 +871,7 @@ fn mount_root_attributes(mount: &MountConfig, semantics: FilesystemSemantics) ->
         read_only: semantics.read_only,
     };
 
-    FileMetadata {
+    legato_proto::FileMetadata {
         file_id: attributes.file_id.0,
         path: attributes.path.to_string_lossy().into_owned(),
         size: attributes.size,

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
@@ -34,7 +35,7 @@ pub struct MacosFilesystem {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug)]
 pub struct MacosMountService {
-    service: Mutex<FilesystemService>,
+    service: Arc<Mutex<FilesystemService>>,
     library_root: String,
 }
 
@@ -243,9 +244,9 @@ impl MacosFilesystem {
 impl MacosMountService {
     /// Creates one shared mount service around the connected filesystem runtime.
     #[must_use]
-    pub fn new(service: FilesystemService, library_root: impl Into<String>) -> Self {
+    pub fn new(service: Arc<Mutex<FilesystemService>>, library_root: impl Into<String>) -> Self {
         Self {
-            service: Mutex::new(service),
+            service,
             library_root: library_root.into(),
         }
     }
@@ -266,7 +267,7 @@ pub fn mount_runtime_available() -> bool {
 /// Mounts the Legato filesystem on macOS and blocks until the mount exits.
 #[cfg(target_os = "macos")]
 pub async fn mount(
-    service: FilesystemService,
+    service: Arc<Mutex<FilesystemService>>,
     mount_point: impl AsRef<Path>,
     library_root: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {

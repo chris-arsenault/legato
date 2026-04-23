@@ -1132,6 +1132,7 @@ dependencies = [
  "legato-foundation",
  "legato-fs-macos",
  "legato-fs-windows",
+ "legato-prefetch",
  "legato-proto",
  "legato-server",
  "legato-types",

@@ -58,7 +58,7 @@ The client store is a partial replica. It can contain metadata for more files th
 
 ### `legato-prefetch`
 
-`legato-prefetch` owns project parsing and residency planning. The mounted client invokes it automatically when a supported project or preset is opened. The CLI remains available for manual analysis or explicit warm-up.
+`legato-prefetch` owns project parsing and residency planning. The mounted client invokes it automatically when a supported project or preset is opened. The CLI remains available for manual analysis or explicit warm-up requests, but residency changes still flow through the mounted client runtime.
 
 Responsibilities:
 
@@ -69,7 +69,7 @@ Responsibilities:
 - ask the local client runtime to make selected extents resident
 - optionally wait until selected priorities are resident
 
-`legato-prefetch` is shared logic with an optional CLI wrapper, not a standalone service.
+`legato-prefetch` is shared logic with an optional CLI wrapper, not a standalone service. The mounted runtime remains the single writer for the local store.
 
 ## Deployment Shape
 

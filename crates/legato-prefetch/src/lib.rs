@@ -6,14 +6,16 @@ use std::{
     time::Instant,
 };
 
-use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{
-    ClientConfig, ClientRuntimeMetrics, FilesystemOpenHandle, FilesystemService,
-    PrefetchMetricsReport,
+    ClientRuntimeMetrics, FilesystemOpenHandle, FilesystemService, PrefetchMetricsReport,
 };
 use legato_foundation::load_config;
 use legato_types::{PrefetchHintPath, PrefetchPriority};
 use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+};
 
 mod analyzers;
 
@@ -129,7 +131,7 @@ pub enum PrefetchCommand {
 }
 
 /// Summary of one real local prefetch run.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExecutionReport {
     /// Hints accepted for processing after analysis.
     pub accepted: usize,
@@ -145,10 +147,33 @@ pub struct ExecutionReport {
     pub bytes_fetched: u64,
 }
 
+/// Local control endpoint published by the mounted runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PrefetchControlEndpoint {
+    /// Loopback host serving the local control API.
+    pub host: String,
+    /// TCP port serving the local control API.
+    pub port: u16,
+}
+
+/// One local prefetch request sent to the mounted runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PrefetchControlRequest {
+    /// Canonical project path to prefetch through the mounted runtime.
+    pub project_path: String,
+}
+
+/// One local prefetch response returned by the mounted runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PrefetchControlResponse {
+    /// Completed execution report when the request succeeded.
+    pub report: Option<ExecutionReport>,
+    /// Human-readable error when the request failed.
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PrefetchClientProcessConfig {
-    #[serde(default)]
-    client: ClientConfig,
     #[serde(default)]
     mount: PrefetchMountConfig,
 }
@@ -157,12 +182,18 @@ struct PrefetchClientProcessConfig {
 struct PrefetchMountConfig {
     #[serde(default = "default_state_dir")]
     state_dir: String,
+    #[serde(default = "default_mount_point")]
+    mount_point: String,
+    #[serde(default = "default_library_root")]
+    library_root: String,
 }
 
 impl Default for PrefetchMountConfig {
     fn default() -> Self {
         Self {
             state_dir: default_state_dir(),
+            mount_point: default_mount_point(),
+            library_root: default_library_root(),
         }
     }
 }
@@ -321,7 +352,8 @@ pub fn run_cli_command_with_metrics(
         } => {
             let mut analysis = analyze_project(&project_path)?;
             analysis.wait_through = wait_through;
-            let execution = execute_analysis(&analysis, config_path.as_deref(), metrics)?;
+            let execution =
+                execute_analysis(&project_path, &analysis, config_path.as_deref(), metrics)?;
             Ok(CommandResult {
                 exit_code: 0,
                 output: render_execution(&analysis, &execution, json)?,
@@ -348,9 +380,10 @@ pub fn supports_project_prefetch(path: &Path) -> bool {
 }
 
 fn execute_analysis(
+    project_path: &Path,
     analysis: &ProjectAnalysis,
     config_path: Option<&Path>,
-    metrics: Option<ClientRuntimeMetrics>,
+    _metrics: Option<ClientRuntimeMetrics>,
 ) -> Result<ExecutionReport, PrefetchError> {
     let config_path = config_path
         .map(Path::to_path_buf)
@@ -362,7 +395,11 @@ fn execute_analysis(
         .enable_all()
         .build()
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    runtime.block_on(execute_analysis_live(analysis, process_config, metrics))
+    runtime.block_on(execute_analysis_live(
+        project_path,
+        analysis,
+        process_config,
+    ))
 }
 
 /// Executes integrated project prefetch for one already-opened project handle.
@@ -412,47 +449,34 @@ pub async fn prefetch_opened_project(
     Ok(Some(report))
 }
 
+/// Executes project prefetch for one canonical project path through the mounted runtime.
+pub async fn prefetch_project_path(
+    service: &mut FilesystemService,
+    project_path: &str,
+) -> Result<ExecutionReport, PrefetchError> {
+    let handle = service
+        .open(project_path)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let report = prefetch_opened_project(service, &handle)
+        .await?
+        .unwrap_or_default();
+    service
+        .release(handle.local_handle)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    Ok(report)
+}
+
 async fn execute_analysis_live(
+    project_path: &Path,
     analysis: &ProjectAnalysis,
     process_config: PrefetchClientProcessConfig,
-    metrics: Option<ClientRuntimeMetrics>,
 ) -> Result<ExecutionReport, PrefetchError> {
-    let started = Instant::now();
-    let state_dir = PathBuf::from(&process_config.mount.state_dir);
-    let bytes_before = local_extent_bytes(&state_dir)?;
-    let mut service = FilesystemService::connect_with_metrics(
-        process_config.client,
-        default_client_name(),
-        Path::new(&process_config.mount.state_dir),
-        metrics,
-    )
-    .await
-    .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    let mut report = ExecutionReport::default();
-
-    for hint in scheduled_hints(
-        analysis
-            .hints
-            .clone()
-            .into_iter()
-            .map(PrefetchHintPath::from)
-            .collect(),
-    ) {
-        report.accepted += 1;
-        match prefetch_one_hint(&mut service, &state_dir, &hint).await {
-            Ok(PrefetchHintOutcome::AlreadyResident) => report.skipped += 1,
-            Ok(PrefetchHintOutcome::Completed { bytes_read }) => {
-                report.completed += 1;
-                report.bytes_read = report.bytes_read.saturating_add(bytes_read);
-            }
-            Err(_error) => report.failed += 1,
-        }
-    }
-
-    let bytes_after = local_extent_bytes(&state_dir)?;
-    report.bytes_fetched = bytes_after.saturating_sub(bytes_before);
-    record_prefetch_metrics(&service, &report, started.elapsed().as_nanos() as u64);
-    Ok(report)
+    let _ = analysis;
+    let endpoint = read_control_endpoint(Path::new(&process_config.mount.state_dir))?;
+    let project_path = control_project_path(project_path, &process_config.mount)?;
+    request_control_prefetch(&endpoint, &project_path).await
 }
 
 fn render_analysis(analysis: &ProjectAnalysis, json: bool) -> Result<String, PrefetchError> {
@@ -492,46 +516,6 @@ fn render_execution(
     ))
 }
 
-enum PrefetchHintOutcome {
-    AlreadyResident,
-    Completed { bytes_read: u64 },
-}
-
-async fn prefetch_one_hint(
-    service: &mut FilesystemService,
-    state_dir: &Path,
-    hint: &PrefetchHintPath,
-) -> Result<PrefetchHintOutcome, PrefetchError> {
-    let handle = service
-        .open(hint.path.to_string_lossy().as_ref())
-        .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    if hint_already_resident(state_dir, &handle, hint)? {
-        service
-            .release(handle.local_handle)
-            .await
-            .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-        return Ok(PrefetchHintOutcome::AlreadyResident);
-    }
-
-    let read_size = hint
-        .length
-        .max(1)
-        .min(u64::from(u32::MAX))
-        .min(handle.size.saturating_sub(hint.file_offset)) as u32;
-    let bytes = service
-        .read(handle.local_handle, hint.file_offset, read_size)
-        .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    service
-        .release(handle.local_handle)
-        .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    Ok(PrefetchHintOutcome::Completed {
-        bytes_read: bytes.len() as u64,
-    })
-}
-
 async fn prefetch_one_hint_inline(
     service: &mut FilesystemService,
     hint: &PrefetchHintPath,
@@ -556,42 +540,81 @@ async fn prefetch_one_hint_inline(
     Ok(bytes.len() as u64)
 }
 
-fn hint_already_resident(
-    state_dir: &Path,
-    handle: &FilesystemOpenHandle,
-    hint: &PrefetchHintPath,
-) -> Result<bool, PrefetchError> {
-    let required = handle
-        .extents
-        .iter()
-        .filter(|extent| {
-            let extent_end = extent.file_offset.saturating_add(extent.length);
-            let hint_end = hint.file_offset.saturating_add(hint.length.max(1));
-            extent.file_offset < hint_end && extent_end > hint.file_offset
-        })
-        .collect::<Vec<_>>();
-    if required.is_empty() {
-        return Ok(false);
-    }
-
-    let store = ClientLegatoStore::open(state_dir, 0)
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    for extent in required {
-        if store
-            .get_extent(handle.file_id, extent.extent_index)
-            .map_err(|error| PrefetchError::Runtime(error.to_string()))?
-            .is_none()
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// Returns the local control endpoint manifest path under the client state directory.
+#[must_use]
+pub fn control_endpoint_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("prefetch-control.json")
 }
 
-fn local_extent_bytes(state_dir: &Path) -> Result<u64, PrefetchError> {
-    ClientLegatoStore::open(state_dir, 0)
-        .map(|store| store.resident_bytes())
+/// Writes the mounted runtime control endpoint manifest.
+pub fn write_control_endpoint(
+    state_dir: &Path,
+    endpoint: &PrefetchControlEndpoint,
+) -> Result<(), PrefetchError> {
+    fs::write(
+        control_endpoint_path(state_dir),
+        serde_json::to_vec(endpoint).map_err(|error| PrefetchError::Runtime(error.to_string()))?,
+    )
+    .map_err(PrefetchError::Io)
+}
+
+/// Loads the mounted runtime control endpoint manifest.
+pub fn read_control_endpoint(state_dir: &Path) -> Result<PrefetchControlEndpoint, PrefetchError> {
+    serde_json::from_slice(&fs::read(control_endpoint_path(state_dir))?)
         .map_err(|error| PrefetchError::Runtime(error.to_string()))
+}
+
+/// Sends one canonical project-prefetch request to the mounted runtime control surface.
+pub async fn request_control_prefetch(
+    endpoint: &PrefetchControlEndpoint,
+    project_path: &str,
+) -> Result<ExecutionReport, PrefetchError> {
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let mut request = serde_json::to_vec(&PrefetchControlRequest {
+        project_path: String::from(project_path),
+    })
+    .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    request.push(b'\n');
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let mut response = Vec::new();
+    BufReader::new(stream)
+        .read_until(b'\n', &mut response)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let response: PrefetchControlResponse = serde_json::from_slice(&response)
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    match (response.report, response.error) {
+        (Some(report), None) => Ok(report),
+        (_, Some(error)) => Err(PrefetchError::Runtime(error)),
+        (None, None) => Err(PrefetchError::Runtime(String::from(
+            "prefetch control response did not include a report",
+        ))),
+    }
+}
+
+fn control_project_path(
+    project_path: &Path,
+    mount: &PrefetchMountConfig,
+) -> Result<String, PrefetchError> {
+    let mount_point = Path::new(&mount.mount_point);
+    let suffix = project_path.strip_prefix(mount_point).map_err(|_error| {
+        PrefetchError::InvalidCli(format!(
+            "project path must be inside the mounted Legato filesystem: {}",
+            mount_point.display()
+        ))
+    })?;
+    let mut canonical = PathBuf::from(&mount.library_root);
+    for component in suffix.components() {
+        if let std::path::Component::Normal(segment) = component {
+            canonical.push(segment);
+        }
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 fn record_prefetch_metrics(service: &FilesystemService, report: &ExecutionReport, elapsed_ns: u64) {
@@ -654,6 +677,25 @@ fn default_config_path() -> PathBuf {
     }
 }
 
+fn default_mount_point() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return String::from("/Volumes/Legato");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return String::from("L:\\Legato");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        String::from("/tmp/legato")
+    }
+}
+
+fn default_library_root() -> String {
+    String::from("/")
+}
+
 fn default_state_dir() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -669,15 +711,6 @@ fn default_state_dir() -> String {
     }
 }
 
-fn default_client_name() -> String {
-    std::env::var("LEGATO_CLIENT_NAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| String::from("legato-prefetch"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, io::Write, path::Path};
@@ -686,9 +719,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        KontaktVersion, PrefetchCommand, ProjectAnalysis, ProjectFormat, analyze_project,
-        detect_kontakt_version, parse_cli_args, project_analyzer_registry,
-        supports_project_prefetch,
+        KontaktVersion, PrefetchCommand, PrefetchControlEndpoint, PrefetchMountConfig,
+        ProjectAnalysis, ProjectFormat, analyze_project, control_project_path,
+        detect_kontakt_version, parse_cli_args, project_analyzer_registry, read_control_endpoint,
+        supports_project_prefetch, write_control_endpoint,
     };
     use legato_types::PrefetchPriority;
 
@@ -844,5 +878,34 @@ mod tests {
         assert!(supports_project_prefetch(Path::new("piano.nki")));
         assert!(supports_project_prefetch(Path::new("preset.vstpreset")));
         assert!(!supports_project_prefetch(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn control_project_path_maps_mount_paths_into_logical_namespace() {
+        let mount = PrefetchMountConfig {
+            state_dir: String::from("/tmp/legato-state"),
+            mount_point: String::from("/Volumes/Legato"),
+            library_root: String::from("/"),
+        };
+
+        let mapped =
+            control_project_path(Path::new("/Volumes/Legato/Projects/session.als"), &mount)
+                .expect("mounted project path should map");
+
+        assert_eq!(mapped, "/Projects/session.als");
+    }
+
+    #[test]
+    fn control_endpoint_manifest_round_trips() {
+        let temp = tempdir().expect("tempdir should be created");
+        let endpoint = PrefetchControlEndpoint {
+            host: String::from("127.0.0.1"),
+            port: 9464,
+        };
+
+        write_control_endpoint(temp.path(), &endpoint).expect("endpoint should be written");
+        let loaded = read_control_endpoint(temp.path()).expect("endpoint should load");
+
+        assert_eq!(loaded, endpoint);
     }
 }
