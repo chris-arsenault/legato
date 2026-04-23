@@ -527,6 +527,12 @@ impl PrefetchExecutor {
             for extent in plan.missing {
                 let data = source(&extent);
                 let cached = coordinator.complete_extent(store, &extent, &data)?;
+                store.pin_extent(
+                    cached.file_id,
+                    cached.extent_index,
+                    entry.priority,
+                    self.execution_generation,
+                )?;
                 self.residency.insert(
                     PrefetchKey {
                         file_id: cached.file_id,
@@ -537,6 +543,12 @@ impl PrefetchExecutor {
             }
 
             for extent in plan.cached {
+                store.pin_extent(
+                    extent.file_id,
+                    extent.extent_index,
+                    entry.priority,
+                    self.execution_generation,
+                )?;
                 self.residency.insert(
                     PrefetchKey {
                         file_id: extent.file_id,

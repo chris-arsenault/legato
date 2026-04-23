@@ -1,12 +1,12 @@
 //! Client partial-replica store built on Legato catalog and segment records.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{cmp::Ordering, collections::BTreeMap, fs, path::Path};
 
 use legato_proto::{
     ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, InodeMetadata, InvalidationEvent,
     InvalidationKind,
 };
-use legato_types::FileId;
+use legato_types::{FileId, PrefetchPriority};
 
 use crate::catalog::{
     CatalogExtent, CatalogFileState, CatalogInode, CatalogStore, CatalogStoreError,
@@ -143,6 +143,37 @@ impl ClientLegatoStore {
             data,
             payload_hash: extent.payload_hash.clone(),
         }))
+    }
+
+    /// Records one local access against a resident extent for recency-aware eviction.
+    pub fn touch_extent(
+        &mut self,
+        file_id: FileId,
+        extent_index: u32,
+        last_access_ns: u64,
+    ) -> Result<(), CatalogStoreError> {
+        self.update_extent_metadata(file_id, extent_index, |extent| {
+            extent.last_access_ns = extent.last_access_ns.max(last_access_ns);
+        })
+    }
+
+    /// Pins one extent to the supplied active-project generation and priority.
+    pub fn pin_extent(
+        &mut self,
+        file_id: FileId,
+        extent_index: u32,
+        priority: PrefetchPriority,
+        pin_generation: u64,
+    ) -> Result<(), CatalogStoreError> {
+        self.update_extent_metadata(file_id, extent_index, |extent| {
+            let priority = prefetch_priority_ordinal(priority);
+            if extent.pin_generation == pin_generation {
+                extent.pin_priority = extent.pin_priority.min(priority);
+            } else {
+                extent.pin_generation = pin_generation;
+                extent.pin_priority = priority;
+            }
+        })
     }
 
     /// Returns total logical resident payload bytes currently referenced by active inodes.
@@ -338,37 +369,70 @@ impl ClientLegatoStore {
             return Ok(before);
         }
 
+        let active_pin_generation = self
+            .catalog
+            .active_inodes()
+            .into_iter()
+            .flat_map(|inode| inode.extents.into_iter())
+            .filter(|extent| extent.is_resident())
+            .map(|extent| extent.pin_generation)
+            .max()
+            .unwrap_or(0);
         let mut remaining = before.resident_bytes_before;
+        let mut changed_file_ids = BTreeMap::new();
         let mut removed_extents = 0_usize;
         let mut removed_bytes = 0_u64;
-        for mut inode in self.catalog.active_inodes() {
+        let mut inodes = self
+            .catalog
+            .active_inodes()
+            .into_iter()
+            .filter(|inode| !inode.is_dir)
+            .map(|inode| (inode.file_id, inode))
+            .collect::<BTreeMap<_, _>>();
+        let mut candidates = inodes
+            .iter()
+            .flat_map(|(file_id, inode)| {
+                inode.extents.iter().filter_map(|extent| {
+                    extent.is_resident().then_some(EvictionCandidate {
+                        file_id: *file_id,
+                        extent_index: extent.extent_index,
+                        length: extent.length,
+                        active_pin_generation,
+                        pin_generation: extent.pin_generation,
+                        pin_priority: extent.pin_priority,
+                        last_access_ns: extent.last_access_ns,
+                        file_offset: extent.file_offset,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+
+        for candidate in candidates {
             if remaining <= max_resident_bytes {
                 break;
             }
-            if inode.is_dir || inode.extents.iter().all(|extent| !extent.is_resident()) {
+            let Some(inode) = inodes.get_mut(&candidate.file_id) else {
                 continue;
+            };
+            let Some(extent) = inode.extents.iter_mut().find(|extent| {
+                extent.extent_index == candidate.extent_index && extent.is_resident()
+            }) else {
+                continue;
+            };
+            remaining = remaining.saturating_sub(extent.length);
+            removed_extents += 1;
+            removed_bytes = removed_bytes.saturating_add(extent.length);
+            extent.segment_id = None;
+            extent.segment_offset = None;
+            extent.pin_generation = 0;
+            extent.pin_priority = u8::MAX;
+            changed_file_ids.insert(candidate.file_id, ());
+        }
+        for (file_id, inode) in inodes {
+            if changed_file_ids.contains_key(&file_id) {
+                let _ = self.catalog.append_inode(inode)?;
             }
-
-            inode.extents.sort_by_key(|extent| {
-                (
-                    std::cmp::Reverse(extent.file_offset),
-                    std::cmp::Reverse(extent.extent_index),
-                )
-            });
-            let mut updated_extents = Vec::with_capacity(inode.extents.len());
-            for mut extent in inode.extents {
-                if extent.is_resident() && remaining > max_resident_bytes {
-                    remaining = remaining.saturating_sub(extent.length);
-                    removed_extents += 1;
-                    removed_bytes = removed_bytes.saturating_add(extent.length);
-                    extent.segment_id = None;
-                    extent.segment_offset = None;
-                }
-                updated_extents.push(extent);
-            }
-            updated_extents.sort_by_key(|extent| extent.extent_index);
-            inode.extents = updated_extents;
-            let _ = self.catalog.append_inode(inode)?;
         }
         self.checkpoint()?;
 
@@ -391,6 +455,76 @@ impl ClientLegatoStore {
             resident_extents_removed: 0,
             resident_bytes_removed: 0,
         }
+    }
+
+    fn update_extent_metadata(
+        &mut self,
+        file_id: FileId,
+        extent_index: u32,
+        update: impl FnOnce(&mut CatalogExtent),
+    ) -> Result<(), CatalogStoreError> {
+        let Some(mut inode) = self.catalog.resolve_file_id(file_id).cloned() else {
+            return Ok(());
+        };
+        let Some(extent) = inode
+            .extents
+            .iter_mut()
+            .find(|extent| extent.extent_index == extent_index)
+        else {
+            return Ok(());
+        };
+        update(extent);
+        let _ = self.catalog.append_inode(inode)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EvictionCandidate {
+    file_id: FileId,
+    extent_index: u32,
+    length: u64,
+    active_pin_generation: u64,
+    pin_generation: u64,
+    pin_priority: u8,
+    last_access_ns: u64,
+    file_offset: u64,
+}
+
+impl EvictionCandidate {
+    fn active_pin_bonus(self) -> u8 {
+        if self.active_pin_generation != 0 && self.pin_generation == self.active_pin_generation {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+impl Ord for EvictionCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.active_pin_bonus(),
+            u8::MAX.saturating_sub(self.pin_priority),
+            self.last_access_ns,
+            self.file_offset,
+            self.extent_index,
+            self.file_id,
+        )
+            .cmp(&(
+                other.active_pin_bonus(),
+                u8::MAX.saturating_sub(other.pin_priority),
+                other.last_access_ns,
+                other.file_offset,
+                other.extent_index,
+                other.file_id,
+            ))
+    }
+}
+
+impl PartialOrd for EvictionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -433,6 +567,9 @@ fn proto_to_catalog_inode(
                         transfer_class: layout.transfer_class,
                         segment_id: resident.and_then(|resident| resident.segment_id),
                         segment_offset: resident.and_then(|resident| resident.segment_offset),
+                        last_access_ns: resident.map_or(0, |resident| resident.last_access_ns),
+                        pin_priority: resident.map_or(u8::MAX, |resident| resident.pin_priority),
+                        pin_generation: resident.map_or(0, |resident| resident.pin_generation),
                     }
                 })
                 .collect()
@@ -451,6 +588,15 @@ fn proto_to_catalog_inode(
     }
 }
 
+fn prefetch_priority_ordinal(priority: PrefetchPriority) -> u8 {
+    match priority {
+        PrefetchPriority::P0 => 0,
+        PrefetchPriority::P1 => 1,
+        PrefetchPriority::P2 => 2,
+        PrefetchPriority::P3 => 3,
+    }
+}
+
 fn path_starts_with(path: &str, root: &str) -> bool {
     root == "/"
         || path == root
@@ -466,7 +612,7 @@ mod tests {
         ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout,
         InodeMetadata, InvalidationEvent, InvalidationKind, TransferClass,
     };
-    use legato_types::FileId;
+    use legato_types::{FileId, PrefetchPriority};
     use tempfile::tempdir;
 
     #[test]
@@ -566,6 +712,112 @@ mod tests {
             .resolve_path("/library/piano.wav")
             .expect("inode should still resolve after eviction");
         assert_eq!(inode.layout.expect("layout should exist").extents.len(), 2);
+    }
+
+    #[test]
+    fn client_store_evicts_old_unpinned_before_recent_or_pinned_extents() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 7,
+                path: String::from("/library/piano.wav"),
+                size: 20,
+                mtime_ns: 123,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: vec![
+                        ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 5,
+                            extent_hash: blake3::hash(b"zero0").as_bytes().to_vec(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 1,
+                            file_offset: 5,
+                            length: 5,
+                            extent_hash: blake3::hash(b"one-1").as_bytes().to_vec(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 2,
+                            file_offset: 10,
+                            length: 5,
+                            extent_hash: blake3::hash(b"two-2").as_bytes().to_vec(),
+                        },
+                        ExtentDescriptor {
+                            extent_index: 3,
+                            file_offset: 15,
+                            length: 5,
+                            extent_hash: blake3::hash(b"tre-3").as_bytes().to_vec(),
+                        },
+                    ],
+                }),
+                inode_generation: 1,
+                content_hash: b"0123".to_vec(),
+            })
+            .expect("inode should record");
+
+        store
+            .put_extent(&sample_extent_at(0, 0, b"zero0"))
+            .expect("extent zero should store");
+        store
+            .put_extent(&sample_extent_at(1, 5, b"one-1"))
+            .expect("extent one should store");
+        store
+            .put_extent(&sample_extent_at(2, 10, b"two-2"))
+            .expect("extent two should store");
+        store
+            .put_extent(&sample_extent_at(3, 15, b"tre-3"))
+            .expect("extent three should store");
+
+        store
+            .touch_extent(FileId(7), 0, 10)
+            .expect("old access should record");
+        store
+            .touch_extent(FileId(7), 1, 40)
+            .expect("recent access should record");
+        store
+            .touch_extent(FileId(7), 2, 20)
+            .expect("p2 access should record");
+        store
+            .touch_extent(FileId(7), 3, 30)
+            .expect("p0 access should record");
+        store
+            .pin_extent(FileId(7), 2, PrefetchPriority::P2, 7)
+            .expect("p2 pin should record");
+        store
+            .pin_extent(FileId(7), 3, PrefetchPriority::P0, 7)
+            .expect("p0 pin should record");
+
+        let report = store
+            .evict_to_limit(15)
+            .expect("first eviction should succeed");
+        assert_eq!(report.resident_extents_removed, 1);
+        assert!(store.get_extent(FileId(7), 0).expect("lookup").is_none());
+        assert!(store.get_extent(FileId(7), 1).expect("lookup").is_some());
+        assert!(store.get_extent(FileId(7), 2).expect("lookup").is_some());
+        assert!(store.get_extent(FileId(7), 3).expect("lookup").is_some());
+
+        let report = store
+            .evict_to_limit(10)
+            .expect("second eviction should succeed");
+        assert_eq!(report.resident_extents_removed, 1);
+        assert!(store.get_extent(FileId(7), 1).expect("lookup").is_none());
+        assert!(store.get_extent(FileId(7), 2).expect("lookup").is_some());
+        assert!(store.get_extent(FileId(7), 3).expect("lookup").is_some());
+
+        let report = store
+            .evict_to_limit(5)
+            .expect("third eviction should succeed");
+        assert_eq!(report.resident_extents_removed, 1);
+        assert!(store.get_extent(FileId(7), 2).expect("lookup").is_none());
+        assert!(
+            store.get_extent(FileId(7), 3).expect("lookup").is_some(),
+            "highest-priority active pin should be retained last",
+        );
     }
 
     #[test]

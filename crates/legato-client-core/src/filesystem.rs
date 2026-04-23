@@ -314,7 +314,7 @@ impl FilesystemService {
                 .await?;
         }
 
-        let bytes = assemble_read(&mut self.store, &snapshot, offset, size)?;
+        let bytes = assemble_read(&mut self.store, &snapshot, offset, size, now_ns)?;
         self.enforce_cache_budget()?;
         if let Some(metrics) = &self.metrics {
             metrics.record_read(
@@ -581,6 +581,7 @@ fn assemble_read(
     handle: &FilesystemOpenHandle,
     offset: u64,
     size: u32,
+    now_ns: u64,
 ) -> Result<Vec<u8>, FilesystemServiceError> {
     let end = offset.saturating_add(u64::from(size)).min(handle.size);
     let mut bytes = Vec::with_capacity(size as usize);
@@ -589,6 +590,7 @@ fn assemble_read(
         let Some(extent) = store.get_extent(handle.file_id, descriptor.extent_index)? else {
             return Err(FilesystemServiceError::NotFound(handle.path.clone()));
         };
+        store.touch_extent(handle.file_id, descriptor.extent_index, now_ns)?;
         let extent_end = extent.file_offset.saturating_add(extent.data.len() as u64);
         let copy_start = offset.max(extent.file_offset);
         let copy_end = end.min(extent_end);

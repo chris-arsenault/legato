@@ -40,6 +40,15 @@ pub struct CatalogExtent {
     /// Byte offset of the resident extent payload record inside the segment.
     #[serde(default)]
     pub segment_offset: Option<u64>,
+    /// Most recent local access timestamp used for recency-aware eviction.
+    #[serde(default)]
+    pub last_access_ns: u64,
+    /// Prefetch priority ordinal used for active-project retention.
+    #[serde(default = "default_pin_priority")]
+    pub pin_priority: u8,
+    /// Most recent prefetch execution generation that pinned this extent.
+    #[serde(default)]
+    pub pin_generation: u64,
 }
 
 impl CatalogExtent {
@@ -48,6 +57,10 @@ impl CatalogExtent {
     pub fn is_resident(&self) -> bool {
         self.segment_id.is_some() && self.segment_offset.is_some()
     }
+}
+
+fn default_pin_priority() -> u8 {
+    u8::MAX
 }
 
 /// Active inode metadata and extent map for a file or directory.
@@ -293,6 +306,9 @@ impl CatalogStore {
             transfer_class: transfer_class as i32,
             segment_id: Some(segment_id),
             segment_offset: Some(segment_offset),
+            last_access_ns: 0,
+            pin_priority: default_pin_priority(),
+            pin_generation: 0,
         })
     }
 
@@ -942,6 +958,9 @@ mod tests {
                     transfer_class: TransferClass::Streamed as i32,
                     segment_id: Some(9),
                     segment_offset: Some(128),
+                    last_access_ns: 0,
+                    pin_priority: u8::MAX,
+                    pin_generation: 0,
                 }],
             },
         )
