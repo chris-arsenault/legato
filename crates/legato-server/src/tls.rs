@@ -438,7 +438,7 @@ fn load_ca_issuer(
     Issuer::from_ca_cert_pem(&cert_pem, key).map_err(TlsConfigError::Rcgen)
 }
 
-fn write_file(path: &Path, contents: String, mode: u32) -> Result<(), TlsConfigError> {
+fn write_file(path: &Path, contents: String, _mode: u32) -> Result<(), TlsConfigError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| TlsConfigError::Io {
             path: parent.to_path_buf(),
@@ -452,7 +452,7 @@ fn write_file(path: &Path, contents: String, mode: u32) -> Result<(), TlsConfigE
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(mode);
+        let permissions = fs::Permissions::from_mode(_mode);
         fs::set_permissions(path, permissions).map_err(|source| TlsConfigError::Io {
             path: path.to_path_buf(),
             source,

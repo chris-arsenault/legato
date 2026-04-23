@@ -66,7 +66,7 @@ impl fmt::Debug for WindowsMountService {
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
-struct WinfspFileContext {
+pub struct WinfspFileContext {
     path: String,
     local_handle: Option<u64>,
     attributes: WindowsAttributes,
