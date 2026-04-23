@@ -7,7 +7,7 @@ CONFIG_EXAMPLE="${STATE_DIR}/legatofs.toml.example"
 CONFIG_PATH="${STATE_DIR}/legatofs.toml"
 CERT_README="${CERT_DIR}/README.txt"
 
-mkdir -p "${STATE_DIR}" "${CERT_DIR}" "${STATE_DIR}/extents"
+mkdir -p "${STATE_DIR}" "${CERT_DIR}" "${STATE_DIR}/catalog" "${STATE_DIR}/segments" "${STATE_DIR}/checkpoints"
 
 if [ -f "${STATE_DIR}/certs-README.txt" ] && [ ! -f "${CERT_README}" ]; then
   mv "${STATE_DIR}/certs-README.txt" "${CERT_README}"

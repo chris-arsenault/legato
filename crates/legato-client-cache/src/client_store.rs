@@ -96,6 +96,17 @@ impl ClientLegatoStore {
             .sum()
     }
 
+    /// Returns total resident extent references currently tracked by active inodes.
+    #[must_use]
+    pub fn resident_extent_count(&self) -> usize {
+        self.catalog
+            .active_paths()
+            .into_iter()
+            .filter_map(|path| self.catalog.resolve_path(&path))
+            .map(|inode| inode.extents.len())
+            .sum()
+    }
+
     /// Appends a fetched extent and marks it resident in the local inode extent map.
     pub fn put_extent(
         &mut self,

@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use legato_client_cache::{ExtentCacheStore, open_cache_database};
+use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{ClientConfig, FilesystemService, LocalControlPlane};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
@@ -346,10 +346,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             )?;
             let report = match action {
                 CacheCommand::Status => cache_status_report(&process_config.mount)?,
-                CacheCommand::Repair => cache_repair_report(
-                    &process_config.mount,
-                    process_config.client.cache.max_bytes,
-                )?,
+                CacheCommand::Repair => cache_repair_report(&process_config.mount)?,
             };
             println!("{report}");
             Ok(())
@@ -482,8 +479,8 @@ async fn client_doctor_report(
 
     require_writable_directory("state_dir", Path::new(&process_config.mount.state_dir))?;
     require_writable_directory(
-        "extent_dir",
-        &Path::new(&process_config.mount.state_dir).join("extents"),
+        "segment_dir",
+        &Path::new(&process_config.mount.state_dir).join("segments"),
     )?;
     lines.push(format!("ok state_dir {}", process_config.mount.state_dir));
 
@@ -497,60 +494,24 @@ async fn client_doctor_report(
 }
 
 fn cache_status_report(mount: &MountConfig) -> Result<String, Box<dyn std::error::Error>> {
-    let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
-    let store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
-    let extent_count: i64 =
-        store
-            .connection()
-            .query_row("SELECT COUNT(*) FROM extent_entries", [], |row| row.get(0))?;
-    let bytes = store.total_size_bytes()?;
-    let dirty = store.is_dirty()?;
-    let checkpoint = store.load_checkpoint()?;
-    let checkpoint_text = checkpoint.map_or_else(
-        || String::from("none"),
-        |checkpoint| {
-            format!(
-                "version={} updated_at_ns={} extent_entries={} total_bytes={}",
-                checkpoint.version,
-                checkpoint.updated_at_ns,
-                checkpoint.extent_entries,
-                checkpoint.total_bytes
-            )
-        },
-    );
+    let store = ClientLegatoStore::open(&mount.state_dir, now_unix_ns())?;
 
     Ok(format!(
-        "legatofs cache status\nstate_dir {}\nextents {}\nbytes {}\ndirty {}\ncheckpoint {}",
-        mount.state_dir, extent_count, bytes, dirty, checkpoint_text
+        "legatofs store status\nstate_dir {}\nresident_extents {}\nresident_bytes {}",
+        mount.state_dir,
+        store.resident_extent_count(),
+        store.resident_bytes()
     ))
 }
 
-fn cache_repair_report(
-    mount: &MountConfig,
-    max_cache_bytes: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
-    let mut store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    let repair = store.repair()?;
-    let compaction = store.compact()?;
-    let eviction = store.evict_to_limit(max_cache_bytes)?;
-    let checkpoint = store.checkpoint(now_ns)?;
+fn cache_repair_report(mount: &MountConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let mut store = ClientLegatoStore::open(&mount.state_dir, now_unix_ns())?;
+    store.checkpoint()?;
 
     Ok(format!(
-        "legatofs cache repair\nrepaired_entries {}\nentries_removed {}\norphan_files_removed {}\nreclaimed_bytes {}\nstale_fetch_rows_removed {}\nstale_pins_removed {}\nempty_directories_removed {}\nevicted_entries {}\nbytes_after {}\ncheckpoint_updated_at_ns {}",
-        repair.repaired_entries,
-        repair.entries_removed,
-        repair.orphan_files_removed,
-        repair.reclaimed_bytes,
-        compaction.stale_fetch_rows_removed,
-        compaction.stale_pins_removed,
-        compaction.empty_directories_removed,
-        eviction.entries_removed,
-        checkpoint.total_bytes,
-        checkpoint.updated_at_ns
+        "legatofs store repair\ncheckpoint written\nresident_extents {}\nresident_bytes {}",
+        store.resident_extent_count(),
+        store.resident_bytes()
     ))
 }
 
@@ -810,16 +771,19 @@ fn control_plane_for_mount(
     mount: &MountConfig,
     semantics: FilesystemSemantics,
 ) -> Result<LocalControlPlane, Box<dyn std::error::Error>> {
-    let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
-    let _store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
+    let _store = ClientLegatoStore::open(&mount.state_dir, now_unix_ns())?;
     let mut control = LocalControlPlane::new(legato_client_cache::MetadataCache::new(
         legato_client_cache::MetadataCachePolicy::default(),
     ));
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64);
+    let now_ns = now_unix_ns();
     control.register_path(mount_root_attributes(mount, semantics), now_ns);
     Ok(control)
+}
+
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
 }
 
 fn mount_root_attributes(mount: &MountConfig, semantics: FilesystemSemantics) -> FileMetadata {
@@ -1078,7 +1042,9 @@ fn install_client_bundle(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cert_dir = state_dir.join("certs");
     fs::create_dir_all(&cert_dir)?;
-    fs::create_dir_all(state_dir.join("extents"))?;
+    for child in ["catalog", "segments", "checkpoints"] {
+        fs::create_dir_all(state_dir.join(child))?;
+    }
 
     copy_required_bundle_file(bundle_dir, &cert_dir, "server-ca.pem")?;
     copy_required_bundle_file(bundle_dir, &cert_dir, "client.pem")?;
@@ -1239,11 +1205,12 @@ mod tests {
         CacheCommand, ClientProcessConfig, Command, MountConfig, cache_repair_report,
         cache_status_report, default_client_name, default_config_path, default_library_root,
         default_mount_point, default_state_dir, endpoint_socket, install_client_bundle,
-        load_bundle_manifest, mount_root_attributes, open_cache_database, parse_command_impl,
+        load_bundle_manifest, mount_root_attributes, parse_command_impl,
         render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
         startup_context, windows_task_command_for_executable,
     };
-    use legato_client_cache::ExtentCacheStore;
+    use legato_client_cache::client_store::ClientLegatoStore;
+    use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
     use legato_proto::{ExtentRecord, TransferClass};
     use legato_types::{FilesystemOperation, FilesystemSemantics};
     use tempfile::tempdir;
@@ -1459,7 +1426,9 @@ mod tests {
         assert!(state_dir.join("certs").join("server-ca.pem").exists());
         assert!(state_dir.join("certs").join("client.pem").exists());
         assert!(state_dir.join("certs").join("client-key.pem").exists());
-        assert!(state_dir.join("extents").exists());
+        assert!(state_dir.join("catalog").exists());
+        assert!(state_dir.join("segments").exists());
+        assert!(state_dir.join("checkpoints").exists());
     }
 
     #[test]
@@ -1565,36 +1534,47 @@ mod tests {
             library_root: String::from("/srv/libraries"),
             state_dir: fixture.path().join("state").to_string_lossy().into_owned(),
         };
-        let database = open_cache_database(&PathBuf::from(&mount.state_dir).join("client.sqlite"))
-            .expect("cache database should open");
         let mut store =
-            ExtentCacheStore::new(&PathBuf::from(&mount.state_dir).join("extents"), database)
-                .expect("extent store should open");
+            ClientLegatoStore::open(&mount.state_dir, 100).expect("client store should open");
         store
-            .put_extent(
-                &ExtentRecord {
-                    file_id: 7,
-                    extent_index: 0,
-                    file_offset: 0,
-                    data: b"fixture".to_vec(),
-                    extent_hash: Vec::new(),
+            .record_inode(InodeMetadata {
+                file_id: 7,
+                path: String::from("/srv/libraries/piano.wav"),
+                size: 7,
+                mtime_ns: 100,
+                is_dir: false,
+                layout: Some(FileLayout {
                     transfer_class: TransferClass::Unitary as i32,
-                },
-                1,
-                100,
-            )
+                    extents: vec![ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 7,
+                        extent_hash: Vec::new(),
+                    }],
+                }),
+            })
+            .expect("inode should be recorded");
+        store
+            .put_extent(&ExtentRecord {
+                file_id: 7,
+                extent_index: 0,
+                file_offset: 0,
+                data: b"fixture".to_vec(),
+                extent_hash: Vec::new(),
+                transfer_class: TransferClass::Unitary as i32,
+            })
             .expect("extent should be stored");
 
         let status = cache_status_report(&mount).expect("status should render");
-        let repair = cache_repair_report(&mount, 1024).expect("repair should render");
+        let repair = cache_repair_report(&mount).expect("repair should render");
 
-        assert!(status.contains("extents 1"));
-        assert!(status.contains("dirty true"));
-        assert!(repair.contains("checkpoint_updated_at_ns"));
+        assert!(status.contains("resident_extents 1"));
+        assert!(status.contains("resident_bytes 7"));
+        assert!(repair.contains("checkpoint written"));
         assert!(
             cache_status_report(&mount)
                 .expect("status should render")
-                .contains("dirty false")
+                .contains("resident_extents 1")
         );
     }
 }

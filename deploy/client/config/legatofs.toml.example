@@ -10,7 +10,6 @@ endpoint = "legato.lan:7823"
 
 [client.cache]
 max_bytes = 1610612736000
-block_size = 1048576
 
 [client.tls]
 ca_cert_path = "__CERT_DIR__/server-ca.pem"

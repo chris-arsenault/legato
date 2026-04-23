@@ -407,7 +407,7 @@ fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
         FilesystemServiceError::NotFound(_) => FilesystemError::NotFound,
         FilesystemServiceError::UnknownHandle(_) => FilesystemError::StaleHandle,
         FilesystemServiceError::InvalidRead { .. } => FilesystemError::InvalidInput,
-        FilesystemServiceError::Transport(_) | FilesystemServiceError::Cache(_) => {
+        FilesystemServiceError::Transport(_) | FilesystemServiceError::Store(_) => {
             FilesystemError::Transient
         }
     };
@@ -425,7 +425,7 @@ fn map_mount_error(error: FilesystemServiceError) -> MountFsError {
             MountFsError::Other(String::from("invalid read"))
         }
         FilesystemServiceError::Transport(error) => MountFsError::Other(error.to_string()),
-        FilesystemServiceError::Cache(error) => MountFsError::Other(error.to_string()),
+        FilesystemServiceError::Store(error) => MountFsError::Other(error.to_string()),
     }
 }
 

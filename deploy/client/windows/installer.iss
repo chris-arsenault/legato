@@ -29,7 +29,9 @@ Source: "{#MyAppSourceDir}\certs-README.txt"; DestDir: "{commonappdata}\Legato";
 [Dirs]
 Name: "{commonappdata}\Legato"
 Name: "{commonappdata}\Legato\certs"
-Name: "{commonappdata}\Legato\extents"
+Name: "{commonappdata}\Legato\catalog"
+Name: "{commonappdata}\Legato\segments"
+Name: "{commonappdata}\Legato\checkpoints"
 
 [Icons]
 Name: "{group}\Legato Config"; Filename: "{commonappdata}\Legato\legatofs.toml"
@@ -127,8 +129,7 @@ begin
         '[client]' + #13#10 +
         'endpoint = "' + ServerEndpointPage.Values[0] + '"' + #13#10 + #13#10 +
         '[client.cache]' + #13#10 +
-        'max_bytes = 1610612736000' + #13#10 +
-        'block_size = 1048576' + #13#10 + #13#10 +
+        'max_bytes = 1610612736000' + #13#10 + #13#10 +
         '[client.tls]' + #13#10 +
         'ca_cert_path = "C:\\ProgramData\\Legato\\certs\\server-ca.pem"' + #13#10 +
         'client_cert_path = "C:\\ProgramData\\Legato\\certs\\client.pem"' + #13#10 +
