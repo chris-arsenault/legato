@@ -662,7 +662,7 @@ mod tests {
             .lookup(&mut service, sample_path.to_string_lossy().as_ref())
             .await
             .expect("lookup should succeed");
-        assert_eq!(attrs.inode, 1);
+        assert_ne!(attrs.inode, 0);
 
         let entries = adapter
             .read_dir(

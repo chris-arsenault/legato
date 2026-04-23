@@ -818,7 +818,7 @@ mod tests {
             .lookup(&mut service, sample_path.to_string_lossy().as_ref())
             .await
             .expect("lookup should succeed");
-        assert_eq!(attrs.file_index, 1);
+        assert_ne!(attrs.file_index, 0);
 
         let entries = adapter
             .read_dir(

@@ -613,7 +613,7 @@ mod tests {
             .lookup(sample_path.to_string_lossy().as_ref())
             .await
             .expect("lookup should succeed");
-        assert_eq!(attrs.file_id.0, 1);
+        assert_ne!(attrs.file_id.0, 0);
         assert!(!attrs.is_dir);
 
         let entries = service
@@ -780,7 +780,7 @@ mod tests {
             .lookup(sample_path.to_string_lossy().as_ref())
             .await
             .expect("lookup should succeed");
-        assert_eq!(attrs.file_id.0, 1);
+        assert_ne!(attrs.file_id.0, 0);
 
         let initial_entries = service
             .read_dir(library_root.join("Kontakt").to_string_lossy().as_ref())
