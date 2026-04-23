@@ -12,6 +12,7 @@ use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_proto::FileMetadata;
+use legato_server::ClientBundleManifest;
 use legato_types::{
     ClientPlatform, FileId, FilesystemAttributes, FilesystemError, FilesystemSemantics,
     platform_error_code,
@@ -143,11 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum Command {
     Install {
         bundle_dir: PathBuf,
-        endpoint: String,
-        server_name: String,
-        mount_point: String,
+        endpoint: Option<String>,
+        server_name: Option<String>,
+        mount_point: Option<String>,
         state_dir: PathBuf,
-        library_root: String,
+        library_root: Option<String>,
         force: bool,
     },
     Smoke {
@@ -198,11 +199,11 @@ where
 
             Ok(Some(Command::Install {
                 bundle_dir: bundle_dir.ok_or("missing --bundle-dir for install")?,
-                endpoint: endpoint.ok_or("missing --endpoint for install")?,
-                server_name: server_name.ok_or("missing --server-name for install")?,
-                mount_point: mount_point.unwrap_or_else(default_mount_point),
+                endpoint,
+                server_name,
+                mount_point,
                 state_dir: state_dir.unwrap_or_else(|| PathBuf::from(default_state_dir())),
-                library_root: library_root.unwrap_or_else(default_library_root),
+                library_root,
                 force,
             }))
         }
@@ -254,6 +255,33 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             library_root,
             force,
         } => {
+            let manifest = load_bundle_manifest(&bundle_dir)?;
+            let endpoint = resolve_required_install_value(
+                endpoint,
+                manifest.as_ref().and_then(|bundle| bundle.endpoint.clone()),
+                "--endpoint",
+            )?;
+            let server_name = resolve_required_install_value(
+                server_name,
+                manifest
+                    .as_ref()
+                    .and_then(|bundle| bundle.server_name.clone()),
+                "--server-name",
+            )?;
+            let mount_point = resolve_optional_install_value(
+                mount_point,
+                manifest
+                    .as_ref()
+                    .and_then(|bundle| bundle.mount_point.clone()),
+                default_mount_point,
+            );
+            let library_root = resolve_optional_install_value(
+                library_root,
+                manifest
+                    .as_ref()
+                    .and_then(|bundle| bundle.library_root.clone()),
+                default_library_root,
+            );
             install_client_bundle(
                 &bundle_dir,
                 &state_dir,
@@ -401,6 +429,34 @@ fn default_library_root() -> String {
     String::from("/srv/libraries")
 }
 
+fn load_bundle_manifest(
+    bundle_dir: &Path,
+) -> Result<Option<ClientBundleManifest>, Box<dyn std::error::Error>> {
+    let manifest_path = bundle_dir.join("bundle.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(&manifest_path)?)?))
+}
+
+fn resolve_required_install_value(
+    command_value: Option<String>,
+    manifest_value: Option<String>,
+    flag_name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    command_value.or(manifest_value).ok_or_else(|| {
+        format!("missing {flag_name} for install and no bundle manifest value was provided").into()
+    })
+}
+
+fn resolve_optional_install_value(
+    command_value: Option<String>,
+    manifest_value: Option<String>,
+    default: impl FnOnce() -> String,
+) -> String {
+    command_value.or(manifest_value).unwrap_or_else(default)
+}
+
 fn default_state_dir() -> String {
     #[cfg(target_os = "macos")]
     {
@@ -517,8 +573,9 @@ mod tests {
 
     use super::{
         ClientProcessConfig, Command, MountConfig, default_client_name, default_config_path,
-        default_mount_point, install_client_bundle, mount_root_attributes, parse_command_impl,
-        startup_context,
+        default_library_root, default_mount_point, default_state_dir, install_client_bundle,
+        load_bundle_manifest, mount_root_attributes, parse_command_impl,
+        resolve_optional_install_value, resolve_required_install_value, startup_context,
     };
     use legato_types::{FilesystemOperation, FilesystemSemantics};
     use tempfile::tempdir;
@@ -582,12 +639,35 @@ mod tests {
             command,
             Some(Command::Install {
                 bundle_dir: PathBuf::from("/tmp/bundle"),
-                endpoint: String::from("legato.lan:7823"),
-                server_name: String::from("legato.lan"),
-                mount_point: String::from("/Volumes/Legato"),
+                endpoint: Some(String::from("legato.lan:7823")),
+                server_name: Some(String::from("legato.lan")),
+                mount_point: Some(String::from("/Volumes/Legato")),
                 state_dir: PathBuf::from("/tmp/legato-state"),
-                library_root: String::from("/srv/libraries"),
+                library_root: Some(String::from("/srv/libraries")),
                 force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_install_command_allows_manifest_backed_defaults() {
+        let command = parse_command_impl([
+            String::from("install"),
+            String::from("--bundle-dir"),
+            String::from("/tmp/bundle"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Install {
+                bundle_dir: PathBuf::from("/tmp/bundle"),
+                endpoint: None,
+                server_name: None,
+                mount_point: None,
+                state_dir: PathBuf::from(default_state_dir()),
+                library_root: None,
+                force: false,
             })
         );
     }
@@ -646,5 +726,58 @@ mod tests {
         assert!(state_dir.join("certs").join("client.pem").exists());
         assert!(state_dir.join("certs").join("client-key.pem").exists());
         assert!(state_dir.join("extents").exists());
+    }
+
+    #[test]
+    fn install_command_uses_bundle_manifest_defaults() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let bundle_dir = fixture.path().join("bundle");
+        let state_dir = fixture.path().join("state");
+        fs::create_dir_all(&bundle_dir).expect("bundle dir should be created");
+        fs::write(bundle_dir.join("server-ca.pem"), "ca").expect("server ca should be written");
+        fs::write(bundle_dir.join("client.pem"), "client").expect("client cert should be written");
+        fs::write(bundle_dir.join("client-key.pem"), "key").expect("client key should be written");
+        fs::write(
+            bundle_dir.join("bundle.json"),
+            r#"{
+  "client_name":"studio-mac",
+  "endpoint":"legato.lan:7823",
+  "server_name":"legato.lan",
+  "mount_point":"/Volumes/Legato",
+  "library_root":"/srv/libraries",
+  "issued_at_unix_ms":1
+}"#,
+        )
+        .expect("bundle manifest should be written");
+
+        let manifest = load_bundle_manifest(&bundle_dir)
+            .expect("bundle manifest should load")
+            .expect("bundle manifest should exist");
+        install_client_bundle(
+            &bundle_dir,
+            &state_dir,
+            &resolve_required_install_value(None, manifest.endpoint.clone(), "--endpoint")
+                .expect("endpoint should resolve"),
+            &resolve_required_install_value(None, manifest.server_name.clone(), "--server-name")
+                .expect("server name should resolve"),
+            &resolve_optional_install_value(
+                None,
+                manifest.mount_point.clone(),
+                default_mount_point,
+            ),
+            &resolve_optional_install_value(
+                None,
+                manifest.library_root.clone(),
+                default_library_root,
+            ),
+            false,
+        )
+        .expect("install should succeed");
+
+        let config =
+            fs::read_to_string(state_dir.join("legatofs.toml")).expect("config should be readable");
+        assert!(config.contains("endpoint = \"legato.lan:7823\""));
+        assert!(config.contains("server_name = \"legato.lan\""));
+        assert!(config.contains("mount_point = \"/Volumes/Legato\""));
     }
 }

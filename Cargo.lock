@@ -1126,6 +1126,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1151,8 +1152,10 @@ dependencies = [
  "legato-fs-macos",
  "legato-fs-windows",
  "legato-proto",
+ "legato-server",
  "legato-types",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

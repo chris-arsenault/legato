@@ -56,12 +56,12 @@ start_server
 
 server_env "${ROOT_DIR}/target/release/legato-server" issue-client \
   --name "release-smoke" \
-  --output-dir "${CLIENT_BUNDLE}"
+  --output-dir "${CLIENT_BUNDLE}" \
+  --endpoint "localhost:${PORT}" \
+  --server-name "localhost"
 
 "${ROOT_DIR}/target/release/legatofs" install \
   --bundle-dir "${CLIENT_BUNDLE}" \
-  --endpoint "localhost:${PORT}" \
-  --server-name "localhost" \
   --mount-point "/tmp/legato-smoke" \
   --state-dir "${CLIENT_STATE}" \
   --library-root "${LIBRARY_ROOT}"

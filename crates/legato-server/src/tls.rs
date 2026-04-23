@@ -6,6 +6,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rcgen::{
@@ -17,7 +18,7 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
     server::WebPkiClientVerifier,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// TLS material configuration for the server listener.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -80,6 +81,47 @@ pub struct BootstrappedServerTlsPaths {
     pub server_key_path: PathBuf,
     /// Client CA bundle used by the server. Mirrors the CA certificate.
     pub client_ca_path: PathBuf,
+}
+
+/// Installation metadata emitted alongside one issued client bundle.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientBundleManifest {
+    /// Logical client name embedded into the client certificate.
+    pub client_name: String,
+    /// Suggested server endpoint for install-time config hydration.
+    pub endpoint: Option<String>,
+    /// Suggested TLS server name for client validation.
+    pub server_name: Option<String>,
+    /// Optional install-time mount point override.
+    pub mount_point: Option<String>,
+    /// Optional install-time virtual library root override.
+    pub library_root: Option<String>,
+    /// Time when the bundle was issued.
+    pub issued_at_unix_ms: u64,
+}
+
+impl ClientBundleManifest {
+    /// Creates a client-bundle manifest from server-side defaults and optional overrides.
+    #[must_use]
+    pub fn for_issue(
+        client_name: &str,
+        endpoint: Option<String>,
+        server_name: Option<String>,
+        mount_point: Option<String>,
+        library_root: Option<String>,
+    ) -> Self {
+        let issued_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
+        Self {
+            client_name: client_name.to_owned(),
+            endpoint,
+            server_name,
+            mount_point,
+            library_root,
+            issued_at_unix_ms,
+        }
+    }
 }
 
 /// Fail-fast errors encountered while loading listener TLS state.
@@ -245,6 +287,18 @@ pub fn issue_client_tls_bundle(
     })?;
 
     Ok(())
+}
+
+/// Writes installation metadata alongside an issued client bundle.
+pub fn write_client_bundle_manifest(
+    output_dir: &Path,
+    manifest: &ClientBundleManifest,
+) -> Result<(), TlsConfigError> {
+    let payload = serde_json::to_string_pretty(manifest).map_err(|error| TlsConfigError::Io {
+        path: output_dir.join("bundle.json"),
+        source: std::io::Error::other(error),
+    })?;
+    write_file(&output_dir.join("bundle.json"), payload, 0o644)
 }
 
 /// Loads TLS files and builds a TLS 1.3-only rustls server configuration with mTLS.
@@ -414,8 +468,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ServerTlsConfig, TlsConfigError, build_tls_server_config, ensure_server_tls_materials,
-        issue_client_tls_bundle,
+        ClientBundleManifest, ServerTlsConfig, TlsConfigError, build_tls_server_config,
+        ensure_server_tls_materials, issue_client_tls_bundle, write_client_bundle_manifest,
     };
 
     const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIC/zCCAeegAwIBAgIUKWr7nJpAOz9K1vWUN3gheRvIy/8wDQYJKoZIhvcNAQEL\nBQAwDzENMAsGA1UEAwwEdGVzdDAeFw0yNjA0MjIwMDU0MDlaFw0yNzA0MjIwMDU0\nMDlaMA8xDTALBgNVBAMMBHRlc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK\nAoIBAQDEIfTpZUMQggMrqrDW9DMykuBUtQs7C0MAzs/WZjxTYaPfiONPYOvJ3n+e\nruGti/ypIxNijZPksrINYbh5PQpZ+Vo+bJml2K0S0d3EwDGEfLVEC8JNYUgKbCdZ\nvGuno/2KT4d5NnJNtVkxGZFh4KTFnpwhhbJH7lGt2VbvXLcJtQM+vgHpihz6QZxX\nR+L+LSNmaM8MZxU8MtbdyLKdey745osovkjdi+IKmkXb0ySra1fzgmXDaWMThOXy\nTh5UuD5n0RuUf5U9kRrpNc2/WxKx60mqdVA0BPHpOZyvEH9Nop9ZctVF1WKUGAzf\nvEYfeo2/OVW/+l1owNSb1CGWBcglAgMBAAGjUzBRMB0GA1UdDgQWBBQTHES/FEdh\nBSSzvS3vdZyNTnqunzAfBgNVHSMEGDAWgBQTHES/FEdhBSSzvS3vdZyNTnqunzAP\nBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBnXNfXPXQ8l89Cmy7D\ntoRjdWhPc1auU6U6LmZME5TcrQsDTEUlux2u4C2X+qTygZY/bJT8aum4D9LJlEh2\nY8tr/8yz2+jcoNu+tDmHs/OTTUuJfw03Gztbj/m0+nZBPEhmU2VK+t5SWUuJen+3\nEnE5oP2jByDR9AR/z9QPUqDgvP8wsuAvZ6mSZoP9iF3AGNLY8OF9j0BLBXSwHGkM\ncHJsVQvNJ+BOpn6KxsLxLl8DG4fwQ9RCBdhrSr3gQxYMWNnLmqbpeGDE+wQQWDEM\nPSvoKbrOwJyAO8RYUTTG0shPGm5J7tb1ZBJfITtfS4uNBRU8RLpDXFXk1hTKys+y\nEnAC\n-----END CERTIFICATE-----\n";
@@ -509,5 +563,32 @@ mod tests {
         assert!(output_dir.join("client.pem").exists());
         assert!(output_dir.join("client-key.pem").exists());
         assert!(output_dir.join("server-ca.pem").exists());
+    }
+
+    #[test]
+    fn bundle_manifest_writes_install_metadata() {
+        let root = tempdir().expect("tempdir should be created");
+        let output_dir = root.path().join("client-bundle");
+        fs::create_dir_all(&output_dir).expect("bundle dir should exist");
+        let manifest = ClientBundleManifest::for_issue(
+            "studio-mac",
+            Some(String::from("legato.lan:7823")),
+            Some(String::from("legato.lan")),
+            None,
+            Some(String::from("/srv/libraries")),
+        );
+
+        write_client_bundle_manifest(&output_dir, &manifest)
+            .expect("bundle manifest should be written");
+
+        let written = fs::read_to_string(output_dir.join("bundle.json"))
+            .expect("bundle manifest should be readable");
+        let parsed: ClientBundleManifest =
+            serde_json::from_str(&written).expect("bundle manifest should parse");
+        assert_eq!(parsed.client_name, "studio-mac");
+        assert_eq!(parsed.endpoint.as_deref(), Some("legato.lan:7823"));
+        assert_eq!(parsed.server_name.as_deref(), Some("legato.lan"));
+        assert_eq!(parsed.library_root.as_deref(), Some("/srv/libraries"));
+        assert!(parsed.issued_at_unix_ms > 0);
     }
 }

@@ -13,8 +13,10 @@ legato-foundation = { path = "../legato-foundation" }
 legato-fs-macos = { path = "../legato-fs-macos" }
 legato-fs-windows = { path = "../legato-fs-windows" }
 legato-proto = { path = "../legato-proto" }
+legato-server = { path = "../legato-server" }
 legato-types = { path = "../legato-types" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

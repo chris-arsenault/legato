@@ -25,8 +25,9 @@ use rusqlite::Connection;
 pub use schema::{SERVER_SCHEMA_VERSION, server_migrations};
 use serde::Deserialize;
 pub use tls::{
-    BootstrappedServerTlsPaths, ServerTlsConfig, TlsConfigError, build_tls_server_config,
-    ensure_server_tls_materials, issue_client_tls_bundle,
+    BootstrappedServerTlsPaths, ClientBundleManifest, ServerTlsConfig, TlsConfigError,
+    build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
+    write_client_bundle_manifest,
 };
 pub use watcher::{
     NotificationAction, WatchBackend, apply_notification_result, create_poll_watcher,

@@ -46,7 +46,11 @@ On first boot, `legato-server` now generates its own local CA and listener certi
 Client registration is handled by the server binary itself. To issue a client bundle after the server has bootstrapped its CA:
 
 ```bash
-docker exec legato-server legato-server issue-client --name studio-mac --output-dir /tmp/studio-mac
+docker exec legato-server legato-server issue-client \
+  --name studio-mac \
+  --output-dir /tmp/studio-mac \
+  --endpoint legato.lan:7823 \
+  --server-name legato.lan
 ```
 
 That writes:
@@ -54,25 +58,30 @@ That writes:
 - `client.pem`
 - `client-key.pem`
 - `server-ca.pem`
+- `bundle.json`
+
+`bundle.json` carries the supported install-time defaults for endpoint and TLS server name, so the client install no longer needs those values typed manually unless you intentionally want to override them.
 
 You can then copy that bundle to the client machine and install it with `legatofs` itself instead of manually placing certs and writing config:
 
 ```bash
-legatofs install \
-  --bundle-dir /tmp/studio-mac \
-  --endpoint legato.lan:7823 \
-  --server-name legato.lan \
-  --mount-point /Volumes/Legato
+legatofs install --bundle-dir /tmp/studio-mac
 ```
 
 For Windows, pass a Windows state or mount path as needed:
 
 ```powershell
 legatofs.exe install `
-  --bundle-dir C:\Temp\studio-win `
-  --endpoint legato.lan:7823 `
-  --server-name legato.lan `
-  --mount-point L:\Legato
+  --bundle-dir C:\Temp\studio-win
+```
+
+Override flags remain supported when the issued bundle metadata should not be used as-is:
+
+```bash
+legatofs install \
+  --bundle-dir /tmp/studio-mac \
+  --mount-point /Volumes/Legato-Alt \
+  --force
 ```
 
 The install command creates:
@@ -138,10 +147,17 @@ Client validation flow:
 
 1. Install the native binary.
 2. Issue a bundle from the server with `legato-server issue-client`.
-3. Run `legatofs install` with the bundle plus endpoint settings.
+3. Run `legatofs install` with the issued bundle.
 4. Start the mount agent.
 5. Verify the mount root appears and resolves indexed paths.
 6. Run `legato-prefetch analyze <project>` against one representative session.
+
+Replacement flow:
+
+1. Reissue the client bundle on the server for the same logical client name.
+2. Transfer the new bundle to the client host.
+3. Reinstall with `legatofs install --bundle-dir <bundle> --force`.
+4. Restart the native client runtime.
 
 ## Client State Layout
 

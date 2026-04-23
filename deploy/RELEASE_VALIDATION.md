@@ -12,7 +12,9 @@ This document defines the v1 release-validation matrix for Legato. It separates 
   - server startup
   - TLS bootstrap
   - client bundle issuance
+  - bundle manifest emission
   - client bundle installation into runtime state
+  - manifest-backed install-time config hydration
   - client config generation
   - metadata lookup
   - file open and block read
@@ -37,11 +39,11 @@ The following checks still require platform or environment-specific validation:
   - server can read the mounted library dataset and write state/config datasets
 - macOS installer:
   - `.pkg` installs `legatofs`
-  - `legatofs install` writes config and certs under `/Library/Application Support/Legato`
+  - `legatofs install --bundle-dir <bundle>` writes config and certs under `/Library/Application Support/Legato`
   - the installed binary can connect to the target server and complete a smoke read
 - Windows installer:
   - `.exe` installs `legatofs.exe`
-  - `legatofs.exe install` writes config and certs under `C:\ProgramData\Legato`
+  - `legatofs.exe install --bundle-dir <bundle>` writes config and certs under `C:\ProgramData\Legato`
   - the installed binary can connect to the target server and complete a smoke read
 - Native mount behavior:
   - the intended macOS mount backend exposes the library at `/Volumes/Legato`
