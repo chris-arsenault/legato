@@ -25,10 +25,20 @@ pub fn default_capabilities() -> Vec<i32> {
         Capability::Resolve as i32,
         Capability::ExtentFetch as i32,
         Capability::Prefetch as i32,
-        Capability::Hint as i32,
         Capability::Invalidations as i32,
         Capability::ChangeSubscription as i32,
     ]
+}
+
+/// Returns the exact supported subset of the requested capabilities.
+#[must_use]
+pub fn negotiate_capabilities(requested: &[i32]) -> Vec<i32> {
+    let supported = default_capabilities();
+    requested
+        .iter()
+        .copied()
+        .filter(|capability| supported.contains(capability))
+        .collect()
 }
 
 #[cfg(test)]
@@ -37,6 +47,7 @@ mod tests {
         AttachRequest, AttachResponse, Capability, ChangeKind, ExtentDescriptor, ExtentRecord,
         FileLayout, HintExtent, HintRequest, InodeMetadata, PROTOCOL_NAMESPACE, PROTOCOL_VERSION,
         PrefetchPriority, ResolveRequest, ResolveResponse, TransferClass, default_capabilities,
+        negotiate_capabilities,
     };
 
     #[test]
@@ -48,7 +59,7 @@ mod tests {
         };
         let response = AttachResponse {
             protocol_version: request.protocol_version,
-            negotiated_capabilities: request.desired_capabilities.clone(),
+            negotiated_capabilities: negotiate_capabilities(&request.desired_capabilities),
             server_name: String::from("legato-server"),
         };
 
@@ -59,6 +70,11 @@ mod tests {
             response
                 .negotiated_capabilities
                 .contains(&(Capability::Prefetch as i32))
+        );
+        assert!(
+            !response
+                .negotiated_capabilities
+                .contains(&(Capability::Hint as i32))
         );
         assert!(
             response

@@ -228,14 +228,28 @@ impl ClientLegatoStore {
         event: &InvalidationEvent,
     ) -> Result<(), CatalogStoreError> {
         let kind = InvalidationKind::try_from(event.kind).unwrap_or(InvalidationKind::Unspecified);
-        if matches!(
-            kind,
-            InvalidationKind::File | InvalidationKind::Directory | InvalidationKind::Subtree
-        ) {
-            let _ = self.catalog.append_tombstone(CatalogTombstone {
-                path: event.path.clone(),
-                file_id: (event.file_id != 0).then_some(FileId(event.file_id)),
-            })?;
+        match kind {
+            InvalidationKind::File | InvalidationKind::Directory => {
+                let _ = self.catalog.append_tombstone(CatalogTombstone {
+                    path: event.path.clone(),
+                    file_id: (event.file_id != 0).then_some(FileId(event.file_id)),
+                })?;
+            }
+            InvalidationKind::Subtree => {
+                let matching_paths = self
+                    .catalog
+                    .active_paths()
+                    .into_iter()
+                    .filter(|path| path_starts_with(path, &event.path))
+                    .collect::<Vec<_>>();
+                for path in matching_paths {
+                    let file_id = self.catalog.resolve_path(&path).map(|inode| inode.file_id);
+                    let _ = self
+                        .catalog
+                        .append_tombstone(CatalogTombstone { path, file_id })?;
+                }
+            }
+            InvalidationKind::Unspecified => {}
         }
         Ok(())
     }
@@ -398,12 +412,20 @@ fn proto_to_catalog_inode(
     }
 }
 
+fn path_starts_with(path: &str, root: &str) -> bool {
+    root == "/"
+        || path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::ClientLegatoStore;
     use legato_proto::{
         ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout,
-        InodeMetadata, TransferClass,
+        InodeMetadata, InvalidationEvent, InvalidationKind, TransferClass,
     };
     use legato_types::FileId;
     use tempfile::tempdir;
@@ -565,6 +587,54 @@ mod tests {
         assert_eq!(reopened.subscription_cursor(), 3);
         assert!(reopened.resolve_path("/Kontakt").is_some());
         assert!(reopened.resolve_path("/Kontakt/piano.nki").is_some());
+    }
+
+    #[test]
+    fn client_store_subtree_invalidation_removes_nested_paths_recursively() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 7,
+                path: String::from("/Kontakt/piano.nki"),
+                size: 13,
+                mtime_ns: 123,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: b"resident-data".to_vec(),
+            })
+            .expect("root child should record");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 8,
+                path: String::from("/Kontakt/Subdir/strings.nki"),
+                size: 21,
+                mtime_ns: 124,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Streamed as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: b"strings".to_vec(),
+            })
+            .expect("nested child should record");
+
+        store
+            .apply_invalidation(&InvalidationEvent {
+                kind: InvalidationKind::Subtree as i32,
+                path: String::from("/Kontakt"),
+                file_id: 0,
+            })
+            .expect("subtree invalidation should apply");
+
+        assert!(store.resolve_path("/Kontakt/piano.nki").is_none());
+        assert!(store.resolve_path("/Kontakt/Subdir/strings.nki").is_none());
     }
 
     fn sample_inode() -> InodeMetadata {

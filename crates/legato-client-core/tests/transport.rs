@@ -82,6 +82,12 @@ async fn grpc_client_transport_attaches_resolves_and_fetches_extents() {
             .negotiated_capabilities
             .contains(&(Capability::Metadata as i32))
     );
+    assert!(
+        !transport
+            .attach_session()
+            .negotiated_capabilities
+            .contains(&(Capability::Hint as i32))
+    );
 
     let metadata = transport
         .stat(String::from("/Kontakt/piano.nki"))

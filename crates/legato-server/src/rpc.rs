@@ -256,9 +256,12 @@ impl Legato for LiveServer {
 
     async fn attach(
         &self,
-        _request: Request<AttachRequest>,
+        request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
-        Ok(Response::new(self.shell.attach_response()))
+        Ok(Response::new(
+            self.shell
+                .attach_response(&request.into_inner().desired_capabilities),
+        ))
     }
 
     async fn resolve(
@@ -632,6 +635,7 @@ mod tests {
             .expect("attach should succeed")
             .into_inner();
         assert_eq!(attach.server_name, "legato-server");
+        assert_eq!(attach.negotiated_capabilities, vec![Capability::Metadata as i32]);
 
         let stat = client
             .stat(StatRequest {
