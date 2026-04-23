@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use legato_client_cache::{BlockCacheStore, open_cache_database};
+use legato_client_cache::{ExtentCacheStore, open_cache_database};
 use legato_client_core::{ClientConfig, FilesystemService, LocalControlPlane};
 use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
@@ -334,7 +334,7 @@ fn control_plane_for_mount(
     semantics: FilesystemSemantics,
 ) -> Result<LocalControlPlane, Box<dyn std::error::Error>> {
     let database = open_cache_database(&Path::new(&mount.state_dir).join("client.sqlite"))?;
-    let _store = BlockCacheStore::new(&Path::new(&mount.state_dir).join("blocks"), database)?;
+    let _store = ExtentCacheStore::new(&Path::new(&mount.state_dir).join("extents"), database)?;
     let mut control = LocalControlPlane::new(legato_client_cache::MetadataCache::new(
         legato_client_cache::MetadataCachePolicy::default(),
     ));
@@ -427,7 +427,7 @@ fn install_client_bundle(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cert_dir = state_dir.join("certs");
     fs::create_dir_all(&cert_dir)?;
-    fs::create_dir_all(state_dir.join("blocks"))?;
+    fs::create_dir_all(state_dir.join("extents"))?;
 
     copy_required_bundle_file(bundle_dir, &cert_dir, "server-ca.pem")?;
     copy_required_bundle_file(bundle_dir, &cert_dir, "client.pem")?;
@@ -645,6 +645,6 @@ mod tests {
         assert!(state_dir.join("certs").join("server-ca.pem").exists());
         assert!(state_dir.join("certs").join("client.pem").exists());
         assert!(state_dir.join("certs").join("client-key.pem").exists());
-        assert!(state_dir.join("blocks").exists());
+        assert!(state_dir.join("extents").exists());
     }
 }

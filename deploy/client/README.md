@@ -11,7 +11,9 @@ This document defines the installation and upgrade shape for the native Legato c
   - macOS: `/Library/Application Support/Legato`
   - Windows: `C:\ProgramData\Legato`
 - Cache database: `<state_dir>/client.sqlite`
-- Block cache root: `<state_dir>/blocks`
+- Extent store root: `<state_dir>/extents`
+- Certificate root: `<state_dir>/certs`
+- Generated client config: `<state_dir>/legatofs.toml`
 - Certificates:
   - server CA: `/etc/legato/certs/server-ca.pem` equivalent under the chosen client config root
   - client certificate: `/etc/legato/certs/client.pem`
@@ -37,7 +39,7 @@ This document defines the installation and upgrade shape for the native Legato c
 - Filesystem framework expectation: macFUSE-compatible user-space mount integration
 - Upgrade behavior:
   - replace the binary in place
-  - preserve `client.sqlite`, `blocks/`, and cert material
+  - preserve `client.sqlite`, `extents/`, and cert material
   - preserve an existing `legatofs.toml` if already configured
 
 ## Windows
@@ -61,14 +63,21 @@ This document defines the installation and upgrade shape for the native Legato c
 - Filesystem framework expectation: WinFSP-backed user-space filesystem
 - Upgrade behavior:
   - replace the binary in place
-  - preserve `client.sqlite`, `blocks\`, and cert material
+  - preserve `client.sqlite`, `extents\`, and cert material
   - preserve an existing `legatofs.toml` if already configured
+
+## Client State Model
+
+- `client.sqlite` stores metadata cache state, extent residency metadata, pin state, and checkpoints.
+- `extents/` stores the materialized local extent files used by the read path.
+- `certs/` stores the server CA plus issued client certificate and key.
+- `legatofs.toml` is generated from the install command and should be preserved across upgrades.
 
 ## Cache Integrity Rules
 
-- Never delete `client.sqlite` or `blocks/` during normal upgrades.
+- Never delete `client.sqlite` or `extents/` during normal upgrades.
 - If the cache schema changes, run migrations at startup before mounting.
-- If block integrity verification fails, remove only the affected cached block and refetch it.
+- If extent integrity verification fails, remove only the affected cached extent and refetch it.
 - If cert paths change, fail fast at startup rather than mounting a partially configured filesystem.
 
 ## Registration Flow
@@ -80,4 +89,4 @@ The current end-to-end client registration flow is:
 3. Run `legatofs install` against that bundle.
 4. Start `legatofs` with the generated `legatofs.toml`.
 
-`legatofs install` creates the config file, cert layout, and block-cache directory under the chosen state root. Use `--force` only when intentionally replacing an existing client configuration.
+`legatofs install` creates the config file, cert layout, and extent-store directory under the chosen state root. Use `--force` only when intentionally replacing an existing client configuration.

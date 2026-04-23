@@ -2,7 +2,7 @@
 
 This is a focused operations document. For the top-level project index, start at [README.md](../README.md) or [docs/INDEX.md](../docs/INDEX.md).
 
-This document is the MVP deployment and recovery guide for running Legato as a Dockerized server on the TrueNAS side, with native clients mounting the library on macOS or Windows.
+This document is the deployment and recovery guide for running Legato as a Dockerized server on the TrueNAS side, with native clients mounting the library on macOS or Windows.
 
 ## Topology
 
@@ -10,7 +10,7 @@ This document is the MVP deployment and recovery guide for running Legato as a D
 - The server mounts the canonical read-only sample library at `/srv/libraries`.
 - Server metadata and runtime state live under `/var/lib/legato`.
 - TLS materials live under `/etc/legato/certs`.
-- `legatofs` runs natively on client machines and maintains its SQLite/cache state locally.
+- `legatofs` runs natively on client machines and maintains its SQLite metadata plus local extent store under the configured state root.
 - `legato-prefetch` can be invoked by the launcher or DAW helper flow before mount-time reads become latency-sensitive.
 
 ## TrueNAS + Komodo
@@ -81,7 +81,7 @@ The install command creates:
 - `certs/server-ca.pem`
 - `certs/client.pem`
 - `certs/client-key.pem`
-- `blocks/`
+- `extents/`
 
 under the platform-default state directory unless `--state-dir` is explicitly provided.
 
@@ -99,7 +99,7 @@ The base example is [deploy/server/server.toml.example](/home/dev/repos/legato/d
 
 - `server.bind_address`: gRPC/control-plane listener
 - `server.library_root`: mounted sample-library root
-- `server.state_dir`: SQLite metadata and watcher state
+- `server.state_dir`: server catalog database, extent materialization state, and recovery metadata
 - `server.tls.*`: mTLS certificate chain and client CA
 - `common.metrics.bind_address`: optional Prometheus scrape endpoint
 
@@ -108,6 +108,24 @@ Recommended overrides for production:
 - Keep `common.tracing.level=info` by default and raise to `debug` only during incident work.
 - Use a dedicated client CA for Legato mounts rather than a shared internal PKI root.
 - Keep the library mount read-only inside the container so the server cannot mutate the sample dataset.
+
+## Server State Layout
+
+Under `/var/lib/legato`, the expected durable layout is:
+
+- `server.sqlite`
+  Catalog metadata, ordered change records, and server-side runtime state.
+- `extents/`
+  Materialized extent artifacts used by the semantic fetch path.
+- future checkpoint or maintenance artifacts alongside the database as the store model expands.
+
+Under `/etc/legato/certs`, the expected durable layout is:
+
+- `server.pem`
+- `server-key.pem`
+- `client-ca.pem`
+- `server-ca.pem`
+- `server-ca-key.pem`
 
 ## Client Rollout
 
@@ -124,6 +142,19 @@ Client validation flow:
 4. Start the mount agent.
 5. Verify the mount root appears and resolves indexed paths.
 6. Run `legato-prefetch analyze <project>` against one representative session.
+
+## Client State Layout
+
+Under the chosen client state root, the expected durable layout is:
+
+- `client.sqlite`
+  Metadata cache state, extent residency metadata, pin state, and recovery checkpoints.
+- `extents/`
+  Verified local extent files served by the mounted read path.
+- `certs/`
+  Issued client bundle content.
+- `legatofs.toml`
+  Generated client config.
 
 ## Observability
 
@@ -144,20 +175,21 @@ Suggested starter alerts:
 
 Client-side cache maintenance now supports:
 
-- integrity verification on block read
+- integrity verification on extent read
 - orphan/corrupt entry repair
-- size-based eviction using pin generation and last access ordering
+- size-based eviction using pin generation, fetch utility, and last access ordering
+- startup recovery with checkpointing and metadata compaction
 
 Operational recovery steps:
 
 1. Stop the client service if corruption is suspected.
-2. Run the client with cache-maintenance tooling once it exists as a surfaced command, or remove only the local cache state directory if a clean rebuild is faster.
+2. Use surfaced client maintenance tooling once it exists, or remove only the local client state directory if a clean rebuild is faster.
 3. Restart the client and verify reconnect/open/prefetch flow.
 4. If the server restarted, expect a root invalidation and stale-handle reopen cycle on the client side.
 
 ## Benchmarking
 
-The benchmark suite currently focuses on the three workloads that matter for the MVP:
+The benchmark suite currently focuses on the three workloads that matter for the current v1 store model:
 
 - full library reconciliation scan
 - cold metadata open
