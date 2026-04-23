@@ -1,8 +1,11 @@
 //! Windows-specific adapter wrappers over the shared Legato filesystem service.
 
-use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
 use legato_proto::DirectoryEntry;
@@ -71,6 +74,54 @@ pub struct WindowsAttributes {
     pub directory: bool,
     /// Whether the entry is writable.
     pub read_only: bool,
+}
+
+/// Result of preparing the configured mount point before handing it to WinFSP.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MountPointReadiness {
+    /// The mount point already existed and was usable.
+    Ready,
+    /// The mount point did not exist and was created.
+    Created,
+}
+
+/// Clear local mount point conflicts surfaced before WinFSP starts.
+#[derive(Debug)]
+pub enum MountPointError {
+    /// The configured mount point exists but is not a directory.
+    NotDirectory(PathBuf),
+    /// The configured mount point is a non-empty directory and may already be mounted or busy.
+    BusyDirectory(PathBuf),
+    /// The mount point could not be inspected or created.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for MountPointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDirectory(path) => {
+                write!(
+                    formatter,
+                    "mount point is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::BusyDirectory(path) => write!(
+                formatter,
+                "mount point is not empty; unmount or clear it before starting Legato: {}",
+                path.display()
+            ),
+            Self::Io(error) => write!(formatter, "mount point check failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MountPointError {}
+
+impl From<std::io::Error> for MountPointError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
 }
 
 impl WindowsFilesystem {
@@ -216,6 +267,7 @@ pub async fn mount(
     library_root: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mount_point = mount_point.as_ref().to_path_buf();
+    prepare_mount_point(&mount_point)?;
     let host = UniFuseHost::new(WindowsMountService::new(service, library_root));
     let options = MountOptions {
         fs_name: String::from("legato"),
@@ -226,6 +278,21 @@ pub async fn mount(
     host.mount(&mount_point, &options)
         .await
         .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+}
+
+/// Ensures the mount point is a usable empty directory before mounting.
+pub fn prepare_mount_point(path: &Path) -> Result<MountPointReadiness, MountPointError> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+        return Ok(MountPointReadiness::Created);
+    }
+    if !path.is_dir() {
+        return Err(MountPointError::NotDirectory(path.to_path_buf()));
+    }
+    if std::fs::read_dir(path)?.next().is_some() {
+        return Err(MountPointError::BusyDirectory(path.to_path_buf()));
+    }
+    Ok(MountPointReadiness::Ready)
 }
 
 #[cfg(target_os = "windows")]
@@ -432,7 +499,10 @@ mod tests {
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
-    use super::{WindowsFilesystem, map_virtual_path};
+    use super::{
+        MountPointError, MountPointReadiness, WindowsFilesystem, map_virtual_path,
+        prepare_mount_point,
+    };
 
     fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
         ClientConfig {
@@ -493,6 +563,35 @@ mod tests {
             map_virtual_path("/srv/libraries", Path::new("/Kontakt/piano.nki")),
             "/srv/libraries/Kontakt/piano.nki"
         );
+    }
+
+    #[test]
+    fn mount_point_preflight_creates_empty_directory_and_rejects_conflicts() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let missing = fixture.path().join("Legato");
+        assert_eq!(
+            prepare_mount_point(&missing).expect("missing mount point should be created"),
+            MountPointReadiness::Created
+        );
+        assert_eq!(
+            prepare_mount_point(&missing).expect("empty mount point should be ready"),
+            MountPointReadiness::Ready
+        );
+
+        let busy = fixture.path().join("Busy");
+        fs::create_dir_all(&busy).expect("busy dir should be created");
+        fs::write(busy.join("leftover"), b"mounted").expect("busy marker should be written");
+        assert!(matches!(
+            prepare_mount_point(&busy),
+            Err(MountPointError::BusyDirectory(_))
+        ));
+
+        let file = fixture.path().join("file");
+        fs::write(&file, b"not a directory").expect("file should be written");
+        assert!(matches!(
+            prepare_mount_point(&file),
+            Err(MountPointError::NotDirectory(_))
+        ));
     }
 
     #[tokio::test]
