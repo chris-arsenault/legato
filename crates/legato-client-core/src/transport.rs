@@ -12,11 +12,11 @@ use tonic::{
 
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
-    AttachResponse, BlockRequest, BlockResponse, ChangeRecord, CloseRequest, CloseResponse,
-    DirectoryEntry, ExtentRecord, ExtentRef, FetchRequest, FileMetadata, InodeMetadata,
-    InvalidationEvent, ListDirRequest, OpenRequest, OpenResponse, PROTOCOL_VERSION,
-    PrefetchRequest, PrefetchResponse, ReadBlocksRequest, ResolvePathRequest, ResolveRequest,
-    StatRequest, SubscribeChangesRequest, SubscribeRequest, legato_client::LegatoClient,
+    AttachResponse, ChangeRecord, CloseRequest, CloseResponse, DirectoryEntry, ExtentRecord,
+    ExtentRef, FetchRequest, FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest,
+    OpenRequest, OpenResponse, PROTOCOL_VERSION, PrefetchRequest, PrefetchResponse,
+    ResolvePathRequest, ResolveRequest, StatRequest, SubscribeChangesRequest, SubscribeRequest,
+    legato_client::LegatoClient,
 };
 
 /// Session metadata returned after a successful attach.
@@ -292,23 +292,6 @@ impl GrpcClientTransport {
             .into_inner();
         self.runtime.record_open_handle(&path, &response);
         Ok(response)
-    }
-
-    /// Streams one or more block ranges from the remote server and collects them in order.
-    pub async fn read_blocks(
-        &mut self,
-        ranges: Vec<BlockRequest>,
-    ) -> Result<Vec<BlockResponse>, ClientTransportError> {
-        let mut stream = self
-            .client
-            .read_blocks(ReadBlocksRequest { ranges })
-            .await?
-            .into_inner();
-        let mut blocks = Vec::new();
-        while let Some(block) = stream.message().await? {
-            blocks.push(block);
-        }
-        Ok(blocks)
     }
 
     /// Sends a prefetch request to the remote server.

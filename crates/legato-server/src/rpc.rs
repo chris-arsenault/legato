@@ -376,6 +376,7 @@ impl Legato for LiveServer {
         &self,
         request: Request<ReadBlocksRequest>,
     ) -> Result<Response<Self::ReadBlocksStream>, Status> {
+        // Legacy compatibility surface. The native client path uses Resolve + Fetch extents.
         let blocks = self
             .metadata
             .lock()
@@ -496,9 +497,8 @@ mod tests {
     use tonic::transport::{Channel, ClientTlsConfig};
 
     use legato_proto::{
-        AttachRequest, Capability, ExtentRef, FetchRequest, OpenRequest, ReadBlocksRequest,
-        ResolvePathRequest, ResolveRequest, StatRequest, SubscribeChangesRequest, TransferClass,
-        legato_client::LegatoClient,
+        AttachRequest, Capability, ExtentRef, FetchRequest, ResolvePathRequest, ResolveRequest,
+        StatRequest, SubscribeChangesRequest, TransferClass, legato_client::LegatoClient,
     };
     use tempfile::tempdir;
 
@@ -594,29 +594,37 @@ mod tests {
             sample_path.to_string_lossy()
         );
 
-        let opened = client
-            .open(OpenRequest {
+        let inode = client
+            .resolve(ResolveRequest {
                 path: sample_path.to_string_lossy().into_owned(),
             })
             .await
-            .expect("open should succeed")
-            .into_inner();
-        let blocks = client
-            .read_blocks(ReadBlocksRequest {
-                ranges: vec![legato_proto::BlockRequest {
-                    file_handle: opened.file_handle,
-                    start_offset: 0,
-                    block_count: 1,
+            .expect("resolve should succeed")
+            .into_inner()
+            .inode
+            .expect("inode should be present");
+        let layout = inode.layout.expect("layout should be present");
+        let extent = layout
+            .extents
+            .first()
+            .expect("sample file should have an extent");
+        let extents = client
+            .fetch(FetchRequest {
+                extents: vec![ExtentRef {
+                    file_id: inode.file_id,
+                    extent_index: extent.extent_index,
+                    file_offset: extent.file_offset,
+                    length: extent.length,
                 }],
             })
             .await
-            .expect("read should succeed")
+            .expect("fetch should succeed")
             .into_inner()
             .collect::<Result<Vec<_>, _>>()
             .await
-            .expect("block stream should collect");
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].data, b"hello legato");
+            .expect("extent stream should collect");
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].data, b"hello legato");
 
         let resolved = client
             .resolve_path(ResolvePathRequest {

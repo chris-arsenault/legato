@@ -29,4 +29,4 @@ Reset-era protocol guidance:
 - stable logical file identity plus layout metadata is the forward-looking read contract
 - server-local open handles are transitional compatibility behavior, not the intended long-term design center
 - semantic extents are the forward-looking transfer unit
-- fixed block alignment remains only for compatibility until the reset protocol is fully adopted
+- fixed block alignment remains only as a legacy compatibility RPC; new client code must use semantic extents

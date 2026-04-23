@@ -5,7 +5,7 @@ use std::{fs, path::Path};
 use legato_client_core::{
     ClientConfig, ClientTlsConfig, GrpcClientTransport, RetryPolicy, SessionStatus,
 };
-use legato_proto::{BlockRequest, Capability, ChangeKind};
+use legato_proto::{Capability, ChangeKind, ExtentRef, TransferClass};
 use legato_server::{
     LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
     issue_client_tls_bundle, load_runtime_tls,
@@ -28,7 +28,7 @@ fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -
 }
 
 #[tokio::test]
-async fn grpc_client_transport_attaches_to_live_server_and_reads_blocks() {
+async fn grpc_client_transport_attaches_resolves_and_fetches_extents() {
     let fixture = tempdir().expect("tempdir should be created");
     let library_root = fixture.path().join("library");
     let state_dir = fixture.path().join("state");
@@ -89,20 +89,28 @@ async fn grpc_client_transport_attaches_to_live_server_and_reads_blocks() {
         .expect("stat should succeed");
     assert_eq!(metadata.path, sample_path.to_string_lossy());
 
-    let opened = transport
-        .open(sample_path.to_string_lossy().into_owned())
+    let inode = transport
+        .resolve(sample_path.to_string_lossy().into_owned())
         .await
-        .expect("open should succeed");
-    let blocks = transport
-        .read_blocks(vec![BlockRequest {
-            file_handle: opened.file_handle,
-            start_offset: 0,
-            block_count: 1,
+        .expect("resolve should succeed");
+    let layout = inode.layout.expect("file layout should be present");
+    assert_eq!(layout.transfer_class, TransferClass::Unitary as i32);
+    let extent = layout
+        .extents
+        .first()
+        .expect("sample file should have one extent");
+    let records = transport
+        .fetch_extents(vec![ExtentRef {
+            file_id: inode.file_id,
+            extent_index: extent.extent_index,
+            file_offset: extent.file_offset,
+            length: extent.length,
         }])
         .await
-        .expect("block read should succeed");
-    assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].data, b"hello legato");
+        .expect("extent fetch should succeed");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].data, b"hello legato");
+    assert_eq!(records[0].transfer_class, TransferClass::Unitary as i32);
 
     let entries = transport
         .list_dir(library_root.join("Kontakt").to_string_lossy().into_owned())
@@ -118,7 +126,7 @@ async fn grpc_client_transport_attaches_to_live_server_and_reads_blocks() {
 }
 
 #[tokio::test]
-async fn grpc_client_transport_reconnects_and_reopens_stale_handles() {
+async fn grpc_client_transport_reconnects_and_fetches_extents_after_restart() {
     let fixture = tempdir().expect("tempdir should be created");
     let library_root = fixture.path().join("library");
     let state_dir = fixture.path().join("state");
@@ -164,10 +172,13 @@ async fn grpc_client_transport_reconnects_and_reopens_stale_handles() {
     let mut transport = GrpcClientTransport::connect(client_config, "studio-win")
         .await
         .expect("client should connect");
-    let opened = transport
-        .open(sample_path.to_string_lossy().into_owned())
+    let inode = transport
+        .resolve(sample_path.to_string_lossy().into_owned())
         .await
-        .expect("open should succeed");
+        .expect("resolve should succeed");
+    fetch_first_extent(&mut transport, &inode)
+        .await
+        .expect("initial extent fetch should succeed");
     assert_eq!(
         transport.runtime().session_status(),
         &SessionStatus::Connected {
@@ -196,10 +207,7 @@ async fn grpc_client_transport_reconnects_and_reopens_stale_handles() {
         .reconnect()
         .await
         .expect("reconnect should succeed");
-    assert_eq!(
-        recovery.reopened_paths,
-        vec![sample_path.to_string_lossy().into_owned()]
-    );
+    assert!(recovery.reopened_paths.is_empty());
     assert_eq!(
         transport.runtime().session_status(),
         &SessionStatus::Connected {
@@ -207,26 +215,53 @@ async fn grpc_client_transport_reconnects_and_reopens_stale_handles() {
             subscription_active: false,
         }
     );
-    assert!(
-        transport
-            .runtime()
-            .open_file(&sample_path.to_string_lossy())
-            .is_some()
-    );
-
-    let blocks = transport
-        .read_blocks(vec![BlockRequest {
-            file_handle: opened.file_handle,
-            start_offset: 0,
-            block_count: 1,
-        }])
+    let inode_after_restart = transport
+        .resolve(sample_path.to_string_lossy().into_owned())
         .await;
-    assert!(blocks.is_ok(), "reads should work after reconnect");
+    assert!(
+        inode_after_restart.is_ok(),
+        "resolve should work after reconnect"
+    );
+    let records = fetch_first_extent(
+        &mut transport,
+        &inode_after_restart.expect("inode should be resolved after reconnect"),
+    )
+    .await
+    .expect("fetch should work after reconnect");
+    assert_eq!(records[0].data, vec![0x5a; 4096]);
 
     second_bound
         .shutdown()
         .await
         .expect("server should shut down cleanly");
+}
+
+async fn fetch_first_extent(
+    transport: &mut GrpcClientTransport,
+    inode: &legato_proto::InodeMetadata,
+) -> Result<Vec<legato_proto::ExtentRecord>, legato_client_core::ClientTransportError> {
+    let layout =
+        inode
+            .layout
+            .as_ref()
+            .ok_or(legato_client_core::ClientTransportError::MissingField(
+                "inode.layout",
+            ))?;
+    let extent =
+        layout
+            .extents
+            .first()
+            .ok_or(legato_client_core::ClientTransportError::MissingField(
+                "inode.layout.extents",
+            ))?;
+    transport
+        .fetch_extents(vec![ExtentRef {
+            file_id: inode.file_id,
+            extent_index: extent.extent_index,
+            file_offset: extent.file_offset,
+            length: extent.length,
+        }])
+        .await
 }
 
 #[tokio::test]

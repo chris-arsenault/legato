@@ -226,7 +226,9 @@ impl MetadataService {
         }))
     }
 
-    /// Reads one or more aligned block ranges from already opened file handles.
+    /// Legacy compatibility RPC for aligned block ranges from already opened file handles.
+    ///
+    /// New client code should resolve paths and fetch semantic extents instead.
     pub fn read_blocks(&self, request: ReadBlocksRequest) -> rusqlite::Result<Vec<BlockResponse>> {
         let mut responses = Vec::new();
 
@@ -467,8 +469,7 @@ mod tests {
     use std::fs;
 
     use legato_proto::{
-        CloseRequest, ListDirRequest, OpenRequest, ReadBlocksRequest, ResolvePathRequest,
-        StatRequest, TransferClass,
+        CloseRequest, ListDirRequest, OpenRequest, ResolvePathRequest, StatRequest, TransferClass,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -577,92 +578,6 @@ mod tests {
         });
 
         assert!(!service.is_handle_open(open.file_handle));
-    }
-
-    #[test]
-    fn read_blocks_returns_aligned_ranges_with_tail_hashes() {
-        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
-            build_service_fixture();
-
-        let open = service
-            .open(OpenRequest { path: sample_path })
-            .expect("open should succeed")
-            .expect("sample file should open");
-
-        let blocks = service
-            .read_blocks(ReadBlocksRequest {
-                ranges: vec![legato_proto::BlockRequest {
-                    file_handle: open.file_handle,
-                    start_offset: 0,
-                    block_count: 4,
-                }],
-            })
-            .expect("read blocks should succeed");
-
-        assert_eq!(
-            service.file_id_for_handle(open.file_handle),
-            Some(open.file_id)
-        );
-        assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0].offset, 0);
-        assert_eq!(blocks[0].data, b"abcd");
-        assert_eq!(
-            blocks[0].block_hash,
-            blake3::hash(b"abcd").as_bytes().to_vec()
-        );
-        assert_eq!(blocks[1].offset, 4);
-        assert_eq!(blocks[1].data, b"efgh");
-        assert_eq!(
-            blocks[1].block_hash,
-            blake3::hash(b"efgh").as_bytes().to_vec()
-        );
-        assert_eq!(blocks[2].offset, 8);
-        assert_eq!(blocks[2].data, b"ij");
-        assert_eq!(
-            blocks[2].block_hash,
-            blake3::hash(b"ij").as_bytes().to_vec()
-        );
-    }
-
-    #[test]
-    fn read_blocks_rejects_unknown_handles_and_unaligned_offsets() {
-        let (_library_dir, _db_dir, _library_root, mut service, sample_path) =
-            build_service_fixture();
-
-        let open = service
-            .open(OpenRequest { path: sample_path })
-            .expect("open should succeed")
-            .expect("sample file should open");
-
-        let unknown_handle_error = service
-            .read_blocks(ReadBlocksRequest {
-                ranges: vec![legato_proto::BlockRequest {
-                    file_handle: open.file_handle + 99,
-                    start_offset: 0,
-                    block_count: 1,
-                }],
-            })
-            .expect_err("unknown handles should be rejected");
-        assert!(
-            unknown_handle_error
-                .to_string()
-                .contains("unknown file handle"),
-            "error should mention the unknown handle: {unknown_handle_error}"
-        );
-
-        let unaligned_error = service
-            .read_blocks(ReadBlocksRequest {
-                ranges: vec![legato_proto::BlockRequest {
-                    file_handle: open.file_handle,
-                    start_offset: 2,
-                    block_count: 1,
-                }],
-            })
-            .expect_err("unaligned offsets should be rejected");
-        assert!(
-            unaligned_error.to_string().contains("not aligned"),
-            "error should mention alignment: {unaligned_error}"
-        );
     }
 
     fn build_service_fixture() -> (

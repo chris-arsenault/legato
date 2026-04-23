@@ -28,7 +28,7 @@ The system has three runtime components:
 
 - indexing the library dataset
 - resolving metadata and canonical paths
-- serving file blocks
+- serving semantic file extents
 - emitting invalidations when library content changes
 - exposing metrics and structured logs
 
@@ -39,7 +39,7 @@ It does not mount filesystems, and it does not depend on SMB or NFS on the hot p
 `legatofs` is the native Rust client binary. Its responsibilities are:
 
 - mounting the remote library as a local read-only filesystem
-- maintaining the local metadata and block cache
+- maintaining the local metadata and extent cache
 - serving reads from cache whenever possible
 - fetching cache misses from the server
 - subscribing to invalidations
@@ -68,14 +68,14 @@ The operational model is:
 - one containerized Rust server
 - read-only mount of the canonical library dataset
 - read-write mount for local application state
-- mounted TLS material for mTLS
+- server-managed TLS material for mTLS
 
 Suggested mount layout:
 
 ```text
 /mnt/pool/libraries            -> /srv/libraries:ro
 /mnt/pool/appdata/legato       -> /var/lib/legato
-/mnt/pool/appdata/legato/certs -> /etc/legato/certs:ro
+/mnt/pool/appdata/legato/tls   -> /var/lib/legato/tls
 ```
 
 Suggested server state layout:
@@ -171,9 +171,9 @@ Client-side reasons:
 
 SQLite is intentional here. The first version does not depend on shared Postgres infrastructure.
 
-### Local Block Storage
+### Local Extent Storage
 
-Client cached blocks are stored as content-addressed files on disk, with SQLite tracking metadata and residency state.
+Client cached extents are stored as local files on disk, with SQLite tracking metadata and residency state.
 
 This keeps verification and repair straightforward.
 
@@ -218,7 +218,7 @@ The system has explicit ownership boundaries:
 
 - the TrueNAS dataset is canonical content
 - `legato-server` owns server metadata and indexing state
-- `legatofs` owns the local metadata cache and block cache
+- `legatofs` owns the local metadata cache and extent cache
 - `legato-prefetch` owns project parsing and prefetch planning only
 
 `legato-prefetch` talks to the local client runtime, not directly to the server. Cache ownership and residency guarantees stay in one place.

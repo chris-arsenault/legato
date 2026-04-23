@@ -117,7 +117,7 @@ pub struct FilesystemService {
 }
 
 impl FilesystemService {
-    /// Connects to the remote server and opens the local metadata/block cache.
+    /// Connects to the remote server and opens the local metadata/extent cache.
     pub async fn connect(
         config: ClientConfig,
         client_name: impl Into<String>,
@@ -264,7 +264,7 @@ impl FilesystemService {
         assemble_read(&mut self.store, &snapshot, offset, size, now_ns)
     }
 
-    /// Applies one invalidation to the local metadata and block caches.
+    /// Applies one invalidation to the local metadata and extent caches.
     pub fn apply_invalidation(
         &mut self,
         event: &InvalidationEvent,

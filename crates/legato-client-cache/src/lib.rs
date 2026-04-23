@@ -1,4 +1,4 @@
-//! Local metadata and block-cache primitives shared by client-side components.
+//! Local metadata and extent-store primitives shared by client-side components.
 
 mod schema;
 
@@ -11,7 +11,7 @@ use std::{
 use legato_proto::{
     DirectoryEntry, ExtentRecord, FileMetadata, InvalidationEvent, InvalidationKind, TransferClass,
 };
-use legato_types::{BlockRange, FileId};
+use legato_types::FileId;
 use rusqlite::{Connection, OptionalExtension, params};
 pub use schema::{CLIENT_CACHE_SCHEMA_VERSION, cache_migrations};
 use serde::{Deserialize, Serialize};
@@ -21,31 +21,13 @@ const EXTENT_STORE_DIRTY_STATE_KEY: &str = "extent_store.dirty";
 const EXTENT_STORE_CHECKPOINT_KEY: &str = "extent_store.checkpoint";
 const EXTENT_STORE_PIN_GENERATION_KEY: &str = "extent_store.pin_generation";
 
-/// Identity for a single block cache entry.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct CacheKey {
-    /// Stable identifier of the file containing the block.
-    pub file_id: FileId,
-    /// Block-aligned starting offset in bytes.
-    pub start_offset: u64,
-}
-
-impl From<&BlockRange> for CacheKey {
-    fn from(range: &BlockRange) -> Self {
-        Self {
-            file_id: range.file_id,
-            start_offset: range.start_offset,
-        }
-    }
-}
-
 /// Minimal cache configuration used by the shared client runtime.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct CacheConfig {
     /// Total maximum size of the cache in bytes.
     pub max_bytes: u64,
-    /// Fixed block size used by the cache.
+    /// Default chunk size used by local fetch/cache planning.
     pub block_size: u32,
 }
 
@@ -173,19 +155,6 @@ impl MetadataCache {
     }
 }
 
-/// Block data returned from the local cache store after integrity verification.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CachedBlock {
-    /// Identity of the cached block.
-    pub key: CacheKey,
-    /// Verified on-disk block bytes.
-    pub data: Vec<u8>,
-    /// Stored content hash for the block.
-    pub content_hash: Vec<u8>,
-    /// Current pin generation for eviction policy.
-    pub pin_generation: u64,
-}
-
 /// Identity for one semantic extent in the local store.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExtentKey {
@@ -223,7 +192,7 @@ pub struct CacheMaintenanceReport {
     pub entries_removed: usize,
     /// Number of corrupt or missing entries repaired from the metadata database.
     pub repaired_entries: usize,
-    /// Number of orphaned files removed from the block store.
+    /// Number of orphaned files removed from the local store.
     pub orphan_files_removed: usize,
     /// Total bytes reclaimed across removed entries and orphan files.
     pub reclaimed_bytes: u64,
@@ -272,349 +241,11 @@ pub struct ExtentStoreRecoveryReport {
     pub eviction: CacheMaintenanceReport,
 }
 
-/// Persistent client-side block cache backed by the cache SQLite DB and block files.
-#[derive(Debug)]
-pub struct BlockCacheStore {
-    root_dir: PathBuf,
-    connection: Connection,
-}
-
 /// Persistent client-side extent store backed by the cache SQLite DB and extent files.
 #[derive(Debug)]
 pub struct ExtentCacheStore {
     root_dir: PathBuf,
     connection: Connection,
-}
-
-impl BlockCacheStore {
-    /// Creates a block cache store rooted at the provided directory.
-    pub fn new(root_dir: &Path, connection: Connection) -> rusqlite::Result<Self> {
-        fs::create_dir_all(root_dir)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        Ok(Self {
-            root_dir: root_dir.to_path_buf(),
-            connection,
-        })
-    }
-
-    /// Inserts or replaces one verified block in the local cache.
-    pub fn put_block(
-        &mut self,
-        key: &CacheKey,
-        block_count: u32,
-        data: &[u8],
-        pin_generation: u64,
-        now_ns: u64,
-    ) -> rusqlite::Result<CachedBlock> {
-        let content_hash = blake3::hash(data).as_bytes().to_vec();
-        let relative_path = block_storage_relative_path(&content_hash);
-        let absolute_path = self.root_dir.join(&relative_path);
-        if let Some(parent) = absolute_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        }
-        fs::write(&absolute_path, data)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-
-        self.connection.execute(
-            "INSERT INTO cache_entries (
-                 file_id, start_offset, block_count, content_hash, content_size, storage_relative_path,
-                 last_access_ns, pin_generation, state
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready')
-             ON CONFLICT(file_id, start_offset) DO UPDATE SET
-                 block_count = excluded.block_count,
-                 content_hash = excluded.content_hash,
-                 content_size = excluded.content_size,
-                 storage_relative_path = excluded.storage_relative_path,
-                 last_access_ns = excluded.last_access_ns,
-                 pin_generation = excluded.pin_generation,
-                 state = 'ready'",
-            params![
-                key.file_id.0 as i64,
-                key.start_offset as i64,
-                block_count as i64,
-                content_hash,
-                data.len() as i64,
-                relative_path.to_string_lossy(),
-                now_ns as i64,
-                pin_generation as i64
-            ],
-        )?;
-
-        Ok(CachedBlock {
-            key: key.clone(),
-            data: data.to_vec(),
-            content_hash: blake3::hash(data).as_bytes().to_vec(),
-            pin_generation,
-        })
-    }
-
-    /// Returns a verified cached block when it exists locally.
-    pub fn get_block(
-        &mut self,
-        key: &CacheKey,
-        now_ns: u64,
-    ) -> rusqlite::Result<Option<CachedBlock>> {
-        let row = self
-            .connection
-            .query_row(
-                "SELECT content_hash, storage_relative_path, pin_generation
-                 FROM cache_entries
-                 WHERE file_id = ?1 AND start_offset = ?2 AND state = 'ready'",
-                params![key.file_id.0 as i64, key.start_offset as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-
-        let Some((content_hash, relative_path, pin_generation)) = row else {
-            return Ok(None);
-        };
-
-        let absolute_path = self.root_dir.join(relative_path);
-        let data = fs::read(&absolute_path)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        let actual_hash = blake3::hash(&data).as_bytes().to_vec();
-        if actual_hash != content_hash {
-            self.connection.execute(
-                "DELETE FROM cache_entries WHERE file_id = ?1 AND start_offset = ?2",
-                params![key.file_id.0 as i64, key.start_offset as i64],
-            )?;
-            let _ = fs::remove_file(&absolute_path);
-            return Ok(None);
-        }
-
-        self.connection.execute(
-            "UPDATE cache_entries SET last_access_ns = ?3 WHERE file_id = ?1 AND start_offset = ?2",
-            params![key.file_id.0 as i64, key.start_offset as i64, now_ns as i64],
-        )?;
-
-        Ok(Some(CachedBlock {
-            key: key.clone(),
-            data,
-            content_hash,
-            pin_generation: pin_generation as u64,
-        }))
-    }
-
-    /// Removes all cached blocks for one file, used to maintain metadata/block coherence.
-    pub fn invalidate_file(&mut self, file_id: FileId) -> rusqlite::Result<usize> {
-        let paths = collect_storage_paths_for_file(&self.connection, file_id)?;
-        let deleted = self.connection.execute(
-            "DELETE FROM cache_entries WHERE file_id = ?1",
-            [file_id.0 as i64],
-        )?;
-        for path in paths {
-            let _ = fs::remove_file(self.root_dir.join(path));
-        }
-        Ok(deleted)
-    }
-
-    /// Applies an invalidation to the block cache when file identity is known.
-    pub fn apply_invalidation(&mut self, event: &InvalidationEvent) -> rusqlite::Result<()> {
-        let kind = InvalidationKind::try_from(event.kind).unwrap_or(InvalidationKind::Unspecified);
-        if matches!(
-            kind,
-            InvalidationKind::File | InvalidationKind::Directory | InvalidationKind::Subtree
-        ) && event.file_id != 0
-        {
-            let _ = self.invalidate_file(FileId(event.file_id))?;
-        }
-        Ok(())
-    }
-
-    /// Records fetch state for one block range.
-    pub fn record_fetch_state(
-        &mut self,
-        range: &BlockRange,
-        priority: i32,
-        state: &str,
-        now_ns: u64,
-    ) -> rusqlite::Result<()> {
-        self.connection.execute(
-            "INSERT INTO fetch_state (file_id, start_offset, block_count, priority, state, updated_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(file_id, start_offset) DO UPDATE SET
-                 block_count = excluded.block_count,
-                 priority = excluded.priority,
-                 state = excluded.state,
-                 updated_at_ns = excluded.updated_at_ns",
-            params![
-                range.file_id.0 as i64,
-                range.start_offset as i64,
-                range.block_count as i64,
-                priority,
-                state,
-                now_ns as i64
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Records one pin generation for eviction-sensitive ranges.
-    pub fn record_pin(
-        &mut self,
-        generation: u64,
-        reason: &str,
-        created_at_ns: u64,
-    ) -> rusqlite::Result<()> {
-        self.connection.execute(
-            "INSERT OR REPLACE INTO pins (generation, reason, created_at_ns) VALUES (?1, ?2, ?3)",
-            params![generation as i64, reason, created_at_ns as i64],
-        )?;
-        Ok(())
-    }
-
-    /// Exposes the underlying SQLite connection for higher-level orchestration tests.
-    #[must_use]
-    pub fn connection(&self) -> &Connection {
-        &self.connection
-    }
-
-    /// Returns the logical size of all tracked cache entries.
-    pub fn total_size_bytes(&self) -> rusqlite::Result<u64> {
-        self.connection
-            .query_row(
-                "SELECT COALESCE(SUM(content_size), 0) FROM cache_entries",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|total| total.max(0) as u64)
-    }
-
-    /// Evicts least-recently-used, oldest-pin entries until the cache fits within the limit.
-    pub fn evict_to_limit(&mut self, max_bytes: u64) -> rusqlite::Result<CacheMaintenanceReport> {
-        let bytes_before = self.total_size_bytes()?;
-        if bytes_before <= max_bytes {
-            return Ok(CacheMaintenanceReport {
-                bytes_before,
-                bytes_after: bytes_before,
-                ..CacheMaintenanceReport::default()
-            });
-        }
-
-        let mut report = CacheMaintenanceReport {
-            bytes_before,
-            bytes_after: bytes_before,
-            ..CacheMaintenanceReport::default()
-        };
-        let mut statement = self.connection.prepare(
-            "SELECT file_id, start_offset, content_size, storage_relative_path
-             FROM cache_entries
-             ORDER BY pin_generation ASC, last_access_ns ASC, start_offset ASC",
-        )?;
-        let victims = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut remaining = bytes_before;
-        for (file_id, start_offset, content_size, relative_path) in victims {
-            if remaining <= max_bytes {
-                break;
-            }
-            self.connection.execute(
-                "DELETE FROM cache_entries WHERE file_id = ?1 AND start_offset = ?2",
-                params![file_id, start_offset],
-            )?;
-            let _ = fs::remove_file(self.root_dir.join(&relative_path));
-            report.entries_removed += 1;
-            report.reclaimed_bytes = report
-                .reclaimed_bytes
-                .saturating_add(content_size.max(0) as u64);
-            remaining = remaining.saturating_sub(content_size.max(0) as u64);
-        }
-
-        report.bytes_after = self.total_size_bytes()?;
-        Ok(report)
-    }
-
-    /// Removes corrupt, missing, and orphaned cache artifacts from the local store.
-    pub fn repair(&mut self) -> rusqlite::Result<CacheMaintenanceReport> {
-        let bytes_before = self.total_size_bytes()?;
-        let mut report = CacheMaintenanceReport {
-            bytes_before,
-            bytes_after: bytes_before,
-            ..CacheMaintenanceReport::default()
-        };
-        let mut statement = self.connection.prepare(
-            "SELECT file_id, start_offset, content_hash, content_size, storage_relative_path
-             FROM cache_entries",
-        )?;
-        let entries = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut referenced_paths = BTreeSet::new();
-
-        for (file_id, start_offset, expected_hash, content_size, relative_path) in entries {
-            let absolute_path = self.root_dir.join(&relative_path);
-            referenced_paths.insert(relative_path.clone());
-            let healthy = fs::read(&absolute_path)
-                .ok()
-                .is_some_and(|data| blake3::hash(&data).as_bytes() == expected_hash.as_slice());
-
-            if healthy {
-                continue;
-            }
-
-            self.connection.execute(
-                "DELETE FROM cache_entries WHERE file_id = ?1 AND start_offset = ?2",
-                params![file_id, start_offset],
-            )?;
-            let _ = fs::remove_file(&absolute_path);
-            report.entries_removed += 1;
-            report.repaired_entries += 1;
-            report.reclaimed_bytes = report
-                .reclaimed_bytes
-                .saturating_add(content_size.max(0) as u64);
-        }
-
-        for entry in WalkDir::new(&self.root_dir)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let relative_path = entry
-                .path()
-                .strip_prefix(&self.root_dir)
-                .expect("walkdir entries should remain under the root")
-                .to_string_lossy()
-                .into_owned();
-            if referenced_paths.contains(&relative_path) {
-                continue;
-            }
-
-            let size = entry.metadata().map_or(0, |metadata| metadata.len());
-            fs::remove_file(entry.path())
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            report.orphan_files_removed += 1;
-            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(size);
-        }
-
-        report.bytes_after = self.total_size_bytes()?;
-        Ok(report)
-    }
 }
 
 impl ExtentCacheStore {
@@ -1191,28 +822,8 @@ fn path_starts_with(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
 }
 
-fn block_storage_relative_path(content_hash: &[u8]) -> PathBuf {
-    let hex = content_hash
-        .iter()
-        .flat_map(|byte| [hex_char(byte >> 4), hex_char(byte & 0x0f)])
-        .collect::<String>();
-    PathBuf::from(&hex[0..2]).join(hex)
-}
-
 fn extent_storage_relative_path(file_id: u64, extent_index: u32) -> PathBuf {
     PathBuf::from(file_id.to_string()).join(format!("{extent_index}.bin"))
-}
-
-fn collect_storage_paths_for_file(
-    connection: &Connection,
-    file_id: FileId,
-) -> rusqlite::Result<Vec<String>> {
-    let mut statement = connection.prepare(
-        "SELECT storage_relative_path FROM cache_entries WHERE file_id = ?1 ORDER BY start_offset",
-    )?;
-    statement
-        .query_map([file_id.0 as i64], |row| row.get::<_, String>(0))?
-        .collect()
 }
 
 fn collect_extent_storage_paths_for_file(
@@ -1225,14 +836,6 @@ fn collect_extent_storage_paths_for_file(
     statement
         .query_map([file_id.0 as i64], |row| row.get::<_, String>(0))?
         .collect()
-}
-
-fn hex_char(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
-        _ => '0',
-    }
 }
 
 fn trim_empty_directories(root_dir: &Path) -> rusqlite::Result<usize> {
@@ -1264,30 +867,20 @@ fn trim_empty_directories(root_dir: &Path) -> rusqlite::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockCacheStore, CLIENT_CACHE_SCHEMA_VERSION, CacheConfig, CacheKey, CachedExtent,
-        ExtentCacheStore, ExtentKey, MetadataCache, MetadataCacheLookup, MetadataCachePolicy,
-        block_storage_relative_path, open_cache_database,
+        CLIENT_CACHE_SCHEMA_VERSION, CacheConfig, CachedExtent, ExtentCacheStore, ExtentKey,
+        MetadataCache, MetadataCacheLookup, MetadataCachePolicy, open_cache_database,
     };
     use legato_proto::{
         DirectoryEntry, ExtentRecord, FileMetadata, InvalidationEvent, InvalidationKind,
         TransferClass,
     };
-    use legato_types::{BlockRange, FileId};
+    use legato_types::FileId;
     use tempfile::tempdir;
 
     #[test]
-    fn cache_key_is_derived_from_block_identity() {
-        let range = BlockRange {
-            file_id: FileId(42),
-            start_offset: 2 << 20,
-            block_count: 1,
-        };
-
-        let key = CacheKey::from(&range);
-
-        assert_eq!(key.file_id, FileId(42));
-        assert_eq!(key.start_offset, 2 << 20);
+    fn cache_config_defaults_to_large_local_store_and_megabyte_chunks() {
         assert_eq!(CacheConfig::default().block_size, 1 << 20);
+        assert!(CacheConfig::default().max_bytes > 1_000_000_000);
     }
 
     #[test]
@@ -1347,65 +940,6 @@ mod tests {
             cache.list_dir("/srv/libraries/Kontakt", 105),
             MetadataCacheLookup::Miss
         ));
-    }
-
-    #[test]
-    fn block_cache_store_round_trips_and_verifies_integrity() {
-        let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
-            .expect("store should open");
-        let key = CacheKey {
-            file_id: FileId(7),
-            start_offset: 0,
-        };
-
-        let cached = store
-            .put_block(&key, 1, b"fixture", 2, 100)
-            .expect("block should be cached");
-        let loaded = store
-            .get_block(&key, 200)
-            .expect("cached block should load")
-            .expect("cached block should exist");
-
-        assert_eq!(cached.data, b"fixture");
-        assert_eq!(loaded.data, b"fixture");
-        assert_eq!(loaded.pin_generation, 2);
-    }
-
-    #[test]
-    fn block_cache_store_invalidates_corrupt_or_stale_entries() {
-        let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
-            .expect("store should open");
-        let key = CacheKey {
-            file_id: FileId(7),
-            start_offset: 0,
-        };
-        let cached = store
-            .put_block(&key, 1, b"fixture", 2, 100)
-            .expect("block should be cached");
-        let path: String = store
-            .connection()
-            .query_row(
-                "SELECT storage_relative_path FROM cache_entries WHERE file_id = 7 AND start_offset = 0",
-                [],
-                |row| row.get(0),
-            )
-            .expect("storage path should exist");
-        std::fs::write(temp.path().join("blocks").join(path), b"corrupt")
-            .expect("fixture should be corrupted");
-
-        assert!(
-            store
-                .get_block(&key, 200)
-                .expect("corrupt entry read should succeed")
-                .is_none()
-        );
-        assert_eq!(cached.key.file_id, FileId(7));
     }
 
     #[test]
@@ -1710,90 +1244,6 @@ mod tests {
                 .expect("checkpoint should exist")
                 .updated_at_ns,
             300
-        );
-        assert!(!orphan.exists());
-    }
-
-    #[test]
-    fn block_cache_store_evicts_oldest_entries_to_fit_budget() {
-        let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
-            .expect("store should open");
-
-        for index in 0..3_u64 {
-            let key = CacheKey {
-                file_id: FileId(7),
-                start_offset: index * 4096,
-            };
-            store
-                .put_block(
-                    &key,
-                    1,
-                    format!("fixture-{index}").as_bytes(),
-                    index + 1,
-                    100 + index,
-                )
-                .expect("block should be inserted");
-        }
-
-        let report = store
-            .evict_to_limit("fixture-2".len() as u64 + 1)
-            .expect("eviction should succeed");
-
-        assert!(report.entries_removed >= 2);
-        assert!(
-            store.total_size_bytes().expect("size should load") <= "fixture-2".len() as u64 + 1
-        );
-        assert!(
-            store
-                .get_block(
-                    &CacheKey {
-                        file_id: FileId(7),
-                        start_offset: 8192,
-                    },
-                    200,
-                )
-                .expect("latest block lookup should succeed")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn block_cache_store_repairs_corrupt_entries_and_orphans() {
-        let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("cache").join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = BlockCacheStore::new(&temp.path().join("blocks"), connection)
-            .expect("store should open");
-        let key = CacheKey {
-            file_id: FileId(9),
-            start_offset: 0,
-        };
-        let data = b"fixture";
-        let hash = blake3::hash(data).as_bytes().to_vec();
-        let relative = block_storage_relative_path(&hash);
-        store
-            .put_block(&key, 1, data, 1, 100)
-            .expect("block should be inserted");
-        std::fs::write(temp.path().join("blocks").join(&relative), b"corrupt")
-            .expect("cached block should be corrupted");
-
-        let orphan = temp.path().join("blocks").join("aa").join("orphan.bin");
-        std::fs::create_dir_all(orphan.parent().expect("orphan should have a parent"))
-            .expect("orphan directory should exist");
-        std::fs::write(&orphan, b"orphan").expect("orphan file should be created");
-
-        let report = store.repair().expect("repair should succeed");
-
-        assert_eq!(report.repaired_entries, 1);
-        assert_eq!(report.orphan_files_removed, 1);
-        assert!(
-            store
-                .get_block(&key, 200)
-                .expect("lookup should succeed")
-                .is_none()
         );
         assert!(!orphan.exists());
     }

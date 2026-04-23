@@ -107,7 +107,7 @@ If the caller asks to wait through a priority, completion means those accepted r
 The client runtime includes:
 
 - a metadata cache for path and directory lookups
-- a block cache on local disk
+- an extent cache on local disk
 - fetch coordination so overlapping requests share work
 - prefetch scheduling and residency tracking
 - reconnect and stale-handle recovery
@@ -130,9 +130,9 @@ Legato does not attempt cross-client cache coherence beyond the server invalidat
 The system is designed to degrade in predictable ways:
 
 - if the server is unavailable and the data is already cached, playback can continue from cache
-- if a cache miss occurs during a partition, the read blocks until timeout and then fails
-- if a cached block fails integrity verification, it is evicted and refetched
-- if server-local handles become stale after restart, the client reopens and retries
+- if a cache miss occurs during a partition, the read waits until timeout and then fails
+- if a cached extent fails integrity verification, it is evicted and refetched
+- if transport state becomes stale after restart, the client reconnects and retries
 - if project parsing cannot produce a precise prefetch set, the system falls back to a broader but safe prefetch shape
 
 The important design rule is that failure should degrade to slower behavior or over-fetching, not silent corruption.
@@ -144,7 +144,7 @@ The system emits structured tracing and Prometheus-style metrics.
 The intended visibility includes:
 
 - cache hit and miss behavior
-- block-fetch latency
+- extent-fetch latency
 - invalidation activity
 - prefetch queue or residency behavior
 - bytes served from cache versus network
