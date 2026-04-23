@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn client_store_applies_change_batch_and_persists_cursor_after_reopen() {
+    fn client_store_persists_cursor_and_resumes_replay_after_reopen() {
         let temp = tempdir().expect("tempdir should exist");
         let state = temp.path().join("state");
         let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
@@ -650,12 +650,66 @@ mod tests {
 
         drop(store);
 
-        let reopened = ClientLegatoStore::open(&state, 200).expect("store should reopen");
+        let mut reopened = ClientLegatoStore::open(&state, 200).expect("store should reopen");
         assert_eq!(reopened.subscription_cursor(), 3);
         assert!(reopened.resolve_path("/Kontakt").is_some());
         assert_eq!(
             reopened
                 .resolve_path("/Kontakt/piano.nki")
+                .and_then(|inode| inode.layout.map(|layout| layout.extents.len())),
+            Some(1)
+        );
+
+        reopened
+            .apply_change_record(&ChangeRecord {
+                sequence: 4,
+                kind: ChangeKind::Delete as i32,
+                file_id: 7,
+                path: String::from("/Kontakt/piano.nki"),
+                inode: None,
+                entries: Vec::new(),
+            })
+            .expect("delete replay should apply after reopen");
+        reopened
+            .apply_change_record(&ChangeRecord {
+                sequence: 5,
+                kind: ChangeKind::Upsert as i32,
+                file_id: 8,
+                path: String::from("/Kontakt/strings.nki"),
+                inode: Some(InodeMetadata {
+                    file_id: 8,
+                    path: String::from("/Kontakt/strings.nki"),
+                    size: 21,
+                    mtime_ns: 124,
+                    is_dir: false,
+                    layout: Some(FileLayout {
+                        transfer_class: TransferClass::Streamed as i32,
+                        extents: vec![ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 21,
+                            extent_hash: Vec::new(),
+                        }],
+                    }),
+                    inode_generation: 2,
+                    content_hash: b"strings-data".to_vec(),
+                }),
+                entries: Vec::new(),
+            })
+            .expect("replay resume should apply after reopen");
+
+        assert_eq!(reopened.subscription_cursor(), 5);
+        assert!(reopened.resolve_path("/Kontakt/piano.nki").is_none());
+        assert!(reopened.resolve_path("/Kontakt/strings.nki").is_some());
+
+        drop(reopened);
+
+        let reopened_again = ClientLegatoStore::open(&state, 300).expect("store should reopen");
+        assert_eq!(reopened_again.subscription_cursor(), 5);
+        assert!(reopened_again.resolve_path("/Kontakt/piano.nki").is_none());
+        assert_eq!(
+            reopened_again
+                .resolve_path("/Kontakt/strings.nki")
                 .and_then(|inode| inode.layout.map(|layout| layout.extents.len())),
             Some(1)
         );

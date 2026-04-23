@@ -734,7 +734,7 @@ mod tests {
             .expect("listener should bind");
         let address = listener.local_addr().expect("addr should be available");
         let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
-        let bound = server
+        let first_bound = server
             .bind(
                 listener,
                 Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
@@ -790,7 +790,10 @@ mod tests {
         assert!(service.open_handle(handle.local_handle).is_none());
 
         drop(service);
-        bound.shutdown().await.expect("server should shut down");
+        first_bound
+            .shutdown()
+            .await
+            .expect("server should shut down");
     }
 
     #[tokio::test]
