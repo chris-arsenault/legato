@@ -45,6 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     telemetry.record_startup();
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
+    let server_metrics = ServerRuntimeMetrics::new(telemetry.clone());
+    let _client_metrics_cleanup = server_metrics.spawn_client_metrics_cleanup(shutdown.token());
     ensure_server_tls_materials(
         Path::new(&process_config.server.tls_dir),
         &process_config.server.tls,
@@ -54,10 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_address = parse_bind_address(&process_config.server.bind_address)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
-    let server = LiveServer::bootstrap_with_metrics(
-        process_config.server,
-        Some(ServerRuntimeMetrics::new(telemetry.clone())),
-    )?;
+    let server = LiveServer::bootstrap_with_metrics(process_config.server, Some(server_metrics))?;
     let bound = server.bind(listener, Some(runtime_tls)).await?;
     telemetry.set_lifecycle_state("ready", 1);
     println!("legato-server bootstrap ready");

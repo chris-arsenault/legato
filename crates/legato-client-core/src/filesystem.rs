@@ -17,6 +17,8 @@ use legato_types::{FileId, FilesystemAttributes};
 
 use crate::{ClientConfig, ClientRuntimeMetrics, GrpcClientTransport, LocalControlPlane};
 
+const CLIENT_METRICS_REPORT_INTERVAL_NS: u64 = 5_000_000_000;
+
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
 pub fn now_monotonic_ns() -> u64 {
@@ -109,6 +111,8 @@ pub struct FilesystemService {
     store: ClientLegatoStore,
     metrics: Option<ClientRuntimeMetrics>,
     max_cache_bytes: u64,
+    last_metrics_report_ns: u64,
+    metrics_dirty: bool,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
 }
@@ -141,15 +145,20 @@ impl FilesystemService {
             store,
             metrics,
             max_cache_bytes,
+            last_metrics_report_ns: 0,
+            metrics_dirty: false,
             next_handle: 1,
             open_handles: HashMap::new(),
         };
+        let mut service = service;
         if let Some(metrics) = &service.metrics {
             metrics.record_residency(
                 service.store.resident_bytes(),
                 service.store.resident_extent_count() as u64,
             );
+            service.metrics_dirty = true;
         }
+        service.report_metrics_if_due(true).await;
         Ok(service)
     }
 
@@ -185,6 +194,7 @@ impl FilesystemService {
         self.sync_changes().await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.control.resolve_path(path, now_ns) {
+            self.report_metrics_if_due(false).await;
             return Ok(metadata_to_attributes(metadata));
         }
 
@@ -194,6 +204,7 @@ impl FilesystemService {
             .await
             .map_err(map_lookup_error(path))?;
         self.control.register_path(metadata.clone(), now_ns);
+        self.report_metrics_if_due(false).await;
         Ok(metadata_to_attributes(metadata))
     }
 
@@ -205,6 +216,7 @@ impl FilesystemService {
         self.sync_changes().await?;
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.control.list_dir(path, now_ns) {
+            self.report_metrics_if_due(false).await;
             return Ok(entries);
         }
 
@@ -214,6 +226,7 @@ impl FilesystemService {
             .await
             .map_err(map_lookup_error(path))?;
         self.control.register_dir(path, entries.clone(), now_ns);
+        self.report_metrics_if_due(false).await;
         Ok(entries)
     }
 
@@ -235,6 +248,7 @@ impl FilesystemService {
         self.next_handle += 1;
         self.open_handles
             .insert(handle.local_handle, handle.clone());
+        self.report_metrics_if_due(false).await;
         Ok(handle)
     }
 
@@ -244,6 +258,7 @@ impl FilesystemService {
             return Err(FilesystemServiceError::UnknownHandle(local_handle));
         };
         let _ = handle;
+        self.report_metrics_if_due(false).await;
         Ok(())
     }
 
@@ -309,7 +324,9 @@ impl FilesystemService {
                 remote_bytes,
                 started.elapsed().as_nanos() as u64,
             );
+            self.metrics_dirty = true;
         }
+        self.report_metrics_if_due(false).await;
         Ok(bytes)
     }
 
@@ -328,6 +345,7 @@ impl FilesystemService {
                 self.store.resident_bytes(),
                 self.store.resident_extent_count() as u64,
             );
+            self.metrics_dirty = true;
         }
         Ok(())
     }
@@ -373,6 +391,7 @@ impl FilesystemService {
                 self.transport.reconnect().await?;
                 if let Some(metrics) = &self.metrics {
                     metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
+                    self.metrics_dirty = true;
                 }
                 for record in self
                     .transport
@@ -414,6 +433,7 @@ impl FilesystemService {
                 self.transport.reconnect().await?;
                 if let Some(metrics) = &self.metrics {
                     metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
+                    self.metrics_dirty = true;
                 }
                 self.sync_changes().await?;
                 let refreshed = self
@@ -456,6 +476,7 @@ impl FilesystemService {
             let report = self.store.evict_to_limit(self.max_cache_bytes)?;
             if let Some(metrics) = &self.metrics {
                 metrics.record_eviction(&report);
+                self.metrics_dirty = true;
             }
         } else {
             self.store.checkpoint()?;
@@ -464,9 +485,31 @@ impl FilesystemService {
                     self.store.resident_bytes(),
                     self.store.resident_extent_count() as u64,
                 );
+                self.metrics_dirty = true;
             }
         }
         Ok(())
+    }
+
+    async fn report_metrics_if_due(&mut self, force: bool) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        if !self.metrics_dirty && !force {
+            return;
+        }
+        let snapshot = metrics.snapshot();
+        let now_ns = now_monotonic_ns();
+        if !force
+            && now_ns.saturating_sub(self.last_metrics_report_ns)
+                < CLIENT_METRICS_REPORT_INTERVAL_NS
+        {
+            return;
+        }
+        if self.transport.report_metrics(&snapshot).await.is_ok() {
+            self.last_metrics_report_ns = now_ns;
+            self.metrics_dirty = false;
+        }
     }
 
     fn refresh_handles_from_change(&mut self, record: &ChangeRecord) {

@@ -159,6 +159,26 @@ impl MetricsRegistry {
         samples
     }
 
+    /// Inserts or replaces one fully-specified metric sample.
+    pub fn upsert_sample(&self, sample: MetricSample) {
+        let key = sample_key(&sample.name, &sample.labels);
+        let mut registry = self
+            .samples
+            .lock()
+            .expect("metrics registry mutex should not be poisoned");
+        registry.insert(key, MetricEntry { sample });
+    }
+
+    /// Removes one metric sample from the registry when it is present.
+    pub fn remove_sample(&self, name: &str, labels: &BTreeMap<String, String>) {
+        let key = sample_key(name, labels);
+        let mut registry = self
+            .samples
+            .lock()
+            .expect("metrics registry mutex should not be poisoned");
+        registry.remove(&key);
+    }
+
     /// Renders the registry in Prometheus exposition format.
     #[must_use]
     pub fn render_prometheus(&self) -> String {

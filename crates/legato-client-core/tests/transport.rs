@@ -1,13 +1,14 @@
 //! End-to-end coverage for the live gRPC client transport.
 
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use legato_client_core::{
     ClientConfig, ClientTlsConfig, GrpcClientTransport, RetryPolicy, SessionStatus,
 };
+use legato_foundation::{MetricKind, MetricSample, MetricsConfig, ProcessTelemetry};
 use legato_proto::{Capability, ExtentRef, TransferClass};
 use legato_server::{
-    LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
+    LiveServer, ServerConfig, ServerRuntimeMetrics, ServerTlsConfig, ensure_server_tls_materials,
     issue_client_tls_bundle, load_runtime_tls,
 };
 use tempfile::tempdir;
@@ -24,6 +25,18 @@ fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -
             multiplier: 2,
         },
         ..ClientConfig::default()
+    }
+}
+
+fn reported_metric_sample(name: &str, value: i64) -> MetricSample {
+    let mut labels = BTreeMap::new();
+    labels.insert(String::from("service"), String::from("legatofs"));
+    MetricSample {
+        name: String::from(name),
+        kind: MetricKind::Counter,
+        help: String::from("test metric"),
+        labels,
+        value,
     }
 }
 
@@ -240,6 +253,90 @@ async fn grpc_client_transport_reconnects_and_fetches_extents_after_restart() {
     assert_eq!(records[0].data, vec![0x5a; 4096]);
 
     second_bound
+        .shutdown()
+        .await
+        .expect("server should shut down cleanly");
+}
+
+#[tokio::test]
+async fn grpc_client_transport_reports_metrics_to_server_aggregation_surface() {
+    let fixture = tempdir().expect("tempdir should be created");
+    let library_root = fixture.path().join("library");
+    let state_dir = fixture.path().join("state");
+    let tls_dir = fixture.path().join("tls");
+    fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+    fs::write(
+        library_root.join("Kontakt").join("piano.nki"),
+        b"hello legato",
+    )
+    .expect("sample should be written");
+
+    let mut config = ServerConfig {
+        bind_address: String::from("127.0.0.1:0"),
+        library_root: library_root.to_string_lossy().into_owned(),
+        state_dir: state_dir.to_string_lossy().into_owned(),
+        tls_dir: tls_dir.to_string_lossy().into_owned(),
+        tls: ServerTlsConfig::local_dev(&tls_dir),
+    };
+    config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+    ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+        .expect("tls materials should be created");
+
+    let telemetry = ProcessTelemetry::new(
+        "legato-server",
+        &MetricsConfig {
+            bind_address: None,
+            prefix: String::from("legato"),
+        },
+    );
+    let server_metrics = ServerRuntimeMetrics::new(telemetry);
+    let server = LiveServer::bootstrap_with_metrics(config.clone(), Some(server_metrics.clone()))
+        .expect("server should bootstrap");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener addr should be available");
+    let runtime_tls = load_runtime_tls(&config.tls).expect("runtime tls should load");
+    let bound = server
+        .bind(listener, Some(runtime_tls))
+        .await
+        .expect("server should bind");
+
+    let bundle_dir = fixture.path().join("bundle");
+    issue_client_tls_bundle(
+        Path::new(&config.tls_dir),
+        &config.tls,
+        "studio-mac",
+        &bundle_dir,
+    )
+    .expect("client bundle should be issued");
+
+    let client_config = local_client_config(address.to_string(), &bundle_dir, "localhost");
+    let mut transport = GrpcClientTransport::connect(client_config, "studio-mac")
+        .await
+        .expect("client should connect");
+    transport
+        .report_metrics(&[reported_metric_sample("legatofs_client_read_total", 7)])
+        .await
+        .expect("metric report should succeed");
+
+    let snapshot = server_metrics.snapshot();
+    assert!(snapshot.iter().any(|sample| {
+        sample.name == "legatofs_client_read_total"
+            && sample.value == 7
+            && sample
+                .labels
+                .get("client_name")
+                .is_some_and(|value| value == "studio-mac")
+            && sample
+                .labels
+                .get("service")
+                .is_some_and(|value| value == "legatofs")
+    }));
+
+    bound
         .shutdown()
         .await
         .expect("server should shut down cleanly");

@@ -2,6 +2,7 @@
 
 use std::{fs, time::Duration};
 
+use legato_foundation::{MetricKind as LocalMetricKind, MetricSample};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
@@ -17,8 +18,9 @@ use tonic::{
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
     AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, ExtentRef, FetchRequest,
-    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, PROTOCOL_VERSION,
-    ResolvePathRequest, ResolveRequest, StatRequest, SubscribeChangesRequest, SubscribeRequest,
+    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, MetricKind, MetricLabel,
+    PROTOCOL_VERSION, ReportClientMetricsRequest, ReportedMetric, ResolvePathRequest,
+    ResolveRequest, StatRequest, SubscribeChangesRequest, SubscribeRequest,
     legato_client::LegatoClient,
 };
 
@@ -343,6 +345,40 @@ impl GrpcClientTransport {
             records.push(record);
         }
         Ok(records)
+    }
+
+    /// Reports one full client metrics snapshot to the server aggregation surface.
+    pub async fn report_metrics(
+        &mut self,
+        samples: &[MetricSample],
+    ) -> Result<(), ClientTransportError> {
+        let reported = samples
+            .iter()
+            .map(|sample| ReportedMetric {
+                name: sample.name.clone(),
+                kind: match sample.kind {
+                    LocalMetricKind::Counter => MetricKind::Counter as i32,
+                    LocalMetricKind::Gauge => MetricKind::Gauge as i32,
+                },
+                help: sample.help.clone(),
+                labels: sample
+                    .labels
+                    .iter()
+                    .map(|(key, value)| MetricLabel {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+                value: sample.value,
+            })
+            .collect();
+        self.client
+            .report_client_metrics(ReportClientMetricsRequest {
+                client_name: self.client_name.clone(),
+                samples: reported,
+            })
+            .await?;
+        Ok(())
     }
 
     /// Loads ordered change records after the supplied sequence cursor.

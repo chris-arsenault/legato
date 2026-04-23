@@ -7,6 +7,7 @@ service Legato {
   rpc Resolve(ResolveRequest) returns (ResolveResponse);
   rpc Fetch(FetchRequest) returns (stream ExtentRecord);
   rpc Hint(HintRequest) returns (HintResponse);
+  rpc ReportClientMetrics(ReportClientMetricsRequest) returns (ReportClientMetricsResponse);
   rpc SubscribeChanges(SubscribeChangesRequest) returns (stream ChangeRecord);
   rpc Stat(StatRequest) returns (StatResponse);
   rpc ListDir(ListDirRequest) returns (ListDirResponse);
@@ -54,6 +55,12 @@ enum ChangeKind {
   CHANGE_KIND_DELETE = 2;
   CHANGE_KIND_INVALIDATE = 3;
   CHANGE_KIND_CHECKPOINT = 4;
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_COUNTER = 1;
+  METRIC_KIND_GAUGE = 2;
 }
 
 message AttachRequest {
@@ -149,6 +156,28 @@ message HintRequest {
 message HintResponse {
   repeated HintExtent accepted = 1;
   repeated HintExtent completed = 2;
+}
+
+message MetricLabel {
+  string key = 1;
+  string value = 2;
+}
+
+message ReportedMetric {
+  string name = 1;
+  MetricKind kind = 2;
+  string help = 3;
+  repeated MetricLabel labels = 4;
+  sint64 value = 5;
+}
+
+message ReportClientMetricsRequest {
+  string client_name = 1;
+  repeated ReportedMetric samples = 2;
+}
+
+message ReportClientMetricsResponse {
+  uint32 accepted_samples = 1;
 }
 
 message SubscribeChangesRequest {

@@ -129,32 +129,26 @@ Current limitations remain:
 - no unified server aggregation endpoint yet
 - no first-class compaction metrics emitted from explicit maintenance commands yet
 
-## Proposed Unified Metrics Endpoint
+## Unified Metrics Endpoint
 
-The preferred future shape is a single scrape surface on the server.
+Legato now supports a single canonical scrape surface on the server.
 
-That model would work like this:
+Current behavior:
 
-- clients and prefetch workers emit their local runtime metrics as they do work
-- those metrics are forwarded to the server rather than scraped from each client directly
-- the server maintains an aggregated registry that includes both server-local and client-reported metrics
-- Influx, Prometheus, or any other downstream collector reads only from the server metrics endpoint
+- clients and prefetch workers still emit metrics into their local in-process registry
+- the shared client runtime periodically reports full metric snapshots upstream to the server
+- the server stores fresh client samples in its own registry with `client_name` labels attached
+- the server metrics exporter exposes both server-local and client-reported metrics on one endpoint
 
 Operationally, that gives Legato one canonical metrics endpoint:
 
 - `legato-server:/metrics`
 
-Instead of:
+instead of requiring one scrape target per workstation.
 
-- one metrics endpoint per client machine
-- separate scraping and service discovery for laptops and workstations
-- partial visibility when a client exporter is disabled or unreachable
+### Current Behavior
 
-This is the right shape for this project because the server is already the stable always-on component, while clients are comparatively ephemeral.
-
-### Proposed Behavior
-
-Under this model, clients would report metrics such as:
+Client-reported metrics forwarded to the server include:
 
 - cache hit and miss counts
 - bytes read locally vs fetched remotely
@@ -162,30 +156,31 @@ Under this model, clients would report metrics such as:
 - prefetch duration and bytes warmed
 - reconnect count and reconnect duration
 - invalidation count and invalidation handling lag
-- cache eviction and compaction activity
+- automatic cache eviction activity
 
-The server would then expose:
+The server now exposes:
 
 - its own local metrics
 - per-client metrics labeled by client identity
-- fleet-wide rolled-up counters and gauges where aggregation is meaningful
+
+Each client-reported sample is exported with:
+
+- the original metric name
+- the original metric labels
+- an added `client_name` label
 
 Useful labels would include:
 
 - `client_name`
-- `host`
-- `platform`
-- `mount_id`
-- `library`
+- `service`
 
 ### Proposal Constraints
 
-To keep the unified endpoint correct, the aggregation model should follow a few rules:
+The aggregation model currently follows these rules:
 
-- monotonic counters should be reported as deltas or otherwise deduplicated so reconnecting clients do not double-count
-- gauges should carry freshness semantics so stale disconnected clients do not look healthy forever
-- per-client series should age out after a timeout if the server stops hearing from that client
-- the server should preserve enough label information to debug one machine without losing the ability to graph totals
+- clients report full snapshots, not deltas, so reconnects replace the current value instead of incrementing the server registry twice
+- stale client series are pruned after a timeout if the server stops hearing from that client
+- per-client label fidelity is preserved so one host can still be isolated in graphs or queries
 
 ### Sink Topology
 

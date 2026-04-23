@@ -1,6 +1,7 @@
 //! gRPC runtime wiring for the Legato server daemon.
 
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -9,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+use legato_foundation::{MetricKind as LocalMetricKind, MetricSample};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
@@ -27,7 +29,8 @@ use tonic::{
 use legato_client_cache::catalog::{CatalogInode, CatalogStore, inode_to_proto};
 use legato_proto::{
     AttachRequest, AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, FetchRequest,
-    FileMetadata, HintRequest, HintResponse, ListDirRequest, ListDirResponse, ResolvePathRequest,
+    FileMetadata, HintRequest, HintResponse, ListDirRequest, ListDirResponse, MetricKind,
+    ReportClientMetricsRequest, ReportClientMetricsResponse, ReportedMetric, ResolvePathRequest,
     ResolvePathResponse, ResolveRequest, ResolveResponse, StatRequest, StatResponse,
     SubscribeChangesRequest, SubscribeRequest,
     legato_server::{Legato, LegatoServer},
@@ -340,6 +343,24 @@ impl Legato for LiveServer {
         }))
     }
 
+    async fn report_client_metrics(
+        &self,
+        request: Request<ReportClientMetricsRequest>,
+    ) -> Result<Response<ReportClientMetricsResponse>, Status> {
+        let request = request.into_inner();
+        let samples = request
+            .samples
+            .iter()
+            .map(reported_metric_to_sample)
+            .collect::<Result<Vec<_>, _>>()?;
+        let accepted_samples = self.metrics.as_ref().map_or(0, |metrics| {
+            metrics.record_client_snapshot(&request.client_name, &samples)
+        });
+        Ok(Response::new(ReportClientMetricsResponse {
+            accepted_samples: accepted_samples as u32,
+        }))
+    }
+
     async fn subscribe_changes(
         &self,
         request: Request<SubscribeChangesRequest>,
@@ -537,6 +558,27 @@ fn catalog_inode_to_metadata(inode: CatalogInode) -> FileMetadata {
         content_hash: inode.content_hash,
         is_dir: inode.is_dir,
     }
+}
+
+fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, Status> {
+    let kind = match MetricKind::try_from(metric.kind).unwrap_or(MetricKind::Unspecified) {
+        MetricKind::Counter => LocalMetricKind::Counter,
+        MetricKind::Gauge => LocalMetricKind::Gauge,
+        MetricKind::Unspecified => {
+            return Err(Status::invalid_argument("reported metric kind is required"));
+        }
+    };
+    Ok(MetricSample {
+        name: metric.name.clone(),
+        kind,
+        help: metric.help.clone(),
+        labels: metric
+            .labels
+            .iter()
+            .map(|label| (label.key.clone(), label.value.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        value: metric.value,
+    })
 }
 
 #[cfg(test)]
