@@ -131,7 +131,7 @@ impl ClientLegatoStore {
         let Some(extent) = inode
             .extents
             .iter()
-            .find(|extent| extent.extent_index == extent_index)
+            .find(|extent| extent.extent_index == extent_index && extent.is_resident())
         else {
             return Ok(None);
         };
@@ -152,7 +152,7 @@ impl ClientLegatoStore {
             .active_paths()
             .into_iter()
             .filter_map(|path| self.catalog.resolve_path(&path))
-            .flat_map(|inode| inode.extents.iter())
+            .flat_map(|inode| inode.extents.iter().filter(|extent| extent.is_resident()))
             .map(|extent| extent.length)
             .sum()
     }
@@ -164,7 +164,13 @@ impl ClientLegatoStore {
             .active_paths()
             .into_iter()
             .filter_map(|path| self.catalog.resolve_path(&path))
-            .map(|inode| inode.extents.len())
+            .map(|inode| {
+                inode
+                    .extents
+                    .iter()
+                    .filter(|extent| extent.is_resident())
+                    .count()
+            })
             .sum()
     }
 
@@ -188,8 +194,24 @@ impl ClientLegatoStore {
             .as_ref()
             .map(|inode| inode.extents.clone())
             .unwrap_or_default();
-        extents.retain(|extent| extent.extent_index != resident.extent_index);
-        extents.push(resident.clone());
+        let mut replaced = false;
+        for extent in &mut extents {
+            if extent.extent_index != resident.extent_index {
+                continue;
+            }
+            extent.segment_id = resident.segment_id;
+            extent.segment_offset = resident.segment_offset;
+            if extent.payload_hash.is_empty() {
+                extent.payload_hash = resident.payload_hash.clone();
+            }
+            if extent.length == 0 {
+                extent.length = resident.length;
+            }
+            replaced = true;
+        }
+        if !replaced {
+            extents.push(resident.clone());
+        }
         extents.sort_by_key(|extent| extent.extent_index);
 
         let inode = if let Some(mut inode) = existing {
@@ -323,7 +345,7 @@ impl ClientLegatoStore {
             if remaining <= max_resident_bytes {
                 break;
             }
-            if inode.is_dir || inode.extents.is_empty() {
+            if inode.is_dir || inode.extents.iter().all(|extent| !extent.is_resident()) {
                 continue;
             }
 
@@ -333,18 +355,19 @@ impl ClientLegatoStore {
                     std::cmp::Reverse(extent.extent_index),
                 )
             });
-            let mut retained = Vec::new();
-            for extent in inode.extents {
-                if remaining > max_resident_bytes {
+            let mut updated_extents = Vec::with_capacity(inode.extents.len());
+            for mut extent in inode.extents {
+                if extent.is_resident() && remaining > max_resident_bytes {
                     remaining = remaining.saturating_sub(extent.length);
                     removed_extents += 1;
                     removed_bytes = removed_bytes.saturating_add(extent.length);
-                } else {
-                    retained.push(extent);
+                    extent.segment_id = None;
+                    extent.segment_offset = None;
                 }
+                updated_extents.push(extent);
             }
-            retained.sort_by_key(|extent| extent.extent_index);
-            inode.extents = retained;
+            updated_extents.sort_by_key(|extent| extent.extent_index);
+            inode.extents = updated_extents;
             let _ = self.catalog.append_inode(inode)?;
         }
         self.checkpoint()?;
@@ -377,6 +400,7 @@ fn proto_to_catalog_inode(
 ) -> CatalogInode {
     let resident_by_index = resident_extents
         .into_iter()
+        .filter(|extent| extent.is_resident())
         .map(|extent| (extent.extent_index, extent))
         .collect::<BTreeMap<_, _>>();
     let extents = inode
@@ -386,15 +410,30 @@ fn proto_to_catalog_inode(
             layout
                 .extents
                 .iter()
-                .filter_map(|extent| {
-                    resident_by_index
+                .map(|extent| {
+                    let resident = resident_by_index
                         .get(&extent.extent_index)
-                        .and_then(|resident| {
-                            (resident.file_offset == extent.file_offset
+                        .filter(|resident| {
+                            resident.file_offset == extent.file_offset
                                 && resident.length == extent.length
-                                && resident.payload_hash == extent.extent_hash)
-                                .then_some(resident.clone())
-                        })
+                                && (extent.extent_hash.is_empty()
+                                    || resident.payload_hash == extent.extent_hash)
+                        });
+                    CatalogExtent {
+                        extent_index: extent.extent_index,
+                        file_offset: extent.file_offset,
+                        length: extent.length,
+                        payload_hash: if extent.extent_hash.is_empty() {
+                            resident
+                                .map(|resident| resident.payload_hash.clone())
+                                .unwrap_or_default()
+                        } else {
+                            extent.extent_hash.clone()
+                        },
+                        transfer_class: layout.transfer_class,
+                        segment_id: resident.and_then(|resident| resident.segment_id),
+                        segment_offset: resident.and_then(|resident| resident.segment_offset),
+                    }
                 })
                 .collect()
         })
@@ -429,6 +468,25 @@ mod tests {
     };
     use legato_types::FileId;
     use tempfile::tempdir;
+
+    #[test]
+    fn client_store_tracks_authoritative_layout_without_residency() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(sample_inode())
+            .expect("inode should record");
+
+        let inode = store
+            .resolve_path("/library/piano.wav")
+            .expect("inode should resolve");
+
+        assert_eq!(inode.layout.expect("layout should exist").extents.len(), 1);
+        assert_eq!(store.resident_extent_count(), 0);
+        assert_eq!(store.resident_bytes(), 0);
+        assert!(store.get_extent(FileId(7), 0).expect("lookup").is_none());
+    }
 
     #[test]
     fn client_store_round_trips_resident_extent_after_reopen() {
@@ -504,6 +562,10 @@ mod tests {
         assert_eq!(report.resident_bytes_after, 5);
         assert!(store.get_extent(FileId(7), 0).expect("lookup").is_some());
         assert!(store.get_extent(FileId(7), 1).expect("lookup").is_none());
+        let inode = store
+            .resolve_path("/library/piano.wav")
+            .expect("inode should still resolve after eviction");
+        assert_eq!(inode.layout.expect("layout should exist").extents.len(), 2);
     }
 
     #[test]
@@ -579,14 +641,24 @@ mod tests {
 
         assert_eq!(store.subscription_cursor(), 3);
         assert!(store.resolve_path("/Kontakt").is_some());
-        assert!(store.resolve_path("/Kontakt/piano.nki").is_some());
+        assert_eq!(
+            store
+                .resolve_path("/Kontakt/piano.nki")
+                .and_then(|inode| inode.layout.map(|layout| layout.extents.len())),
+            Some(1)
+        );
 
         drop(store);
 
         let reopened = ClientLegatoStore::open(&state, 200).expect("store should reopen");
         assert_eq!(reopened.subscription_cursor(), 3);
         assert!(reopened.resolve_path("/Kontakt").is_some());
-        assert!(reopened.resolve_path("/Kontakt/piano.nki").is_some());
+        assert_eq!(
+            reopened
+                .resolve_path("/Kontakt/piano.nki")
+                .and_then(|inode| inode.layout.map(|layout| layout.extents.len())),
+            Some(1)
+        );
     }
 
     #[test]
@@ -650,7 +722,7 @@ mod tests {
                     extent_index: 0,
                     file_offset: 0,
                     length: 13,
-                    extent_hash: Vec::new(),
+                    extent_hash: blake3::hash(b"resident-data").as_bytes().to_vec(),
                 }],
             }),
             inode_generation: 1,
@@ -687,13 +759,13 @@ mod tests {
                         extent_index: 0,
                         file_offset: 0,
                         length: 5,
-                        extent_hash: Vec::new(),
+                        extent_hash: blake3::hash(b"first").as_bytes().to_vec(),
                     },
                     ExtentDescriptor {
                         extent_index: 1,
                         file_offset: 5,
                         length: 6,
-                        extent_hash: Vec::new(),
+                        extent_hash: blake3::hash(b"second").as_bytes().to_vec(),
                     },
                 ],
             }),

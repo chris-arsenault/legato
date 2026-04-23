@@ -113,7 +113,10 @@ mod tests {
     #[test]
     fn server_bootstrap_matches_workspace_protocol_version() {
         let server = Server::new(ServerConfig::default());
-        assert_eq!(server.attach_response(&[]).protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            server.attach_response(&[]).protocol_version,
+            PROTOCOL_VERSION
+        );
         assert_eq!(ServerConfig::default().library_root, "/srv/libraries");
     }
 }

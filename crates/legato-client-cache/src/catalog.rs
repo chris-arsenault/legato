@@ -29,14 +29,24 @@ pub struct CatalogExtent {
     pub file_offset: u64,
     /// Extent byte length.
     pub length: u64,
-    /// Segment containing the extent payload.
-    pub segment_id: u64,
-    /// Byte offset of the extent payload record inside the segment.
-    pub segment_offset: u64,
     /// BLAKE3 hash of the extent payload.
     pub payload_hash: Vec<u8>,
     /// Transfer class assigned during ingest.
     pub transfer_class: i32,
+    /// Segment containing the locally resident extent payload when present.
+    #[serde(default)]
+    pub segment_id: Option<u64>,
+    /// Byte offset of the resident extent payload record inside the segment.
+    #[serde(default)]
+    pub segment_offset: Option<u64>,
+}
+
+impl CatalogExtent {
+    /// Returns whether the extent payload is resident in the local segment store.
+    #[must_use]
+    pub fn is_resident(&self) -> bool {
+        self.segment_id.is_some() && self.segment_offset.is_some()
+    }
 }
 
 /// Active inode metadata and extent map for a file or directory.
@@ -278,10 +288,10 @@ impl CatalogStore {
             extent_index,
             file_offset,
             length: payload.len() as u64,
-            segment_id,
-            segment_offset,
             payload_hash: blake3::hash(payload).as_bytes().to_vec(),
             transfer_class: transfer_class as i32,
+            segment_id: Some(segment_id),
+            segment_offset: Some(segment_offset),
         })
     }
 
@@ -371,22 +381,34 @@ impl CatalogStore {
         &self,
         extent: &CatalogExtent,
     ) -> Result<Vec<u8>, CatalogStoreError> {
+        let segment_id = extent
+            .segment_id
+            .ok_or(CatalogStoreError::NonResidentExtent {
+                extent_index: extent.extent_index,
+                file_offset: extent.file_offset,
+            })?;
+        let segment_offset = extent
+            .segment_offset
+            .ok_or(CatalogStoreError::NonResidentExtent {
+                extent_index: extent.extent_index,
+                file_offset: extent.file_offset,
+            })?;
         let path = self
             .root_dir
             .join("segments")
-            .join(segment_file_name(extent.segment_id));
+            .join(segment_file_name(segment_id));
         let scan = repair_incomplete_tail(&path)?;
         let record = scan
             .records
             .into_iter()
             .find(|record| {
                 record.kind == StoreRecordKind::Extent
-                    && record.segment_offset == extent.segment_offset
+                    && record.segment_offset == segment_offset
                     && record.payload_hash.as_slice() == extent.payload_hash.as_slice()
             })
             .ok_or(CatalogStoreError::MissingExtent {
-                segment_id: extent.segment_id,
-                segment_offset: extent.segment_offset,
+                segment_id,
+                segment_offset,
             })?;
         Ok(record.payload)
     }
@@ -720,6 +742,13 @@ pub enum CatalogStoreError {
     Segment(SegmentStoreError),
     /// Catalog JSON serialization failed.
     Json(serde_json::Error),
+    /// Extent layout is known but no resident payload is currently attached.
+    NonResidentExtent {
+        /// Logical extent index.
+        extent_index: u32,
+        /// File-relative byte offset.
+        file_offset: u64,
+    },
     /// Expected extent payload was not present in the referenced segment.
     MissingExtent {
         /// Segment identifier.
@@ -747,6 +776,13 @@ impl std::fmt::Display for CatalogStoreError {
             }
             Self::Segment(source) => write!(formatter, "{source}"),
             Self::Json(source) => write!(formatter, "catalog JSON failed: {source}"),
+            Self::NonResidentExtent {
+                extent_index,
+                file_offset,
+            } => write!(
+                formatter,
+                "extent {extent_index} at file offset {file_offset} is not resident"
+            ),
             Self::MissingExtent {
                 segment_id,
                 segment_offset,
@@ -764,6 +800,7 @@ impl std::error::Error for CatalogStoreError {
             Self::Io { source, .. } => Some(source),
             Self::Segment(source) => Some(source),
             Self::Json(source) => Some(source),
+            Self::NonResidentExtent { .. } => None,
             Self::MissingExtent { .. } => None,
         }
     }
@@ -904,10 +941,10 @@ mod tests {
                     extent_index: 0,
                     file_offset: 0,
                     length: 4096,
-                    segment_id: 9,
-                    segment_offset: 128,
                     payload_hash: blake3::hash(b"payload").as_bytes().to_vec(),
                     transfer_class: TransferClass::Streamed as i32,
+                    segment_id: Some(9),
+                    segment_offset: Some(128),
                 }],
             },
         )
