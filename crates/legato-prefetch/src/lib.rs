@@ -7,12 +7,11 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use legato_client_cache::open_cache_database;
+use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{ClientConfig, FilesystemOpenHandle, FilesystemService};
 use legato_foundation::load_config;
 use legato_types::{PrefetchHintPath, PrefetchPriority};
 use regex::Regex;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 /// Supported project/input formats understood by the prefetch planner.
@@ -736,18 +735,14 @@ fn hint_already_resident(
         return Ok(false);
     }
 
-    let connection = open_cache_database(&state_dir.join("client.sqlite"))
+    let store = ClientLegatoStore::open(state_dir, 0)
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
     for extent in required {
-        let present: Option<i64> = connection
-            .query_row(
-                "SELECT 1 FROM extent_entries WHERE file_id = ?1 AND extent_index = ?2 AND state = 'ready'",
-                [handle.file_id.0 as i64, extent.extent_index as i64],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-        if present.is_none() {
+        if store
+            .get_extent(handle.file_id, extent.extent_index)
+            .map_err(|error| PrefetchError::Runtime(error.to_string()))?
+            .is_none()
+        {
             return Ok(false);
         }
     }
@@ -755,15 +750,8 @@ fn hint_already_resident(
 }
 
 fn local_extent_bytes(state_dir: &Path) -> Result<u64, PrefetchError> {
-    let connection = open_cache_database(&state_dir.join("client.sqlite"))
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    connection
-        .query_row(
-            "SELECT COALESCE(SUM(content_size), 0) FROM extent_entries WHERE state = 'ready'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|value| value.max(0) as u64)
+    ClientLegatoStore::open(state_dir, 0)
+        .map(|store| store.resident_bytes())
         .map_err(|error| PrefetchError::Runtime(error.to_string()))
 }
 

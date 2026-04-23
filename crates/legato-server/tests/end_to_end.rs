@@ -3,9 +3,7 @@
 use std::{fs, io::Write, path::Path};
 
 use flate2::{Compression, write::GzEncoder};
-use legato_client_cache::{
-    ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
-};
+use legato_client_cache::{MetadataCache, MetadataCachePolicy, client_store::ClientLegatoStore};
 use legato_client_core::{
     ClientConfig, ClientTlsConfig, FilesystemService, LocalControlPlane, RetryPolicy,
 };
@@ -42,10 +40,8 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
             .expect("resolve should succeed")
             .expect("sample should resolve"),
     );
-    let client_db =
-        open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =
-        ExtentCacheStore::new(&temp.path().join("extents"), client_db).expect("store should open");
+        ClientLegatoStore::open(temp.path().join("client-state"), 1).expect("store should open");
     let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
     control.register_resolved_path(inode.clone(), 1);
 
@@ -121,10 +117,8 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
             .expect("resolve should succeed")
             .expect("sample should resolve"),
     );
-    let client_db =
-        open_cache_database(&temp.path().join("client.sqlite")).expect("client cache should open");
     let mut store =
-        ExtentCacheStore::new(&temp.path().join("extents"), client_db).expect("store should open");
+        ClientLegatoStore::open(temp.path().join("client-state"), 1).expect("store should open");
     let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
     control.register_resolved_path(inode.clone(), 1);
 

@@ -84,6 +84,18 @@ impl ClientLegatoStore {
         }))
     }
 
+    /// Returns total logical resident payload bytes currently referenced by active inodes.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.catalog
+            .active_paths()
+            .into_iter()
+            .filter_map(|path| self.catalog.resolve_path(&path))
+            .flat_map(|inode| inode.extents.iter())
+            .map(|extent| extent.length)
+            .sum()
+    }
+
     /// Appends a fetched extent and marks it resident in the local inode extent map.
     pub fn put_extent(
         &mut self,

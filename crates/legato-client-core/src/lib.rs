@@ -6,11 +6,13 @@ mod transport;
 use std::{collections::HashMap, fs, io::Cursor, path::Path, sync::Arc};
 
 use legato_client_cache::{
-    CacheConfig, CachedExtent, ExtentCacheStore, ExtentKey, MetadataCache, MetadataCacheLookup,
+    CacheConfig, MetadataCache, MetadataCacheLookup,
+    catalog::CatalogStoreError,
+    client_store::{ClientLegatoStore, ResidentExtent},
 };
 use legato_proto::{
-    AttachRequest, DirectoryEntry, ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata,
-    InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
+    AttachRequest, DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout, FileMetadata,
+    InodeMetadata, InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
     PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
 };
 use legato_types::{
@@ -383,7 +385,7 @@ fn backoff_delay_ms(policy: &RetryPolicy, failure_count: u32) -> u64 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchPlan {
     /// Extents already resident in the local cache.
-    pub cached: Vec<CachedExtent>,
+    pub cached: Vec<ResidentExtent>,
     /// Extents that still require a server-side transfer.
     pub missing: Vec<ExtentRange>,
     /// Number of active waiters now attached to the requested keys.
@@ -393,7 +395,7 @@ pub struct FetchPlan {
 /// In-memory coordinator that deduplicates overlapping extent fetches.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FetchCoordinator {
-    inflight_waiters: HashMap<ExtentKey, usize>,
+    inflight_waiters: HashMap<PrefetchKey, usize>,
 }
 
 impl FetchCoordinator {
@@ -408,15 +410,14 @@ impl FetchCoordinator {
     /// Plans the cache lookups and remote fetches required for one semantic extent.
     pub fn prepare_extent(
         &mut self,
-        store: &mut ExtentCacheStore,
+        store: &mut ClientLegatoStore,
         extent: &ExtentRange,
-        now_ns: u64,
-    ) -> rusqlite::Result<FetchPlan> {
-        let key = ExtentKey {
+    ) -> Result<FetchPlan, CatalogStoreError> {
+        let key = PrefetchKey {
             file_id: extent.file_id,
             extent_index: extent.extent_index,
         };
-        if let Some(cached) = store.get_extent(&key, now_ns)? {
+        if let Some(cached) = store.get_extent(extent.file_id, extent.extent_index)? {
             return Ok(FetchPlan {
                 cached: vec![cached],
                 missing: Vec::new(),
@@ -440,29 +441,23 @@ impl FetchCoordinator {
     /// Completes one fetched extent and records it in the local cache.
     pub fn complete_extent(
         &mut self,
-        store: &mut ExtentCacheStore,
+        store: &mut ClientLegatoStore,
         extent: &ExtentRange,
         data: &[u8],
-        pin_generation: u64,
-        now_ns: u64,
-    ) -> rusqlite::Result<CachedExtent> {
-        let key = ExtentKey {
+    ) -> Result<ResidentExtent, CatalogStoreError> {
+        let key = PrefetchKey {
             file_id: extent.file_id,
             extent_index: extent.extent_index,
         };
         self.inflight_waiters.remove(&key);
-        store.put_extent(
-            &legato_proto::ExtentRecord {
-                file_id: extent.file_id.0,
-                extent_index: extent.extent_index,
-                file_offset: extent.file_offset,
-                data: data.to_vec(),
-                extent_hash: Vec::new(),
-                transfer_class: 0,
-            },
-            pin_generation,
-            now_ns,
-        )
+        store.put_extent(&ExtentRecord {
+            file_id: extent.file_id.0,
+            extent_index: extent.extent_index,
+            file_offset: extent.file_offset,
+            data: data.to_vec(),
+            extent_hash: Vec::new(),
+            transfer_class: 0,
+        })
     }
 }
 
@@ -487,8 +482,8 @@ pub struct PrefetchSchedule {
 /// Tracks cache residency and executes prefetch requests through the local cache store.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrefetchExecutor {
-    residency: HashMap<ExtentKey, PrefetchPriority>,
-    pin_generation: u64,
+    residency: HashMap<PrefetchKey, PrefetchPriority>,
+    execution_generation: u64,
 }
 
 impl PrefetchExecutor {
@@ -497,7 +492,7 @@ impl PrefetchExecutor {
     pub fn new() -> Self {
         Self {
             residency: HashMap::new(),
-            pin_generation: 0,
+            execution_generation: 0,
         }
     }
 
@@ -506,59 +501,54 @@ impl PrefetchExecutor {
         &mut self,
         request: &PrefetchRequest,
         coordinator: &mut FetchCoordinator,
-        store: &mut ExtentCacheStore,
-        now_ns: u64,
+        store: &mut ClientLegatoStore,
         mut source: F,
-    ) -> rusqlite::Result<PrefetchExecution>
+    ) -> Result<PrefetchExecution, CatalogStoreError>
     where
         F: FnMut(&ExtentRange) -> Vec<u8>,
     {
         let schedule = schedule_prefetch_request(request);
-        self.pin_generation = store.begin_pin_generation("prefetch", now_ns)?;
+        self.execution_generation = self.execution_generation.saturating_add(1);
 
         let mut accepted = Vec::new();
         let mut completed = Vec::new();
 
         for entry in &schedule.extents {
             accepted.push(entry.extent.clone());
-            let key = ExtentKey {
+            let key = PrefetchKey {
                 file_id: entry.extent.file_id,
                 extent_index: entry.extent.extent_index,
             };
-            store.record_extent_fetch_state(
-                &key,
-                prefetch_priority_rank(entry.priority),
-                "queued",
-                now_ns,
-            )?;
 
-            let plan = coordinator.prepare_extent(store, &entry.extent, now_ns)?;
+            let plan = coordinator.prepare_extent(store, &entry.extent)?;
             for extent in plan.missing {
                 let data = source(&extent);
-                let cached = coordinator.complete_extent(
-                    store,
-                    &extent,
-                    &data,
-                    self.pin_generation,
-                    now_ns,
-                )?;
-                self.residency.insert(cached.key, entry.priority);
+                let cached = coordinator.complete_extent(store, &extent, &data)?;
+                self.residency.insert(
+                    PrefetchKey {
+                        file_id: cached.file_id,
+                        extent_index: cached.extent_index,
+                    },
+                    entry.priority,
+                );
             }
 
             for extent in plan.cached {
-                self.residency.insert(extent.key, entry.priority);
+                self.residency.insert(
+                    PrefetchKey {
+                        file_id: extent.file_id,
+                        extent_index: extent.extent_index,
+                    },
+                    entry.priority,
+                );
             }
 
-            store.record_extent_fetch_state(
-                &key,
-                prefetch_priority_rank(entry.priority),
-                "resident",
-                now_ns,
-            )?;
+            self.residency.insert(key, entry.priority);
             if priority_satisfies_wait(entry.priority, schedule.wait_through) {
                 completed.push(entry.extent.clone());
             }
         }
+        store.checkpoint()?;
 
         Ok(PrefetchExecution {
             accepted,
@@ -569,7 +559,7 @@ impl PrefetchExecutor {
     /// Returns the most recent pin generation used by the executor.
     #[must_use]
     pub fn current_pin_generation(&self) -> u64 {
-        self.pin_generation
+        self.execution_generation
     }
 
     /// Returns whether the extent is resident at or above the required priority.
@@ -579,7 +569,7 @@ impl PrefetchExecutor {
         extent: &ExtentRange,
         required_priority: PrefetchPriority,
     ) -> bool {
-        let key = ExtentKey {
+        let key = PrefetchKey {
             file_id: extent.file_id,
             extent_index: extent.extent_index,
         };
@@ -685,32 +675,33 @@ impl LocalControlPlane {
         &mut self,
         hints: &[PrefetchHintPath],
         wait_through: PrefetchPriority,
-        store: &mut ExtentCacheStore,
+        store: &mut ClientLegatoStore,
         now_ns: u64,
         source: F,
-    ) -> rusqlite::Result<PrefetchExecution>
+    ) -> Result<PrefetchExecution, CatalogStoreError>
     where
         F: FnMut(&ExtentRange) -> Vec<u8>,
     {
+        let _ = now_ns;
+        let mut extents = Vec::new();
+        for hint in hints {
+            if let Some(inode) = self
+                .canonical_paths
+                .get(hint.path.to_string_lossy().as_ref())
+                .cloned()
+            {
+                store.record_inode(inode.clone())?;
+                extents.extend(extents_for_hint(&inode, hint).into_iter().map(|extent| {
+                    PrefetchPlanEntry {
+                        extent,
+                        priority: hint.priority,
+                    }
+                }));
+            }
+        }
+
         let request = PrefetchRequest {
-            extents: hints
-                .iter()
-                .flat_map(|hint| {
-                    self.canonical_paths
-                        .get(hint.path.to_string_lossy().as_ref())
-                        .cloned()
-                        .map(|inode| {
-                            extents_for_hint(&inode, hint)
-                                .into_iter()
-                                .map(|extent| PrefetchPlanEntry {
-                                    extent,
-                                    priority: hint.priority,
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect(),
+            extents,
             wait_through,
         };
 
@@ -718,7 +709,6 @@ impl LocalControlPlane {
             &request,
             &mut self.fetch_coordinator,
             store,
-            now_ns,
             source,
         )
     }
@@ -817,8 +807,10 @@ pub fn schedule_prefetch_request(request: &PrefetchRequest) -> PrefetchSchedule 
     }
 }
 
-fn prefetch_priority_rank(priority: PrefetchPriority) -> i32 {
-    proto_prefetch_priority(priority)
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PrefetchKey {
+    file_id: FileId,
+    extent_index: u32,
 }
 
 fn priority_satisfies_wait(priority: PrefetchPriority, wait_through: PrefetchPriority) -> bool {
@@ -851,7 +843,7 @@ mod tests {
         RetryPolicy, SessionStatus, build_tls_client_config, schedule_prefetch_request,
     };
     use legato_client_cache::{
-        ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
+        MetadataCache, MetadataCachePolicy, client_store::ClientLegatoStore,
     };
     use legato_proto::{
         ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata, InvalidationEvent,
@@ -990,12 +982,13 @@ mod tests {
     #[test]
     fn fetch_coordinator_deduplicates_overlapping_extents() {
         let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
-            .expect("store should open");
+        let mut store =
+            ClientLegatoStore::open(temp.path().join("state"), 100).expect("store should open");
         let mut coordinator = FetchCoordinator::new();
 
+        store
+            .record_inode(sample_prefetch_inode())
+            .expect("inode should record");
         let first = coordinator
             .prepare_extent(
                 &mut store,
@@ -1005,7 +998,6 @@ mod tests {
                     file_offset: 0,
                     length: 4096,
                 },
-                100,
             )
             .expect("first fetch plan should succeed");
         assert_eq!(first.missing.len(), 1);
@@ -1019,7 +1011,6 @@ mod tests {
                     file_offset: 0,
                     length: 4096,
                 },
-                100,
             )
             .expect("second fetch plan should succeed");
         assert!(second.missing.is_empty());
@@ -1034,8 +1025,6 @@ mod tests {
                     length: 4096,
                 },
                 b"abcd",
-                1,
-                100,
             )
             .expect("completed extent should persist");
         let cached = coordinator
@@ -1047,7 +1036,6 @@ mod tests {
                     file_offset: 0,
                     length: 4096,
                 },
-                200,
             )
             .expect("cached fetch plan should succeed");
         assert_eq!(cached.cached.len(), 1);
@@ -1057,10 +1045,11 @@ mod tests {
     #[test]
     fn prefetch_executor_tracks_residency_by_priority() {
         let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
-            .expect("store should open");
+        let mut store =
+            ClientLegatoStore::open(temp.path().join("state"), 100).expect("store should open");
+        store
+            .record_inode(sample_prefetch_inode())
+            .expect("inode should record");
         let mut coordinator = FetchCoordinator::new();
         let mut executor = PrefetchExecutor::new();
         let request = PrefetchRequest {
@@ -1088,7 +1077,7 @@ mod tests {
         };
 
         let execution = executor
-            .execute_with_source(&request, &mut coordinator, &mut store, 100, |extent| {
+            .execute_with_source(&request, &mut coordinator, &mut store, |extent| {
                 format!("extent-{}", extent.extent_index).into_bytes()
             })
             .expect("prefetch execution should succeed");
@@ -1118,10 +1107,8 @@ mod tests {
     #[test]
     fn local_control_plane_resolves_paths_prefetches_and_refreshes_on_invalidation() {
         let temp = tempdir().expect("tempdir should be created");
-        let connection = open_cache_database(&temp.path().join("client.sqlite"))
-            .expect("cache database should open");
-        let mut store = ExtentCacheStore::new(&temp.path().join("extents"), connection)
-            .expect("store should open");
+        let mut store =
+            ClientLegatoStore::open(temp.path().join("state"), 100).expect("store should open");
         let mut control =
             LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
         control.register_resolved_path(
@@ -1224,6 +1211,33 @@ mod tests {
                 .resolve_path("/srv/libraries/Kontakt/piano.nki", 201)
                 .is_none()
         );
+    }
+
+    fn sample_prefetch_inode() -> InodeMetadata {
+        InodeMetadata {
+            file_id: 7,
+            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+            size: 8192,
+            mtime_ns: 10,
+            is_dir: false,
+            layout: Some(FileLayout {
+                transfer_class: 0,
+                extents: vec![
+                    ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 4096,
+                        extent_hash: Vec::new(),
+                    },
+                    ExtentDescriptor {
+                        extent_index: 1,
+                        file_offset: 4096,
+                        length: 4096,
+                        extent_hash: Vec::new(),
+                    },
+                ],
+            }),
+        }
     }
 
     #[test]
