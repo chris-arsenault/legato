@@ -2,7 +2,11 @@
 
 use std::{fs, time::Duration};
 
-use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tonic::{
     Status,
     transport::{
@@ -34,9 +38,23 @@ pub struct GrpcInvalidationSubscription {
     task: JoinHandle<()>,
 }
 
+/// Streaming change subscription tied to one live gRPC session.
+#[derive(Debug)]
+pub struct GrpcChangeSubscription {
+    receiver: mpsc::Receiver<ChangeDelivery>,
+    task: JoinHandle<()>,
+}
+
 #[derive(Debug)]
 enum InvalidationDelivery {
     Event(InvalidationEvent),
+    Closed,
+    Error(ClientTransportError),
+}
+
+#[derive(Debug)]
+enum ChangeDelivery {
+    Record(ChangeRecord),
     Closed,
     Error(ClientTransportError),
 }
@@ -46,6 +64,17 @@ enum InvalidationDelivery {
 pub enum InvalidationPoll {
     /// One invalidation event is ready.
     Event(InvalidationEvent),
+    /// The stream is still open but currently idle.
+    Empty,
+    /// The remote side closed the subscription.
+    Closed,
+}
+
+/// Non-blocking change poll result.
+#[derive(Debug)]
+pub enum ChangePoll {
+    /// One ordered change record is ready.
+    Record(ChangeRecord),
     /// The stream is still open but currently idle.
     Empty,
     /// The remote side closed the subscription.
@@ -75,6 +104,34 @@ impl GrpcInvalidationSubscription {
 }
 
 impl Drop for GrpcInvalidationSubscription {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl GrpcChangeSubscription {
+    /// Receives the next ordered change record from the remote stream.
+    pub async fn recv_next(&mut self) -> Result<Option<ChangeRecord>, ClientTransportError> {
+        match self.receiver.recv().await {
+            Some(ChangeDelivery::Record(record)) => Ok(Some(record)),
+            Some(ChangeDelivery::Closed) | None => Ok(None),
+            Some(ChangeDelivery::Error(error)) => Err(error),
+        }
+    }
+
+    /// Polls the next change record without waiting.
+    pub fn try_recv_next(&mut self) -> Result<ChangePoll, ClientTransportError> {
+        match self.receiver.try_recv() {
+            Ok(ChangeDelivery::Record(record)) => Ok(ChangePoll::Record(record)),
+            Ok(ChangeDelivery::Closed) => Ok(ChangePoll::Closed),
+            Ok(ChangeDelivery::Error(error)) => Err(error),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(ChangePoll::Empty),
+            Err(mpsc::error::TryRecvError::Disconnected) => Ok(ChangePoll::Closed),
+        }
+    }
+}
+
+impl Drop for GrpcChangeSubscription {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -293,16 +350,60 @@ impl GrpcClientTransport {
         &mut self,
         since_sequence: u64,
     ) -> Result<Vec<ChangeRecord>, ClientTransportError> {
-        let mut stream = self
-            .client
-            .subscribe_changes(SubscribeChangesRequest { since_sequence })
-            .await?
-            .into_inner();
+        let mut subscription = self.subscribe_changes(since_sequence).await?;
         let mut records = Vec::new();
-        while let Some(record) = stream.message().await? {
-            records.push(record);
+        loop {
+            match timeout(Duration::from_millis(100), subscription.recv_next()).await {
+                Ok(Ok(Some(record))) => records.push(record),
+                Ok(Ok(None)) | Err(_) => break,
+                Ok(Err(error)) => return Err(error),
+            }
         }
         Ok(records)
+    }
+
+    /// Subscribes to the live ordered change stream for the current transport generation.
+    pub async fn subscribe_changes(
+        &mut self,
+        since_sequence: u64,
+    ) -> Result<GrpcChangeSubscription, ClientTransportError> {
+        let mut client = self.client.clone();
+        self.runtime.mark_subscription_active();
+        let (sender, receiver) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            let mut stream = match client
+                .subscribe_changes(SubscribeChangesRequest { since_sequence })
+                .await
+            {
+                Ok(response) => response.into_inner(),
+                Err(error) => {
+                    let _ = sender
+                        .send(ChangeDelivery::Error(ClientTransportError::from(error)))
+                        .await;
+                    return;
+                }
+            };
+            loop {
+                match stream.message().await {
+                    Ok(Some(record)) => {
+                        if sender.send(ChangeDelivery::Record(record)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = sender.send(ChangeDelivery::Closed).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender
+                            .send(ChangeDelivery::Error(ClientTransportError::from(error)))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(GrpcChangeSubscription { receiver, task })
     }
 
     /// Subscribes to the server invalidation stream for the current transport generation.

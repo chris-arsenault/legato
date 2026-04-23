@@ -15,7 +15,10 @@ use tokio::{
     task::JoinHandle,
     time::{MissedTickBehavior, interval, timeout},
 };
-use tokio_stream::{Stream, wrappers::TcpListenerStream};
+use tokio_stream::{
+    Stream, StreamExt,
+    wrappers::{ReceiverStream, TcpListenerStream},
+};
 use tonic::{
     Request, Response, Status,
     transport::{Certificate, Identity, Server as TransportServer, ServerTlsConfig},
@@ -340,13 +343,61 @@ impl Legato for LiveServer {
         request: Request<SubscribeChangesRequest>,
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
         let since_sequence = request.into_inner().since_sequence;
-        let records = self
-            .catalog
-            .lock()
-            .await
-            .change_records_since(since_sequence)
-            .map_err(map_catalog_error)?;
-        let stream = tokio_stream::iter(records.into_iter().map(Ok));
+        let (initial_records, mut next_sequence) = {
+            let catalog = self.catalog.lock().await;
+            let records = catalog
+                .change_records_since(since_sequence)
+                .map_err(map_catalog_error)?;
+            let current_sequence = catalog.last_sequence();
+            let initial_records = if records.is_empty() {
+                vec![ChangeRecord {
+                    sequence: current_sequence,
+                    kind: legato_proto::ChangeKind::Checkpoint as i32,
+                    file_id: 0,
+                    path: format!("checkpoint:{current_sequence}"),
+                    inode: None,
+                    entries: Vec::new(),
+                }]
+            } else {
+                records
+            };
+            let next_sequence = initial_records
+                .last()
+                .map(|record| record.sequence)
+                .unwrap_or(since_sequence);
+            (initial_records, next_sequence)
+        };
+        let catalog = Arc::clone(&self.catalog);
+        let (sender, receiver) = mpsc::channel(16);
+        let _task = tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_millis(250));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                let records = {
+                    let catalog = catalog.lock().await;
+                    catalog
+                        .change_records_since(next_sequence)
+                        .map_err(map_catalog_error)
+                };
+                match records {
+                    Ok(records) => {
+                        for record in records {
+                            next_sequence = record.sequence;
+                            if sender.send(Ok(record)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = sender.send(Err(status)).await;
+                        return;
+                    }
+                }
+                ticker.tick().await;
+            }
+        });
+        let stream = tokio_stream::iter(initial_records.into_iter().map(Ok))
+            .chain(ReceiverStream::new(receiver));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -504,7 +555,8 @@ mod tests {
 
     use super::{LiveServer, load_runtime_tls, spawn_watch_task};
     use crate::{
-        InvalidationHub, ServerConfig, ensure_server_tls_materials, reconcile_library_root_to_store,
+        InvalidationHub, ServerConfig, ensure_server_tls_materials, issue_client_tls_bundle,
+        reconcile_library_root_to_store,
     };
 
     #[tokio::test]
@@ -829,5 +881,108 @@ mod tests {
         );
 
         watch_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_changes_yields_checkpoint_boundary_when_caught_up() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        fs::write(
+            library_root.join("Kontakt").join("piano.nki"),
+            b"hello legato",
+        )
+        .expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: crate::ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+        let runtime_tls = load_runtime_tls(&config.tls).expect("runtime tls should load");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener addr should exist");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(listener, Some(runtime_tls))
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-checkpoint",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("https://{}", address))
+            .expect("endpoint should parse")
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(
+                        fs::read(bundle_dir.join("server-ca.pem")).expect("ca should exist"),
+                    ))
+                    .identity(tonic::transport::Identity::from_pem(
+                        fs::read(bundle_dir.join("client.pem")).expect("client cert should exist"),
+                        fs::read(bundle_dir.join("client-key.pem"))
+                            .expect("client key should exist"),
+                    ))
+                    .domain_name("localhost"),
+            )
+            .expect("tls config should be valid")
+            .connect()
+            .await
+            .expect("client should connect");
+        let mut client = LegatoClient::new(channel);
+
+        let current_sequence = CatalogStore::open(&state_dir, 0)
+            .expect("catalog should reopen")
+            .last_sequence();
+        assert!(current_sequence > 0, "baseline sequence should exist");
+
+        let mut stream = client
+            .subscribe_changes(SubscribeChangesRequest {
+                since_sequence: current_sequence,
+            })
+            .await
+            .expect("caught-up subscribe should succeed")
+            .into_inner();
+        let mut saw_response = false;
+        let mut saw_boundary = false;
+        for _ in 0..4 {
+            let Some(record) = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .expect("stream should respond promptly")
+                .expect("stream read should succeed")
+            else {
+                break;
+            };
+            saw_response = true;
+            saw_boundary |= record.kind == legato_proto::ChangeKind::Checkpoint as i32;
+            if saw_boundary {
+                break;
+            }
+        }
+        assert!(saw_response, "caught-up replay should respond promptly");
+        assert!(
+            saw_boundary,
+            "caught-up replay should surface a checkpoint boundary"
+        );
+
+        bound
+            .shutdown()
+            .await
+            .expect("server should shut down cleanly");
     }
 }

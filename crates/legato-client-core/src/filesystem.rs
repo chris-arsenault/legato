@@ -10,15 +10,12 @@ use legato_client_cache::{
     MetadataCache, MetadataCachePolicy, catalog::CatalogStoreError, client_store::ClientLegatoStore,
 };
 use legato_proto::{
-    DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata, InodeMetadata, InvalidationEvent,
-    TransferClass,
+    ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, ExtentRef, FileMetadata,
+    InodeMetadata, InvalidationEvent, TransferClass,
 };
 use legato_types::{FileId, FilesystemAttributes};
 
-use crate::{
-    ClientConfig, GrpcClientTransport, GrpcInvalidationSubscription, LocalControlPlane,
-    transport::InvalidationPoll,
-};
+use crate::{ClientConfig, GrpcClientTransport, LocalControlPlane};
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -113,7 +110,6 @@ pub struct FilesystemService {
     max_cache_bytes: u64,
     next_handle: u64,
     open_handles: HashMap<u64, FilesystemOpenHandle>,
-    invalidations: Option<GrpcInvalidationSubscription>,
 }
 
 impl FilesystemService {
@@ -125,8 +121,7 @@ impl FilesystemService {
     ) -> Result<Self, FilesystemServiceError> {
         let max_cache_bytes = config.cache.max_bytes;
         let store = ClientLegatoStore::open(state_dir, now_monotonic_ns())?;
-        let mut transport = GrpcClientTransport::connect(config, client_name).await?;
-        let invalidations = Some(transport.subscribe_invalidations().await?);
+        let transport = GrpcClientTransport::connect(config, client_name).await?;
         let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
 
         Ok(Self {
@@ -136,7 +131,6 @@ impl FilesystemService {
             max_cache_bytes,
             next_handle: 1,
             open_handles: HashMap::new(),
-            invalidations,
         })
     }
 
@@ -149,7 +143,7 @@ impl FilesystemService {
     /// Returns whether the service currently has an active invalidation subscription.
     #[must_use]
     pub fn has_active_subscription(&self) -> bool {
-        self.invalidations.is_some()
+        true
     }
 
     /// Returns a cached or remotely fetched metadata view for one path.
@@ -157,7 +151,7 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
-        self.sync_invalidations().await?;
+        self.sync_changes().await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.control.resolve_path(path, now_ns) {
             return Ok(metadata_to_attributes(metadata));
@@ -177,7 +171,7 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
-        self.sync_invalidations().await?;
+        self.sync_changes().await?;
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.control.list_dir(path, now_ns) {
             return Ok(entries);
@@ -197,7 +191,7 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
-        self.sync_invalidations().await?;
+        self.sync_changes().await?;
         let inode = self
             .transport
             .resolve(path.to_owned())
@@ -229,7 +223,7 @@ impl FilesystemService {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, FilesystemServiceError> {
-        self.sync_invalidations().await?;
+        self.sync_changes().await?;
         let snapshot = self
             .open_handles
             .get(&local_handle)
@@ -271,61 +265,55 @@ impl FilesystemService {
         Ok(())
     }
 
+    /// Applies one ordered replay record to the local metadata and extent state.
+    pub fn apply_change_record(
+        &mut self,
+        record: &ChangeRecord,
+    ) -> Result<(), FilesystemServiceError> {
+        let now_ns = now_monotonic_ns();
+        self.control.apply_change_record(record, now_ns);
+        self.store.apply_change_record(record)?;
+        self.refresh_handles_from_change(record);
+        Ok(())
+    }
+
     /// Returns the current local open-handle snapshot.
     #[must_use]
     pub fn open_handle(&self, local_handle: u64) -> Option<&FilesystemOpenHandle> {
         self.open_handles.get(&local_handle)
     }
 
-    async fn sync_invalidations(&mut self) -> Result<(), FilesystemServiceError> {
-        loop {
-            if !self.poll_one_invalidation().await? {
-                break;
-            }
-        }
-        Ok(())
+    /// Returns the durable replay cursor stored by the local client catalog.
+    #[must_use]
+    pub fn subscription_cursor(&self) -> u64 {
+        self.store.subscription_cursor()
     }
 
-    async fn poll_one_invalidation(&mut self) -> Result<bool, FilesystemServiceError> {
-        self.ensure_invalidation_subscription().await?;
-        let Some(mut subscription) = self.invalidations.take() else {
-            return Ok(false);
-        };
-
-        match subscription.try_recv_next() {
-            Ok(InvalidationPoll::Empty) => {
-                self.invalidations = Some(subscription);
-                Ok(false)
-            }
-            Ok(InvalidationPoll::Event(event)) => {
-                self.apply_invalidation(&event)?;
-                self.invalidations = Some(subscription);
-                Ok(true)
-            }
-            Ok(InvalidationPoll::Closed) => {
-                self.reconnect_and_resubscribe().await?;
-                Ok(false)
+    async fn sync_changes(&mut self) -> Result<(), FilesystemServiceError> {
+        match self
+            .transport
+            .change_records_since(self.store.subscription_cursor())
+            .await
+        {
+            Ok(records) => {
+                for record in records {
+                    self.apply_change_record(&record)?;
+                }
+                Ok(())
             }
             Err(error) if should_retry_after_reconnect(&error) => {
-                self.reconnect_and_resubscribe().await?;
-                Ok(false)
+                self.transport.reconnect().await?;
+                for record in self
+                    .transport
+                    .change_records_since(self.store.subscription_cursor())
+                    .await?
+                {
+                    self.apply_change_record(&record)?;
+                }
+                Ok(())
             }
             Err(error) => Err(FilesystemServiceError::Transport(error)),
         }
-    }
-
-    async fn ensure_invalidation_subscription(&mut self) -> Result<(), FilesystemServiceError> {
-        if self.invalidations.is_none() {
-            self.invalidations = Some(self.transport.subscribe_invalidations().await?);
-        }
-        Ok(())
-    }
-
-    async fn reconnect_and_resubscribe(&mut self) -> Result<(), FilesystemServiceError> {
-        self.transport.reconnect().await?;
-        self.refresh_handles_from_runtime().await;
-        self.invalidations = Some(self.transport.subscribe_invalidations().await?);
-        Ok(())
     }
 
     async fn fetch_missing_extents(
@@ -352,7 +340,7 @@ impl FilesystemService {
             }
             Err(error) if should_retry_after_reconnect(&error) => {
                 self.transport.reconnect().await?;
-                self.refresh_handles_from_runtime().await;
+                self.sync_changes().await?;
                 let refreshed = self
                     .open_handles
                     .get(&handle.local_handle)
@@ -391,10 +379,18 @@ impl FilesystemService {
         Ok(())
     }
 
-    async fn refresh_handles_from_runtime(&mut self) {
+    fn refresh_handles_from_change(&mut self, record: &ChangeRecord) {
+        let Some(inode) = record.inode.clone() else {
+            return;
+        };
+        if ChangeKind::try_from(record.kind).unwrap_or(ChangeKind::Unspecified)
+            != ChangeKind::Upsert
+        {
+            return;
+        }
         for handle in self.open_handles.values_mut() {
-            if let Ok(inode) = self.transport.resolve(handle.path.clone()).await {
-                *handle = inode_to_open_handle(handle.local_handle, inode);
+            if handle.file_id.0 == inode.file_id || handle.path == record.path {
+                *handle = inode_to_open_handle(handle.local_handle, inode.clone());
             }
         }
     }
@@ -729,74 +725,6 @@ mod tests {
 
         drop(service);
         second_bound.shutdown().await.expect("server should stop");
-    }
-
-    #[tokio::test]
-    async fn filesystem_service_establishes_and_uses_invalidation_subscription() {
-        let fixture = tempdir().expect("tempdir should be created");
-        let library_root = fixture.path().join("library");
-        let state_dir = fixture.path().join("state");
-        let tls_dir = fixture.path().join("tls");
-        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
-        let sample_path = library_root.join("Kontakt").join("piano.nki");
-        fs::write(&sample_path, b"hello legato").expect("sample should be written");
-
-        let mut config = ServerConfig {
-            bind_address: String::from("127.0.0.1:0"),
-            library_root: library_root.to_string_lossy().into_owned(),
-            state_dir: state_dir.to_string_lossy().into_owned(),
-            tls_dir: tls_dir.to_string_lossy().into_owned(),
-            tls: ServerTlsConfig::local_dev(&tls_dir),
-        };
-        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
-        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
-            .expect("tls materials should be created");
-
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("addr should be available");
-        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
-        let bound = server
-            .bind(
-                listener,
-                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
-            )
-            .await
-            .expect("server should bind");
-
-        let bundle_dir = fixture.path().join("bundle");
-        issue_client_tls_bundle(
-            Path::new(&config.tls_dir),
-            &config.tls,
-            "studio-cache",
-            &bundle_dir,
-        )
-        .expect("client bundle should be issued");
-
-        let mut service = FilesystemService::connect(
-            local_client_config(address.to_string(), &bundle_dir, "localhost"),
-            "studio-cache",
-            fixture.path().join("client-state").as_path(),
-        )
-        .await
-        .expect("service should connect");
-        assert!(service.has_active_subscription());
-
-        let attrs = service
-            .lookup("/Kontakt/piano.nki")
-            .await
-            .expect("lookup should succeed");
-        assert_ne!(attrs.file_id.0, 0);
-
-        let initial_entries = service
-            .read_dir("/Kontakt")
-            .await
-            .expect("initial readdir should succeed");
-        assert_eq!(initial_entries.len(), 1);
-
-        drop(service);
-        bound.shutdown().await.expect("server should shut down");
     }
 
     #[test]

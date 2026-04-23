@@ -161,6 +161,7 @@ message ChangeRecord {
   uint64 file_id = 3;
   string path = 4;
   InodeMetadata inode = 5;
+  repeated DirectoryEntry entries = 6;
 }
 
 message StatRequest {

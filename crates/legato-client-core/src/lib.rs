@@ -11,8 +11,8 @@ use legato_client_cache::{
     client_store::{ClientLegatoStore, ResidentExtent},
 };
 use legato_proto::{
-    AttachRequest, DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout, FileMetadata,
-    InodeMetadata, InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
+    AttachRequest, ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, ExtentRecord,
+    FileLayout, FileMetadata, InodeMetadata, InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
     PrefetchPriority as ProtoPrefetchPriority, default_capabilities,
 };
 use legato_types::{
@@ -28,8 +28,8 @@ pub use filesystem::{
     FilesystemOpenHandle, FilesystemService, FilesystemServiceError, now_monotonic_ns,
 };
 pub use transport::{
-    ClientAttachSession, ClientTransportError, GrpcClientTransport, GrpcInvalidationSubscription,
-    InvalidationPoll,
+    ChangePoll, ClientAttachSession, ClientTransportError, GrpcChangeSubscription,
+    GrpcClientTransport, GrpcInvalidationSubscription, InvalidationPoll,
 };
 
 /// Immutable settings used to bootstrap a client runtime.
@@ -645,6 +645,28 @@ impl LocalControlPlane {
             .retain(|path, _| !path_is_invalidated(path, &event.path));
     }
 
+    /// Applies one ordered replay record to the local canonical metadata view.
+    pub fn apply_change_record(&mut self, record: &ChangeRecord, now_ns: u64) {
+        match ChangeKind::try_from(record.kind).unwrap_or(ChangeKind::Unspecified) {
+            ChangeKind::Upsert => {
+                if let Some(inode) = record.inode.clone() {
+                    self.register_resolved_path(inode.clone(), now_ns);
+                    if inode.is_dir && !record.entries.is_empty() {
+                        self.register_dir(&inode.path, record.entries.clone(), now_ns);
+                    }
+                }
+            }
+            ChangeKind::Delete | ChangeKind::Invalidate => {
+                self.apply_invalidation(&InvalidationEvent {
+                    kind: InvalidationKind::Subtree as i32,
+                    path: record.path.clone(),
+                    file_id: record.file_id,
+                });
+            }
+            ChangeKind::Checkpoint | ChangeKind::Unspecified => {}
+        }
+    }
+
     /// Resolves a path through the local metadata cache.
     pub fn resolve_path(&mut self, path: &str, now_ns: u64) -> Option<FileMetadata> {
         match self.metadata_cache.stat(path, now_ns) {
@@ -849,8 +871,8 @@ mod tests {
         MetadataCache, MetadataCachePolicy, client_store::ClientLegatoStore,
     };
     use legato_proto::{
-        ExtentDescriptor, FileLayout, FileMetadata, InodeMetadata, InvalidationEvent,
-        InvalidationKind, PROTOCOL_VERSION,
+        ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, FileLayout, FileMetadata,
+        InodeMetadata, InvalidationEvent, InvalidationKind, PROTOCOL_VERSION,
     };
     use legato_types::{
         ExtentRange, FileId, PrefetchHintPath, PrefetchPlanEntry, PrefetchPriority, PrefetchRequest,
@@ -1212,6 +1234,75 @@ mod tests {
             file_id: 7,
         });
         assert!(control.resolve_path("/Kontakt/piano.nki", 201).is_none());
+    }
+
+    #[test]
+    fn local_control_plane_applies_replay_records_for_directory_batches() {
+        let mut control =
+            LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
+
+        control.apply_change_record(
+            &ChangeRecord {
+                sequence: 1,
+                kind: ChangeKind::Upsert as i32,
+                file_id: 11,
+                path: String::from("/Kontakt"),
+                inode: Some(InodeMetadata {
+                    file_id: 11,
+                    path: String::from("/Kontakt"),
+                    size: 0,
+                    mtime_ns: 10,
+                    is_dir: true,
+                    layout: Some(FileLayout {
+                        transfer_class: 0,
+                        extents: Vec::new(),
+                    }),
+                    inode_generation: 1,
+                    content_hash: Vec::new(),
+                }),
+                entries: vec![DirectoryEntry {
+                    name: String::from("piano.nki"),
+                    path: String::from("/Kontakt/piano.nki"),
+                    is_dir: false,
+                    file_id: 7,
+                }],
+            },
+            100,
+        );
+        control.apply_change_record(
+            &ChangeRecord {
+                sequence: 2,
+                kind: ChangeKind::Upsert as i32,
+                file_id: 7,
+                path: String::from("/Kontakt/piano.nki"),
+                inode: Some(sample_prefetch_inode()),
+                entries: Vec::new(),
+            },
+            101,
+        );
+
+        let entries = control
+            .list_dir("/Kontakt", 102)
+            .expect("directory should resolve from replay");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "piano.nki");
+        let metadata = control
+            .resolve_path("/Kontakt/piano.nki", 102)
+            .expect("file metadata should resolve from replay");
+        assert_eq!(metadata.file_id, 7);
+
+        control.apply_change_record(
+            &ChangeRecord {
+                sequence: 3,
+                kind: ChangeKind::Delete as i32,
+                file_id: 7,
+                path: String::from("/Kontakt/piano.nki"),
+                inode: None,
+                entries: Vec::new(),
+            },
+            103,
+        );
+        assert!(control.resolve_path("/Kontakt/piano.nki", 104).is_none());
     }
 
     fn sample_prefetch_inode() -> InodeMetadata {

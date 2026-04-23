@@ -7,7 +7,8 @@ use std::{
 };
 
 use legato_proto::{
-    ChangeKind, ChangeRecord, ExtentDescriptor, FileLayout, InodeMetadata, TransferClass,
+    ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, FileLayout, InodeMetadata,
+    TransferClass,
 };
 use legato_types::FileId;
 use serde::{Deserialize, Serialize};
@@ -566,6 +567,7 @@ fn change_record_from_store_record(
             file_id: inode.file_id.0,
             path: inode.path.clone(),
             inode: Some(inode_to_proto(inode)),
+            entries: Vec::new(),
         }),
         CatalogRecordPayload::Directory(directory) => Some(ChangeRecord {
             sequence: record.sequence,
@@ -585,6 +587,16 @@ fn change_record_from_store_record(
                 inode_generation: default_inode_generation(),
                 content_hash: Vec::new(),
             }),
+            entries: directory
+                .entries
+                .into_values()
+                .map(|entry| DirectoryEntry {
+                    name: entry.name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                    file_id: entry.file_id.0,
+                })
+                .collect(),
         }),
         CatalogRecordPayload::Tombstone(tombstone) => Some(ChangeRecord {
             sequence: record.sequence,
@@ -592,6 +604,7 @@ fn change_record_from_store_record(
             file_id: tombstone.file_id.map_or(0, |file_id| file_id.0),
             path: tombstone.path,
             inode: None,
+            entries: Vec::new(),
         }),
         CatalogRecordPayload::Checkpoint(checkpoint) => Some(ChangeRecord {
             sequence: record.sequence,
@@ -599,6 +612,7 @@ fn change_record_from_store_record(
             file_id: 0,
             path: format!("checkpoint:{}", checkpoint.sequence),
             inode: None,
+            entries: Vec::new(),
         }),
         CatalogRecordPayload::Cursor(_) => None,
     };

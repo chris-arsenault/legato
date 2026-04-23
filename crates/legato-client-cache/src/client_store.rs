@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
-use legato_proto::{ExtentRecord, InodeMetadata, InvalidationEvent, InvalidationKind};
+use legato_proto::{
+    ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, InodeMetadata, InvalidationEvent,
+    InvalidationKind,
+};
 use legato_types::FileId;
 
 use crate::catalog::{
@@ -65,8 +68,42 @@ impl ClientLegatoStore {
 
     /// Records authoritative inode metadata in the local catalog.
     pub fn record_inode(&mut self, inode: InodeMetadata) -> Result<(), CatalogStoreError> {
-        let catalog_inode = proto_to_catalog_inode(inode, resident_extents::EMPTY);
+        let resident_extents = self
+            .catalog
+            .resolve_file_id(FileId(inode.file_id))
+            .map(|existing| existing.extents.clone())
+            .unwrap_or_default();
+        let catalog_inode = proto_to_catalog_inode(inode, resident_extents);
         let _ = self.catalog.append_inode(catalog_inode)?;
+        Ok(())
+    }
+
+    /// Records one canonical directory listing in the local catalog.
+    pub fn record_directory(
+        &mut self,
+        path: &str,
+        file_id: FileId,
+        entries: Vec<DirectoryEntry>,
+    ) -> Result<(), CatalogStoreError> {
+        let directory = crate::catalog::CatalogDirectory {
+            directory_id: file_id,
+            path: path.to_owned(),
+            entries: entries
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.name.clone(),
+                        crate::catalog::CatalogDirectoryEntry {
+                            name: entry.name,
+                            path: entry.path,
+                            file_id: FileId(entry.file_id),
+                            is_dir: entry.is_dir,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let _ = self.catalog.append_directory(directory)?;
         Ok(())
     }
 
@@ -74,6 +111,12 @@ impl ClientLegatoStore {
     #[must_use]
     pub fn resolve_path(&self, path: &str) -> Option<InodeMetadata> {
         self.catalog.resolve_path(path).cloned().map(inode_to_proto)
+    }
+
+    /// Returns the durable subscription cursor for replay resumption.
+    #[must_use]
+    pub fn subscription_cursor(&self) -> u64 {
+        self.catalog.subscription_cursor()
     }
 
     /// Returns whether one extent is locally resident.
@@ -197,6 +240,38 @@ impl ClientLegatoStore {
         Ok(())
     }
 
+    /// Applies one ordered change record and advances the local replay cursor.
+    pub fn apply_change_record(&mut self, record: &ChangeRecord) -> Result<(), CatalogStoreError> {
+        match ChangeKind::try_from(record.kind).unwrap_or(ChangeKind::Unspecified) {
+            ChangeKind::Upsert => {
+                if let Some(inode) = record.inode.clone() {
+                    self.record_inode(inode)?;
+                }
+                if !record.entries.is_empty() {
+                    self.record_directory(
+                        &record.path,
+                        FileId(record.file_id),
+                        record.entries.clone(),
+                    )?;
+                }
+            }
+            ChangeKind::Delete | ChangeKind::Invalidate => {
+                let _ = self.catalog.append_tombstone(CatalogTombstone {
+                    path: record.path.clone(),
+                    file_id: (record.file_id != 0).then_some(FileId(record.file_id)),
+                })?;
+            }
+            ChangeKind::Checkpoint => {
+                let _ = self.catalog.append_subscription_cursor(record.sequence)?;
+                let _ = self.catalog.checkpoint()?;
+                return Ok(());
+            }
+            ChangeKind::Unspecified => {}
+        }
+        let _ = self.catalog.append_subscription_cursor(record.sequence)?;
+        Ok(())
+    }
+
     /// Writes a compact checkpoint for the partial replica.
     pub fn checkpoint(&mut self) -> Result<(), CatalogStoreError> {
         let _ = self.catalog.checkpoint()?;
@@ -297,7 +372,16 @@ fn proto_to_catalog_inode(
             layout
                 .extents
                 .iter()
-                .filter_map(|extent| resident_by_index.get(&extent.extent_index).cloned())
+                .filter_map(|extent| {
+                    resident_by_index
+                        .get(&extent.extent_index)
+                        .and_then(|resident| {
+                            (resident.file_offset == extent.file_offset
+                                && resident.length == extent.length
+                                && resident.payload_hash == extent.extent_hash)
+                                .then_some(resident.clone())
+                        })
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -314,16 +398,13 @@ fn proto_to_catalog_inode(
     }
 }
 
-mod resident_extents {
-    use crate::catalog::CatalogExtent;
-
-    pub const EMPTY: [CatalogExtent; 0] = [];
-}
-
 #[cfg(test)]
 mod tests {
     use super::ClientLegatoStore;
-    use legato_proto::{ExtentDescriptor, ExtentRecord, FileLayout, InodeMetadata, TransferClass};
+    use legato_proto::{
+        ChangeKind, ChangeRecord, DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout,
+        InodeMetadata, TransferClass,
+    };
     use legato_types::FileId;
     use tempfile::tempdir;
 
@@ -401,6 +482,89 @@ mod tests {
         assert_eq!(report.resident_bytes_after, 5);
         assert!(store.get_extent(FileId(7), 0).expect("lookup").is_some());
         assert!(store.get_extent(FileId(7), 1).expect("lookup").is_none());
+    }
+
+    #[test]
+    fn client_store_applies_change_batch_and_persists_cursor_after_reopen() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+
+        store
+            .apply_change_record(&ChangeRecord {
+                sequence: 1,
+                kind: ChangeKind::Upsert as i32,
+                file_id: 11,
+                path: String::from("/Kontakt"),
+                inode: Some(InodeMetadata {
+                    file_id: 11,
+                    path: String::from("/Kontakt"),
+                    size: 0,
+                    mtime_ns: 10,
+                    is_dir: true,
+                    layout: Some(FileLayout {
+                        transfer_class: TransferClass::Unitary as i32,
+                        extents: Vec::new(),
+                    }),
+                    inode_generation: 1,
+                    content_hash: Vec::new(),
+                }),
+                entries: vec![DirectoryEntry {
+                    name: String::from("piano.nki"),
+                    path: String::from("/Kontakt/piano.nki"),
+                    is_dir: false,
+                    file_id: 7,
+                }],
+            })
+            .expect("directory replay should apply");
+        store
+            .apply_change_record(&ChangeRecord {
+                sequence: 2,
+                kind: ChangeKind::Upsert as i32,
+                file_id: 7,
+                path: String::from("/Kontakt/piano.nki"),
+                inode: Some(InodeMetadata {
+                    file_id: 7,
+                    path: String::from("/Kontakt/piano.nki"),
+                    size: 13,
+                    mtime_ns: 123,
+                    is_dir: false,
+                    layout: Some(FileLayout {
+                        transfer_class: TransferClass::Streamed as i32,
+                        extents: vec![ExtentDescriptor {
+                            extent_index: 0,
+                            file_offset: 0,
+                            length: 13,
+                            extent_hash: Vec::new(),
+                        }],
+                    }),
+                    inode_generation: 1,
+                    content_hash: b"resident-data".to_vec(),
+                }),
+                entries: Vec::new(),
+            })
+            .expect("file replay should apply");
+        store
+            .apply_change_record(&ChangeRecord {
+                sequence: 3,
+                kind: ChangeKind::Checkpoint as i32,
+                file_id: 0,
+                path: String::from("checkpoint:3"),
+                inode: None,
+                entries: Vec::new(),
+            })
+            .expect("checkpoint replay should apply");
+
+        assert_eq!(store.subscription_cursor(), 3);
+        assert!(store.resolve_path("/Kontakt").is_some());
+        assert!(store.resolve_path("/Kontakt/piano.nki").is_some());
+
+        drop(store);
+
+        let reopened = ClientLegatoStore::open(&state, 200).expect("store should reopen");
+        assert_eq!(reopened.subscription_cursor(), 3);
+        assert!(reopened.resolve_path("/Kontakt").is_some());
+        assert!(reopened.resolve_path("/Kontakt/piano.nki").is_some());
     }
 
     fn sample_inode() -> InodeMetadata {
