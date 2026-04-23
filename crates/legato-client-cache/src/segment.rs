@@ -3,7 +3,7 @@
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -245,6 +245,47 @@ impl SegmentWriter {
 /// Scans a segment file without mutating it.
 pub fn scan_segment(path: impl AsRef<Path>) -> Result<SegmentScan, SegmentStoreError> {
     scan_segment_impl(path.as_ref(), false)
+}
+
+/// Reads one validated record directly from its persisted segment offset.
+pub fn read_record_at(
+    path: impl AsRef<Path>,
+    record_offset: u64,
+) -> Result<StoreRecord, SegmentStoreError> {
+    let path = path.as_ref();
+    let mut file =
+        OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|source| SegmentStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    let _ = read_segment_header(path, &mut file)?;
+    file.seek(SeekFrom::Start(record_offset))
+        .map_err(|source| SegmentStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let magic = match read_magic_or_tail(path, &mut file)? {
+        MagicRead::Complete(magic) if magic == *RECORD_MAGIC => magic,
+        _ => {
+            return Err(SegmentStoreError::MissingRecord {
+                path: path.to_path_buf(),
+                offset: record_offset,
+            });
+        }
+    };
+    let _ = magic;
+
+    match read_record_body(path, &mut file, record_offset)? {
+        TailRead::Complete(record) => Ok(record),
+        TailRead::Incomplete => Err(SegmentStoreError::MissingRecord {
+            path: path.to_path_buf(),
+            offset: record_offset,
+        }),
+    }
 }
 
 /// Scans a segment file and truncates an incomplete tail when one is present.
@@ -514,6 +555,13 @@ pub enum SegmentStoreError {
         /// Record sequence number.
         sequence: u64,
     },
+    /// No complete record existed at the requested segment offset.
+    MissingRecord {
+        /// Segment path.
+        path: PathBuf,
+        /// Requested record byte offset.
+        offset: u64,
+    },
 }
 
 impl fmt::Display for SegmentStoreError {
@@ -549,6 +597,11 @@ impl fmt::Display for SegmentStoreError {
                 "segment record hash mismatch in {} at offset {offset} for sequence {sequence}",
                 path.display()
             ),
+            Self::MissingRecord { path, offset } => write!(
+                formatter,
+                "segment record not found in {} at offset {offset}",
+                path.display()
+            ),
         }
     }
 }
@@ -565,8 +618,8 @@ impl std::error::Error for SegmentStoreError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SegmentStoreError, SegmentWriter, StoreRecord, StoreRecordKind, repair_incomplete_tail,
-        scan_segment,
+        SegmentStoreError, SegmentWriter, StoreRecord, StoreRecordKind, read_record_at,
+        repair_incomplete_tail, scan_segment,
     };
     use std::{
         fs::{self, OpenOptions},
@@ -635,6 +688,50 @@ mod tests {
             .expect("payload byte should be corrupted");
 
         let error = scan_segment(&path).expect_err("corrupt hash should fail scan");
+
+        assert!(matches!(error, SegmentStoreError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn direct_record_lookup_reads_extent_by_persisted_offset() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("indexed.lseg");
+        let mut writer = SegmentWriter::create(&path, 1, 100).expect("segment should create");
+        let first = writer
+            .append(StoreRecordKind::Inode, 7, b"inode-record")
+            .expect("inode should append");
+        let second = writer
+            .append(StoreRecordKind::Extent, 8, b"extent-record")
+            .expect("extent should append");
+        writer.seal().expect("segment should seal");
+
+        let loaded = read_record_at(&path, second.segment_offset).expect("record should load");
+
+        assert_eq!(loaded, second);
+        assert_ne!(loaded.segment_offset, first.segment_offset);
+    }
+
+    #[test]
+    fn direct_record_lookup_rejects_corrupt_record_payload_hash() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("corrupt-direct.lseg");
+        let mut writer = SegmentWriter::create(&path, 1, 100).expect("segment should create");
+        let record = writer
+            .append(StoreRecordKind::Extent, 1, b"healthy")
+            .expect("record should append");
+        drop(writer);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("segment should open for corruption");
+        file.seek(SeekFrom::End(-1))
+            .expect("seek to payload tail should work");
+        file.write_all(b"x")
+            .expect("payload byte should be corrupted");
+
+        let error =
+            read_record_at(&path, record.segment_offset).expect_err("corrupt lookup should fail");
 
         assert!(matches!(error, SegmentStoreError::HashMismatch { .. }));
     }

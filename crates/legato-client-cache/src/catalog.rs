@@ -14,7 +14,8 @@ use legato_types::FileId;
 use serde::{Deserialize, Serialize};
 
 use crate::segment::{
-    SegmentStoreError, SegmentWriter, StoreRecord, StoreRecordKind, repair_incomplete_tail,
+    SegmentStoreError, SegmentWriter, StoreRecord, StoreRecordKind, read_record_at,
+    repair_incomplete_tail,
 };
 
 const CATALOG_CHECKPOINT_VERSION: u32 = 1;
@@ -397,19 +398,15 @@ impl CatalogStore {
             .root_dir
             .join("segments")
             .join(segment_file_name(segment_id));
-        let scan = repair_incomplete_tail(&path)?;
-        let record = scan
-            .records
-            .into_iter()
-            .find(|record| {
-                record.kind == StoreRecordKind::Extent
-                    && record.segment_offset == segment_offset
-                    && record.payload_hash.as_slice() == extent.payload_hash.as_slice()
-            })
-            .ok_or(CatalogStoreError::MissingExtent {
+        let record = read_record_at(&path, segment_offset)?;
+        if record.kind != StoreRecordKind::Extent
+            || record.payload_hash.as_slice() != extent.payload_hash.as_slice()
+        {
+            return Err(CatalogStoreError::MissingExtent {
                 segment_id,
                 segment_offset,
-            })?;
+            });
+        }
         Ok(record.payload)
     }
 
