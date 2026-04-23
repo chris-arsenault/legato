@@ -1,7 +1,7 @@
 //! Windows-specific adapter wrappers over the shared Legato filesystem service.
 
 #[cfg(target_os = "windows")]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::ffi::c_void;
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -13,14 +13,31 @@ use legato_types::{
     ClientPlatform, FilesystemAttributes, FilesystemError, FilesystemOperation,
     FilesystemSemantics, PlatformErrorCode, platform_error_code,
 };
+#[cfg(target_os = "windows")]
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::Mutex;
+#[cfg(target_os = "windows")]
+use winfsp::{
+    FspError, U16CStr,
+    filesystem::{
+        DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
+        VolumeInfo, WideNameInfo,
+    },
+    host::{FileSystemHost, VolumeParams},
+};
+#[cfg(target_os = "windows")]
+use winfsp_sys::FILE_ACCESS_RIGHTS;
 
 #[cfg(target_os = "windows")]
-use unifuse::{
-    DirEntry as MountDirEntry, FileAttr as MountFileAttr, FileHandle as MountFileHandle,
-    FileType as MountFileType, FsError as MountFsError, MountOptions, OpenFlags, StatFs,
-    UniFuseFilesystem, UniFuseHost,
-};
+const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+#[cfg(target_os = "windows")]
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+#[cfg(target_os = "windows")]
+const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+#[cfg(target_os = "windows")]
+const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
+#[cfg(target_os = "windows")]
+const WINDOWS_UNIX_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
 
 /// Adapter wrapper for the Windows filesystem surface.
 #[derive(Debug)]
@@ -31,10 +48,29 @@ pub struct WindowsFilesystem {
 
 /// Shared mount state used by the Windows runtime adapter.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[derive(Debug)]
 pub struct WindowsMountService {
     service: Mutex<FilesystemService>,
     library_root: String,
+    #[cfg(target_os = "windows")]
+    runtime: Runtime,
+}
+
+impl fmt::Debug for WindowsMountService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WindowsMountService")
+            .field("library_root", &self.library_root)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WinfspFileContext {
+    path: String,
+    local_handle: Option<u64>,
+    attributes: WindowsAttributes,
+    directory_buffer: DirBuffer,
 }
 
 /// Adapter-local directory entry representation for Windows mount bindings.
@@ -243,6 +279,11 @@ impl WindowsMountService {
         Self {
             service: Mutex::new(service),
             library_root: library_root.into(),
+            #[cfg(target_os = "windows")]
+            runtime: Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("windows mount runtime should be created"),
         }
     }
 
@@ -256,7 +297,7 @@ impl WindowsMountService {
 #[cfg(target_os = "windows")]
 #[must_use]
 pub fn mount_runtime_available() -> bool {
-    UniFuseHost::<WindowsMountService>::is_available()
+    winfsp::winfsp_init().is_ok()
 }
 
 /// Mounts the Legato filesystem on Windows and blocks until the mount exits.
@@ -268,16 +309,28 @@ pub async fn mount(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mount_point = mount_point.as_ref().to_path_buf();
     prepare_mount_point(&mount_point)?;
-    let host = UniFuseHost::new(WindowsMountService::new(service, library_root));
-    let options = MountOptions {
-        fs_name: String::from("legato"),
-        allow_other: false,
-        read_only: true,
-    };
+    let _winfsp = winfsp::winfsp_init()?;
+    let mut volume_params = VolumeParams::new();
+    volume_params
+        .filesystem_name("legato")
+        .read_only_volume(true)
+        .case_sensitive_search(false)
+        .case_preserved_names(true)
+        .unicode_on_disk(true)
+        .sectors_per_allocation_unit(1)
+        .sector_size(4096)
+        .max_component_length(255)
+        .file_info_timeout(1_000)
+        .dir_info_timeout(1_000);
 
-    host.mount(&mount_point, &options)
-        .await
-        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
+    let mut host = FileSystemHost::new(
+        volume_params,
+        WindowsMountService::new(service, library_root),
+    )?;
+    host.mount(mount_point)?;
+    host.start()?;
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 /// Ensures the mount point is a usable empty directory before mounting.
@@ -296,97 +349,109 @@ pub fn prepare_mount_point(path: &Path) -> Result<MountPointReadiness, MountPoin
 }
 
 #[cfg(target_os = "windows")]
-impl UniFuseFilesystem for WindowsMountService {
-    async fn getattr(&self, path: &Path) -> Result<MountFileAttr, MountFsError> {
-        let attributes = self
-            .service
-            .lock()
-            .await
-            .lookup(&self.canonical_path(path))
-            .await
-            .map_err(map_mount_error)?;
-        Ok(attributes_to_mount_attr(&attributes))
-    }
+impl FileSystemContext for WindowsMountService {
+    type FileContext = WinfspFileContext;
 
-    async fn lookup(
+    fn get_security_by_name(
         &self,
-        parent: &Path,
-        name: &std::ffi::OsStr,
-    ) -> Result<MountFileAttr, MountFsError> {
-        let path = if parent == Path::new("/") {
-            PathBuf::from("/").join(name)
-        } else {
-            parent.join(name)
-        };
-        self.getattr(&path).await
-    }
-
-    async fn open(&self, path: &Path, flags: OpenFlags) -> Result<MountFileHandle, MountFsError> {
-        if flags.write {
-            return Err(MountFsError::NotSupported);
-        }
-
-        let handle = self
-            .service
-            .lock()
-            .await
-            .open(&self.canonical_path(path))
-            .await
-            .map_err(map_mount_error)?;
-        Ok(MountFileHandle(handle.local_handle))
-    }
-
-    async fn read(
-        &self,
-        _path: &Path,
-        fh: MountFileHandle,
-        offset: u64,
-        size: u32,
-    ) -> Result<Vec<u8>, MountFsError> {
-        self.service
-            .lock()
-            .await
-            .read(fh.0, offset, size)
-            .await
-            .map_err(map_mount_error)
-    }
-
-    async fn release(&self, _path: &Path, fh: MountFileHandle) -> Result<(), MountFsError> {
-        self.service
-            .lock()
-            .await
-            .release(fh.0)
-            .await
-            .map_err(map_mount_error)
-    }
-
-    async fn readdir(&self, path: &Path) -> Result<Vec<MountDirEntry>, MountFsError> {
-        let entries = self
-            .service
-            .lock()
-            .await
-            .read_dir(&self.canonical_path(path))
-            .await
-            .map_err(map_mount_error)?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| MountDirEntry {
-                name: entry.name,
-                kind: entry_kind(entry.is_dir),
-            })
-            .collect())
-    }
-
-    async fn statfs(&self, _path: &Path) -> Result<StatFs, MountFsError> {
-        Ok(StatFs {
-            blocks: 1_048_576,
-            bfree: 0,
-            bavail: 0,
-            files: 1_000_000,
-            ffree: 0,
-            bsize: 1 << 20,
-            namelen: 255,
+        file_name: &U16CStr,
+        _security_descriptor: Option<&mut [c_void]>,
+        _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
+    ) -> winfsp::Result<FileSecurity> {
+        let path = self.winfsp_path(file_name);
+        let attributes = self.lookup_attributes(&path)?;
+        Ok(FileSecurity {
+            reparse: false,
+            sz_security_descriptor: 0,
+            attributes: file_attributes(&attributes),
         })
+    }
+
+    fn open(
+        &self,
+        file_name: &U16CStr,
+        _create_options: u32,
+        _granted_access: FILE_ACCESS_RIGHTS,
+        file_info: &mut OpenFileInfo,
+    ) -> winfsp::Result<Self::FileContext> {
+        let path = self.winfsp_path(file_name);
+        let attributes = self.lookup_attributes(&path)?;
+        let local_handle = if attributes.directory {
+            None
+        } else {
+            Some(self.open_file(&path, file_info.as_mut())?)
+        };
+        fill_file_info(file_info.as_mut(), &attributes);
+        Ok(WinfspFileContext {
+            path,
+            local_handle,
+            attributes,
+            directory_buffer: DirBuffer::new(),
+        })
+    }
+
+    fn close(&self, context: Self::FileContext) {
+        if let Some(handle) = context.local_handle {
+            let _ = self.release_file(handle);
+        }
+    }
+
+    fn flush(
+        &self,
+        context: Option<&Self::FileContext>,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        if let Some(context) = context {
+            fill_file_info(file_info, &context.attributes);
+        }
+        Ok(())
+    }
+
+    fn get_file_info(
+        &self,
+        context: &Self::FileContext,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        fill_file_info(file_info, &context.attributes);
+        Ok(())
+    }
+
+    fn read_directory(
+        &self,
+        context: &Self::FileContext,
+        _pattern: Option<&U16CStr>,
+        marker: DirMarker<'_>,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u32> {
+        if !context.attributes.directory {
+            return Err(FspError::IO(std::io::ErrorKind::NotADirectory));
+        }
+        if marker.is_none() {
+            self.fill_directory_buffer(context)?;
+        }
+        Ok(context.directory_buffer.read(marker, buffer))
+    }
+
+    fn read(
+        &self,
+        context: &Self::FileContext,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> winfsp::Result<u32> {
+        let handle = context
+            .local_handle
+            .ok_or(FspError::IO(std::io::ErrorKind::IsADirectory))?;
+        let bytes = self.read_file(handle, offset, buffer.len() as u32)?;
+        let bytes_read = bytes.len();
+        buffer[..bytes_read].copy_from_slice(&bytes);
+        Ok(bytes_read as u32)
+    }
+
+    fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
+        out_volume_info.total_size = 1 << 40;
+        out_volume_info.free_size = 0;
+        out_volume_info.set_volume_label("Legato");
+        Ok(())
     }
 }
 
@@ -403,47 +468,153 @@ fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
 }
 
 #[cfg(target_os = "windows")]
-fn map_mount_error(error: FilesystemServiceError) -> MountFsError {
+impl WindowsMountService {
+    fn winfsp_path(&self, file_name: &U16CStr) -> String {
+        self.canonical_path(Path::new(&file_name.to_string_lossy()))
+    }
+
+    fn lookup_attributes(&self, path: &str) -> winfsp::Result<WindowsAttributes> {
+        self.runtime.block_on(async {
+            self.service
+                .lock()
+                .await
+                .lookup(path)
+                .await
+                .map(|attributes| WindowsFilesystem::new("").translate_attributes(&attributes))
+                .map_err(map_mount_error)
+        })
+    }
+
+    fn open_file(&self, path: &str, file_info: &mut FileInfo) -> winfsp::Result<u64> {
+        self.runtime.block_on(async {
+            let handle = self
+                .service
+                .lock()
+                .await
+                .open(path)
+                .await
+                .map_err(map_mount_error)?;
+            let attributes = WindowsFilesystem::new("")
+                .translate_attributes(&attributes_from_open_handle(&handle));
+            fill_file_info(file_info, &attributes);
+            Ok(handle.local_handle)
+        })
+    }
+
+    fn read_file(&self, handle: u64, offset: u64, size: u32) -> winfsp::Result<Vec<u8>> {
+        self.runtime.block_on(async {
+            self.service
+                .lock()
+                .await
+                .read(handle, offset, size)
+                .await
+                .map_err(map_mount_error)
+        })
+    }
+
+    fn release_file(&self, handle: u64) -> winfsp::Result<()> {
+        self.runtime.block_on(async {
+            self.service
+                .lock()
+                .await
+                .release(handle)
+                .await
+                .map_err(map_mount_error)
+        })
+    }
+
+    fn fill_directory_buffer(&self, context: &WinfspFileContext) -> winfsp::Result<()> {
+        let entries = self.runtime.block_on(async {
+            self.service
+                .lock()
+                .await
+                .read_dir(&context.path)
+                .await
+                .map_err(map_mount_error)
+        })?;
+        let lock = context
+            .directory_buffer
+            .acquire(true, Some(entries.len().saturating_add(2) as u32))?;
+        write_dir_entry(&lock, ".", &context.attributes)?;
+        write_dir_entry(&lock, "..", &context.attributes)?;
+        for entry in entries {
+            let attributes = WindowsAttributes {
+                file_index: entry.file_id,
+                allocation_size: if entry.is_dir { 0 } else { entry.size },
+                end_of_file: if entry.is_dir { 0 } else { entry.size },
+                mtime_ns: entry.mtime_ns,
+                directory: entry.is_dir,
+                read_only: true,
+            };
+            write_dir_entry(&lock, &entry.name, &attributes)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn map_mount_error(error: FilesystemServiceError) -> FspError {
     match error {
-        FilesystemServiceError::NotFound(_) => MountFsError::NotFound,
-        FilesystemServiceError::UnknownHandle(_) => {
-            MountFsError::Other(String::from("stale handle"))
-        }
+        FilesystemServiceError::NotFound(_) => FspError::IO(std::io::ErrorKind::NotFound),
+        FilesystemServiceError::UnknownHandle(_) => FspError::IO(std::io::ErrorKind::InvalidInput),
         FilesystemServiceError::InvalidRead { .. } => {
-            MountFsError::Other(String::from("invalid read"))
+            FspError::IO(std::io::ErrorKind::InvalidInput)
         }
-        FilesystemServiceError::Transport(error) => MountFsError::Other(error.to_string()),
-        FilesystemServiceError::Cache(error) => MountFsError::Other(error.to_string()),
+        FilesystemServiceError::Transport(_) | FilesystemServiceError::Cache(_) => {
+            FspError::NTSTATUS(0xC000_00E9u32 as i32)
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
-fn attributes_to_mount_attr(attributes: &FilesystemAttributes) -> MountFileAttr {
-    let timestamp = timestamp_from_ns(attributes.mtime_ns);
-    MountFileAttr {
-        size: attributes.size,
-        blocks: attributes.size.div_ceil(512),
-        atime: timestamp,
-        mtime: timestamp,
-        ctime: timestamp,
-        crtime: timestamp,
-        kind: entry_kind(attributes.is_dir),
-        perm: if attributes.is_dir { 0o555 } else { 0o444 },
-        nlink: if attributes.is_dir { 2 } else { 1 },
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        flags: 0,
-    }
+fn write_dir_entry(
+    lock: &winfsp::filesystem::DirBufferLock<'_>,
+    name: &str,
+    attributes: &WindowsAttributes,
+) -> winfsp::Result<()> {
+    let mut dir_info = DirInfo::<255>::new();
+    fill_file_info(dir_info.file_info_mut(), attributes);
+    dir_info.set_name(name)?;
+    lock.write(&mut dir_info)
 }
 
 #[cfg(target_os = "windows")]
-fn entry_kind(is_dir: bool) -> MountFileType {
-    if is_dir {
-        MountFileType::Directory
+fn fill_file_info(file_info: &mut FileInfo, attributes: &WindowsAttributes) {
+    file_info.file_attributes = file_attributes(attributes);
+    file_info.reparse_tag = 0;
+    file_info.allocation_size = if attributes.directory {
+        0
     } else {
-        MountFileType::RegularFile
-    }
+        attributes.allocation_size
+    };
+    file_info.file_size = if attributes.directory {
+        0
+    } else {
+        attributes.end_of_file
+    };
+    let timestamp = filetime_from_unix_ns(attributes.mtime_ns);
+    file_info.creation_time = timestamp;
+    file_info.last_access_time = timestamp;
+    file_info.last_write_time = timestamp;
+    file_info.change_time = timestamp;
+    file_info.index_number = attributes.file_index;
+    file_info.hard_links = if attributes.directory { 2 } else { 1 };
+    file_info.ea_size = 0;
+}
+
+#[cfg(target_os = "windows")]
+fn file_attributes(attributes: &WindowsAttributes) -> u32 {
+    let kind = if attributes.directory {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_ARCHIVE
+    };
+    let write_mode = if attributes.read_only {
+        FILE_ATTRIBUTE_READONLY
+    } else {
+        0
+    };
+    kind | write_mode
 }
 
 fn translate_directory_entry(entry: DirectoryEntry) -> WindowsDirectoryEntry {
@@ -482,8 +653,10 @@ fn map_virtual_path(library_root: &str, virtual_path: &Path) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn timestamp_from_ns(nanoseconds: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_nanos(nanoseconds)
+fn filetime_from_unix_ns(nanoseconds: u64) -> u64 {
+    WINDOWS_UNIX_EPOCH_OFFSET_SECONDS
+        .saturating_mul(WINDOWS_TICKS_PER_SECOND)
+        .saturating_add(nanoseconds / 100)
 }
 
 #[cfg(test)]
