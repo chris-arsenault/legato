@@ -1016,11 +1016,9 @@ dependencies = [
  "blake3",
  "legato-proto",
  "legato-types",
- "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
- "walkdir",
 ]
 
 [[package]]
