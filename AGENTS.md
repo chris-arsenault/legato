@@ -9,6 +9,7 @@ This is a lightweight working index for agents operating in the Legato repositor
 - [Development Workflow](docs/DEVELOPMENT.md)
 - [System Shape](docs/architecture/SYSTEM_SHAPE.md)
 - [Protocol And Behavior](docs/design/PROTOCOL_AND_BEHAVIOR.md)
+- [Transfer Layout And Store Model](docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
 - [Operations Runbook](deploy/OPERATIONS.md)
 - [Platform Manifest](platform.yml)
 - [Komodo Compose Stack](compose.yaml)
@@ -18,7 +19,7 @@ This is a lightweight working index for agents operating in the Legato repositor
 ## Repository Shape
 
 - `crates/legato-server`
-  Server-side metadata, reconciliation, watchers, invalidations, TLS bootstrap, integration tests, and benchmarks.
+  Server runtime, canonical store access, catalog publication, extent streaming, TLS bootstrap, integration tests, and benchmarks.
 - `crates/legatofs`
   Native client entrypoint and mount bootstrap.
 - `crates/legato-prefetch`
@@ -26,7 +27,7 @@ This is a lightweight working index for agents operating in the Legato repositor
 - `crates/legato-client-core`
   Shared client runtime, reconnect logic, and prefetch execution.
 - `crates/legato-client-cache`
-  SQLite-backed cache metadata and block-cache maintenance.
+  Client-side Legato store primitives: segment records, catalog state, residency, checkpointing, repair, compaction, and eviction.
 - `crates/legato-foundation`
   Shared config, telemetry, and runtime helpers.
 - `crates/legato-proto`
@@ -41,7 +42,7 @@ This is a lightweight working index for agents operating in the Legato repositor
 The standard loop for implementation work in this repo is:
 
 1. Read the relevant local docs and target crate entrypoints.
-2. Make the smallest coherent change that completes the current ticket or batch.
+2. Make the smallest coherent change that completes the assigned ticket or batch.
 3. Run formatting, tests, and linting.
 4. Run focused integration or benchmark compile checks if the touched area needs them.
 5. Commit with an intentional message.
@@ -86,7 +87,7 @@ cargo test -p legato-server --test end_to_end
 cargo bench -p legato-server --no-run
 ```
 
-Use the focused commands when changing integration surfaces, benchmark targets, or the server-side read/prefetch path.
+Use focused commands when changing protocol, store, mount, prefetch, benchmark, or deployment surfaces.
 
 ## Working Guidance
 

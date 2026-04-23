@@ -5,9 +5,11 @@ This directory is the short-form map of the repository documentation.
 ## Root Docs
 
 - [README.md](../README.md)
-  Short overview of what the repository is, what is in it, and where to go next.
+  Short overview of the repository, runtime pieces, and where to go next.
 - [CLAUDE.md](../CLAUDE.md)
   Short working index for contributors or agents navigating the repo.
+- [AGENTS.md](../AGENTS.md)
+  Same working index for tools that read `AGENTS.md`.
 
 ## Repository Guides
 
@@ -16,11 +18,11 @@ This directory is the short-form map of the repository documentation.
 - [DEVELOPMENT.md](DEVELOPMENT.md)
   Common build, test, lint, and benchmark commands plus a brief workflow summary.
 - [architecture/SYSTEM_SHAPE.md](architecture/SYSTEM_SHAPE.md)
-  Final system shape, technology choices, deployment model, and deliberate non-goals.
+  Final system shape, technology choices, deployment model, and deliberate boundaries.
 - [design/PROTOCOL_AND_BEHAVIOR.md](design/PROTOCOL_AND_BEHAVIOR.md)
-  Final behavioral contract for protocol, caching, prefetch, and failure handling.
+  Behavioral contract for protocol, store replication, caching, prefetch, and failure handling.
 - [design/TRANSFER_LAYOUT_AND_STORE_MODEL.md](design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
-  Transfer classification, extent model, and store-shape rules.
+  Transfer classification, extent model, segment format, catalog model, and residency rules.
 
 ## Focused Reference Docs
 
@@ -33,10 +35,11 @@ This directory is the short-form map of the repository documentation.
 - [deploy/client/README.md](../deploy/client/README.md)
   Packaging, install layout, and upgrade expectations for native clients.
 - [crates/legato-proto/PROTO_VERSIONING.md](../crates/legato-proto/PROTO_VERSIONING.md)
-  Wire-compatibility and protobuf namespace rules.
+  Protocol namespace and field-number rules.
 
 ## Reading Strategy
 
 - Start with [REPO_STRUCTURE.md](REPO_STRUCTURE.md) if you need orientation.
-- Move to the crate or deployment document closest to your area of interest.
-- Read the code after that. The docs here are meant to frame the workspace, not to duplicate implementation detail.
+- Read [architecture/SYSTEM_SHAPE.md](architecture/SYSTEM_SHAPE.md) for the final application shape.
+- Read [design/TRANSFER_LAYOUT_AND_STORE_MODEL.md](design/TRANSFER_LAYOUT_AND_STORE_MODEL.md) before changing store or cache behavior.
+- Read the code after that. These docs frame the workspace; they do not duplicate implementation detail.

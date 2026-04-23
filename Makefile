@@ -9,7 +9,7 @@ test:
 	cargo test --workspace
 
 clippy:
-	cargo clippy --workspace --all-targets -- -D warnings
+	RUSTUP_TOOLCHAIN=stable cargo clippy --workspace --all-targets -- -D warnings
 
 integration:
 	cargo test -p legato-server --test end_to_end

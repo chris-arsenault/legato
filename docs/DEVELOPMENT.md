@@ -7,8 +7,8 @@ This is the minimal workflow guide for working in the Legato workspace.
 - Rust workspace managed with Cargo
 - Edition `2024`
 - Workspace lint policy in the root `Cargo.toml`
-- SQLite used for server metadata and client cache state
 - Shared Ahara CI driven by the root `platform.yml`
+- Native client package jobs for macOS and Windows
 
 ## Common Commands
 
@@ -36,32 +36,33 @@ cargo bench -p legato-server --no-run
 - `compose.yaml`
   Root Komodo/TrueNAS stack file used by the shared deploy action.
 - `secret-paths.yml`
-  Placeholder for SSM-backed Komodo environment injection.
+  Reserved path map for SSM-backed Komodo environment injection.
 
 ## What The Checks Cover
 
 - `fmt`
   Workspace formatting.
 - `test`
-  Unit tests across the crates plus the current server-side integration suite.
+  Unit tests across crates plus integration coverage for protocol, store, mount, and prefetch behavior.
 - `clippy`
   Workspace linting at warning-as-error level.
 - `bench --no-run`
-  Verifies the benchmark targets still compile.
+  Verifies benchmark targets still compile.
 
 ## Editing Guidance
 
 - Keep root docs short and index-like.
 - Put deployment-specific prose under `deploy/`.
 - Put protocol-specific prose next to `legato-proto`.
+- Keep store-format prose in `docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md`.
 - Prefer crate-local tests for implementation details and integration tests for cross-crate behavior.
 
 ## Before You Push
 
 1. Run formatting.
-2. Run the workspace tests.
+2. Run workspace tests.
 3. Run Clippy with `-D warnings`.
-4. If you changed the benchmark or integration surfaces, compile the benchmark target and run the targeted integration test.
+4. If you changed protocol, store, mount, benchmark, or integration surfaces, run the focused command for that surface.
 
 ## What This Document Is Not
 

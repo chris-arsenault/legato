@@ -10,14 +10,15 @@ This document defines the installation and upgrade shape for the native Legato c
 - Runtime state:
   - macOS: `/Library/Application Support/Legato`
   - Windows: `C:\ProgramData\Legato`
-- Cache database: `<state_dir>/client.sqlite`
-- Extent store root: `<state_dir>/extents`
+- Catalog root: `<state_dir>/catalog`
+- Segment root: `<state_dir>/segments`
+- Checkpoint root: `<state_dir>/checkpoints`
 - Certificate root: `<state_dir>/certs`
 - Generated client config: `<state_dir>/legatofs.toml`
 - Certificates:
-  - server CA: `/etc/legato/certs/server-ca.pem` equivalent under the chosen client config root
-  - client certificate: `/etc/legato/certs/client.pem`
-  - client key: `/etc/legato/certs/client-key.pem`
+  - server CA under the client certificate root
+  - client certificate under the client certificate root
+  - client key under the client certificate root
 - Default mount points:
   - macOS: `/Volumes/Legato`
   - Windows: `L:\Legato`
@@ -38,10 +39,10 @@ This document defines the installation and upgrade shape for the native Legato c
 - Packaged registration helper:
   `legato-register-client --bundle-dir <bundle>`
 - Startup model: user launchd agent running the installed binary with `LEGATO_FS_CONFIG` pointed at the generated config.
-- Filesystem framework expectation: macFUSE-compatible user-space mount integration
+- Filesystem framework expectation: macFUSE-compatible user-space mount integration.
 - Upgrade behavior:
   - replace the binary in place
-  - preserve `client.sqlite`, `extents/`, and cert material
+  - preserve `catalog/`, `segments/`, `checkpoints/`, and cert material
   - preserve an existing `legatofs.toml` if already configured
 
 ## Windows
@@ -64,37 +65,39 @@ This document defines the installation and upgrade shape for the native Legato c
   `legatofs.exe service install`
 - If the installer is given a valid bundle directory, it runs `legatofs.exe install` automatically during setup.
 - Startup model: per-user scheduled task running the installed binary with `LEGATO_FS_CONFIG` pointed at the generated config.
-- Filesystem framework expectation: WinFSP-backed user-space filesystem
+- Filesystem framework expectation: WinFSP-backed user-space filesystem.
 - Upgrade behavior:
   - replace the binary in place
-  - preserve `client.sqlite`, `extents\`, and cert material
+  - preserve `catalog\`, `segments\`, `checkpoints\`, and cert material
   - preserve an existing `legatofs.toml` if already configured
 
 ## Client State Model
 
-- `client.sqlite` stores metadata cache state, extent residency metadata, pin state, and checkpoints.
-- `extents/` stores the materialized local extent files used by the read path.
+- `catalog/` stores path, inode, directory, extent-map, residency, and subscription-cursor state.
+- `segments/` stores local append-only segment files containing resident records.
+- `checkpoints/` stores compacted recovery boundaries.
 - `certs/` stores the server CA plus issued client certificate and key.
 - `bundle.json` in the issued bundle can carry install-time defaults such as endpoint and server name.
 - `legatofs.toml` is generated from the install command and should be preserved across upgrades.
 
-## Cache Integrity Rules
+## Store Integrity Rules
 
-- Never delete `client.sqlite` or `extents/` during normal upgrades.
-- If the cache schema changes, run migrations at startup before mounting.
-- If extent integrity verification fails, remove only the affected cached extent and refetch it.
+- Do not delete `catalog/`, `segments/`, or `checkpoints/` during normal upgrades.
+- Validate segment records by hash before serving data.
+- Truncate incomplete tail records during startup recovery.
+- Rebuild in-memory indexes from catalog checkpoints plus replay.
 - If cert paths change, fail fast at startup rather than mounting a partially configured filesystem.
 
 ## Registration Flow
 
-The current end-to-end client registration flow is:
+The client registration flow is:
 
 1. Issue a client bundle on the server with `legato-server issue-client`.
 2. Transfer the resulting bundle directory to the client machine.
 3. Run `legatofs install` against that bundle. If `bundle.json` is present, endpoint and TLS server-name settings are hydrated from the bundle automatically.
 4. Start `legatofs` with the generated `legatofs.toml`.
 
-`legatofs install` creates the config file, cert layout, and extent-store directory under the chosen state root. Command-line flags still override bundle defaults when a site-specific endpoint, mount point, or virtual library root must differ from the issued bundle.
+`legatofs install` creates the config file, cert layout, catalog directory, segment directory, and checkpoint directory under the chosen state root. Command-line flags override bundle defaults when a site-specific endpoint, mount point, or virtual library root must differ from the issued bundle.
 
 ## Renewal And Replacement
 

@@ -1,18 +1,20 @@
 # System Shape
 
-This document captures the intended application shape for Legato. It focuses on the settled runtime structure, core technology choices, and intentional boundaries.
+This document captures the application shape for Legato: a read-only, log-structured distributed filesystem specialized for sample-library workloads.
 
 ## Product Shape
 
-Legato is a read-only, project-aware remote sample library system:
+Legato presents a TrueNAS-hosted sample library as a local read-only filesystem on macOS and Windows clients.
 
-- the canonical library stays on the TrueNAS-side dataset
-- the server indexes and serves that library
-- clients mount it as a local read-only filesystem
-- clients keep a local NVMe-backed cache
-- project-aware prefetch warms the client cache before DAW reads become latency-sensitive
+The useful workflow is:
 
-Legato is intentionally shaped as a focused product rather than a general distributed filesystem.
+- the canonical library is stored on the TrueNAS side in a Legato-managed store
+- the server publishes catalog records and streams extent records
+- clients keep partial local replicas on NVMe
+- the mounted filesystem serves reads from local residency whenever possible
+- project-aware prefetch warms the residency set before DAW reads become latency-sensitive
+
+Legato is specialized for read-heavy sample playback. It is not a general-purpose writable distributed filesystem.
 
 ## Runtime Components
 
@@ -24,36 +26,48 @@ The system has three runtime components:
 
 ### `legato-server`
 
-`legato-server` is the Rust service that runs on the TrueNAS side in a container. Its responsibilities are:
+`legato-server` is the Rust service that runs on the TrueNAS side in a container.
 
-- indexing the library dataset
-- resolving metadata and canonical paths
-- serving semantic file extents
-- emitting invalidations when library content changes
-- exposing metrics and structured logs
+Responsibilities:
 
-It does not mount filesystems, and it does not depend on SMB or NFS on the hot path.
+- own the canonical Legato store
+- ingest the library into file, directory, inode, and extent records
+- classify file layouts for sample-library access patterns
+- serve catalog resolution and extent fetches
+- stream ordered catalog and content records to clients
+- issue client TLS bundles
+- expose metrics and structured logs
+
+The server uses the TrueNAS dataset as durable storage for Legato segment and catalog files. It does not rely on SMB or NFS on the hot path.
 
 ### `legatofs`
 
-`legatofs` is the native Rust client binary. Its responsibilities are:
+`legatofs` is the native Rust client binary.
 
-- mounting the remote library as a local read-only filesystem
-- maintaining the local metadata and extent cache
-- serving reads from cache whenever possible
-- fetching cache misses from the server
-- subscribing to invalidations
-- owning cache residency and correctness
+Responsibilities:
+
+- mount the remote library as a local read-only filesystem
+- maintain a local Legato store under the configured state directory
+- track local extent residency in filesystem metadata
+- serve cached reads from local segments
+- fetch missing extents from the server
+- replay ordered server records
+- run cache repair, checkpointing, compaction, and eviction
+
+The client store is a partial replica. It can contain metadata for more files than it has local data for.
 
 ### `legato-prefetch`
 
-`legato-prefetch` is the native CLI used before launching the DAW. Its responsibilities are:
+`legato-prefetch` is the native CLI used before launching the DAW.
 
-- parsing project files and plugin state
-- resolving referenced library paths
-- computing prefetch ranges and priorities
-- asking the local client runtime to prefetch those ranges
-- optionally waiting until selected priorities are resident
+Responsibilities:
+
+- parse project files and plugin state
+- resolve referenced library paths
+- walk inode extent maps
+- compute prefetch priorities
+- ask the local client runtime to make selected extents resident
+- optionally wait until selected priorities are resident
 
 `legato-prefetch` is a binary integration point, not a standalone service.
 
@@ -63,11 +77,11 @@ It does not mount filesystems, and it does not depend on SMB or NFS on the hot p
 
 The server is deployed as a Docker container on the TrueNAS side and managed through Komodo.
 
-The operational model is:
+Operational shape:
 
 - one containerized Rust server
-- read-only mount of the canonical library dataset
-- read-write mount for local application state
+- read-only source-library mount when importing from an existing dataset
+- read-write state mount for the canonical Legato store
 - server-managed TLS material for mTLS
 
 Suggested mount layout:
@@ -82,23 +96,35 @@ Suggested server state layout:
 
 ```text
 /var/lib/legato/
-  server.sqlite
-  config/
+  catalog/
+  segments/
+  checkpoints/
   tmp/
 ```
 
-The initial deployment shape is intentionally a single container. Legato does not split API, indexing, or background work into separate services unless a concrete bottleneck justifies it.
+The deployment is intentionally a single server process for the local TrueNAS workflow.
 
 ### Client Side
 
-Clients run as native binaries, not containers.
+Clients run as native binaries.
 
-Initial target platforms are:
+Target platforms:
 
 - macOS
 - Windows
 
-Linux is not a priority target.
+Default client state layout:
+
+```text
+<state-dir>/
+  catalog/
+  segments/
+  checkpoints/
+  certs/
+  legatofs.toml
+```
+
+Linux is not a primary client target.
 
 ## Repository Shape
 
@@ -107,15 +133,15 @@ Legato is implemented as a Rust workspace with narrow crate boundaries.
 Current crate roles:
 
 - `legato-proto`
-  RPC definitions, generated protobuf types, and protocol compatibility rules.
+  RPC definitions, generated protobuf types, and protocol notes.
 - `legato-types`
   Shared transport-neutral domain types.
 - `legato-server`
-  Server binary, metadata/index handling, extent fetches, invalidations, watcher behavior, and benchmarks/tests.
+  Server binary, canonical store access, ingest, extent fetches, record streaming, invalidations, watcher behavior, and benchmarks/tests.
 - `legato-client-core`
   Shared client runtime, reconnect behavior, scheduling, invalidation handling, and local control-plane behavior.
 - `legato-client-cache`
-  Client-side extent metadata, local extent storage, repair, and eviction logic.
+  Client-side Legato store primitives: segment records, catalog state, residency, checkpointing, repair, compaction, and eviction.
 - `legato-fs-macos`
   macOS adapter surface.
 - `legato-fs-windows`
@@ -133,11 +159,11 @@ Current crate roles:
 
 Rust is used for all first-party components.
 
-The reasons are practical:
+Reasons:
 
 - shared implementation language across server and client
-- good fit for network services, caches, and binary parsing
-- strong safety properties for filesystem-adjacent code
+- good fit for network services, log-structured stores, binary parsing, and filesystem-adjacent code
+- strong safety properties for code that handles local persistence and mount callbacks
 
 ### RPC And Transport
 
@@ -149,44 +175,30 @@ Preferred libraries:
 - `prost`
 - `rustls`
 
-This is a typed, inspectable transport with mature Rust support and good streaming behavior.
+The protocol carries Legato filesystem records and extent references. The transport is typed, inspectable, and supported well in Rust.
 
 ### Persistence
 
-Legato uses SQLite for both:
+Legato uses append-only segment files plus compacted catalog/checkpoint files.
 
-- server-local metadata/state
-- client-local cache metadata/state
+Store files are ordinary host-filesystem files. Legato owns the semantic layout inside those files:
 
-Server-side reasons:
+- records are append-only
+- segment records are immutable after seal
+- catalog updates are committed by appending and checkpointing
+- recovery validates record hashes and replays from the last checkpoint
 
-- the metadata index is local to one server instance
-- operational overhead stays low
-- read-heavy local metadata fits SQLite well
-
-Client-side reasons:
-
-- cache metadata is machine-local
-- SQLite is reliable, embedded, and easy to inspect during debugging
-
-SQLite is intentional here. The first version does not depend on shared Postgres infrastructure.
-
-### Local Extent Storage
-
-Client cached extents are stored as local files on disk, with SQLite tracking metadata and residency state.
-
-This keeps verification and repair straightforward.
+This gives the application a filesystem-specific persistence model without requiring a kernel filesystem or raw storage-device implementation.
 
 ### Filesystem Access And Change Tracking
 
-The server reads from the mounted dataset using ordinary filesystem access.
+The server can import from a mounted source dataset using ordinary filesystem access. The canonical served state is the Legato store.
 
-The correctness model is:
+Correctness model:
 
-- filesystem notifications accelerate freshness
-- reconciliation preserves correctness
-
-Legato does not assume notifications are perfect.
+- import and reconciliation produce ordered Legato records
+- subscriptions deliver ordered records to clients
+- clients update local catalogs and residency state through replay
 
 ### Async Runtime
 
@@ -205,45 +217,45 @@ The server defaults toward structured JSON logs.
 
 ## Security Model
 
-The first version uses mutual TLS between clients and server.
+Legato uses mutual TLS between clients and server.
 
-The authorization model is intentionally simple:
+Authorization model:
 
 - authenticated clients may read the library
-- fine-grained ACLs are not part of the first version
+- the DAW-facing mount is read-only
+- client bundles are issued by the server
 
 ## Ownership Boundaries
 
-The system has explicit ownership boundaries:
+Explicit ownership boundaries:
 
-- the TrueNAS dataset is canonical content
-- `legato-server` owns server metadata and indexing state
-- `legatofs` owns the local metadata cache and extent cache
-- `legato-prefetch` owns project parsing and prefetch planning only
+- the server owns the canonical Legato store
+- clients own their local partial replicas and residency state
+- `legato-prefetch` owns project parsing and prefetch planning
+- platform adapters own only the mount integration surface
 
-`legato-prefetch` talks to the local client runtime, not directly to the server. Cache ownership and residency guarantees stay in one place.
+`legato-prefetch` talks to the local client runtime. Residency guarantees stay with the component that serves reads.
 
-## Deliberate Non-Goals
+## Deliberate Boundaries
 
-These are intentional exclusions from the first implementation:
+Legato does not target:
 
-- write support
+- write support through the DAW-facing mount
 - POSIX-complete filesystem semantics
-- multi-server clustering
-- shared external database state
+- multi-server catalog ownership
 - built-in web UI
-- plugin ecosystem
-- generalized distributed cache coordination
+- plugin marketplace or third-party extension system
+- generalized shared mutation workflows
 
 ## Explicit Trade-Offs
 
-- SQLite over Postgres:
-  Chosen to minimize operational complexity for server-local and client-local state.
-- Native clients over containerized clients:
-  Chosen because filesystem integration and local cache management are OS-specific.
-- gRPC over a custom wire protocol:
-  Chosen for typed contracts and simpler implementation unless a measured bottleneck proves otherwise.
+- Legato-managed store over host-file metadata:
+  Chosen so metadata, extent data, residency, and recovery share one consistency model.
+- User-space mount over kernel filesystem implementation:
+  Chosen because FSKit/macFUSE and WinFSP provide the needed mount surface without kernel-level product scope.
+- gRPC over raw socket protocol:
+  Chosen for typed contracts and operational simplicity.
 - Single server process over split services:
-  Chosen to keep deployment and debugging simple for a local single-user deployment.
+  Chosen to keep the local TrueNAS deployment debuggable.
 - Read-only semantics over write support:
-  Chosen because the useful workflow is fast, predictable library reads rather than shared mutation workflows.
+  Chosen because the target workflow is predictable sample-library playback.

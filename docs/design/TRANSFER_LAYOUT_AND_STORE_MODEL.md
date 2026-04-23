@@ -1,153 +1,236 @@
 # Transfer Layout And Store Model
 
-This document captures the forward-looking transfer and storage rules for the
-v1 architecture reset.
-
-It is intentionally narrow:
-
-- what Legato should build
-- what it should not build
-- why those choices fit the sample-library workload
+This document defines the Legato store and transfer model.
 
 ## Workload Shape
 
-Legato is optimized for a library shape that is both metadata-heavy and
-stream-heavy.
+Legato is optimized for sample libraries with a bimodal shape:
 
-The important workload facts are:
+- many small instrument, preset, map, and metadata files
+- many large audio sample files consumed sequentially
+- a smaller set of container-like files with scattered reads
 
-- many instrument and preset files are small and typically read whole
-- many sample payloads are large and typically consumed sequentially
-- truly random-access container cases exist, but they are the minority
-
-That means a single global fixed block size is the wrong primary abstraction.
-It over-fetches small metadata files and creates too much indexing overhead for
-large sequential sample content.
+The storage model is semantic. File layout is chosen from the file's expected access pattern rather than from a global byte size.
 
 ## Transfer Classes
 
-Legato should classify files into transfer/layout classes at ingest time and
-persist that layout as part of file metadata.
+Files are classified during ingest.
 
-The baseline classes are:
+### `UNITARY`
 
-- `UNITARY`
-  Small files transferred and cached as a single extent.
-- `STREAMED`
-  Sequentially consumed files split into larger extents with readahead-friendly
-  behavior.
-- `RANDOM`
-  Container-like or uncertain files split into smaller extents with conservative
-  fetch behavior.
+Small files are represented as one extent.
 
-These classes are policy, not protocol constants. Thresholds and heuristics
-should be configurable and overrideable.
+Typical examples:
+
+- instrument definitions
+- preset files
+- zone maps
+- small metadata assets
+
+### `STREAMED`
+
+Sequentially consumed sample content is represented as larger ordered extents.
+
+Typical examples:
+
+- medium and large sample files
+- sustained sample payloads
+- files where first-touch reads start near offset zero and continue forward
+
+The read path fetches the required extent and schedules nearby following extents when useful.
+
+### `RANDOM`
+
+Container-like or uncertain files are represented as smaller conservative extents.
+
+Typical examples:
+
+- monolithic sample containers
+- index or database-like assets inside vendor libraries
+- files whose useful access pattern is scattered
 
 ## Classification Inputs
 
-Classification should use signals such as:
+Classification uses:
 
-- extension and magic bytes
+- extension
+- magic bytes
 - file size
 - directory context
-- sampler/library-specific structure where known
-- explicit override rules for vendor or path patterns
+- known sampler or vendor structure
+- explicit path-pattern override rules
 
-Legato should support an override mechanism for edge cases where heuristics are
-not good enough. The override mechanism exists to make the intended layout
-deterministic for unusual vendor libraries, not to preserve multiple competing
-design directions.
-
-## Head-Biased First-Touch
-
-Cold reads for `STREAMED` content should be head-biased.
-
-The required behavior is:
-
-- foreground fetch of the first extent on first uncached access
-- background warming of the following extents
-
-This is important because samplers often need the beginning of a file quickly
-and then continue consuming the remainder sequentially. The system should be
-optimized for "play now, keep warming" rather than "wait for a large generic
-block plan."
+Overrides exist for deterministic handling of unusual libraries.
 
 ## Extent Addressing
 
-Logical addressing should be extent-oriented rather than fixed-block-oriented.
+Legato addresses content with logical extent references.
 
-Legato should identify content through:
+An extent map entry contains:
 
-- stable logical file identity
-- file layout metadata
-- logical extent references
+- file offset
+- length
+- segment identifier
+- segment offset
+- payload hash
+- transfer class
 
-Content hashes belong in the design for:
+Records are self-validating through hashes. File identity and extent map position are the normal operational keys.
 
-- integrity verification
-- recovery
-- corruption detection
+## Segment Store
 
-They should not be treated as the primary design center for addressing. This is
-not a deduplication-first system.
+Legato storage is append-only segment files plus catalog/checkpoint files.
 
-## Store Model
+### Segment Files
 
-The target server and client stores are log-structured Legato-managed stores on
-top of host filesystems.
+Segments are ordinary host-filesystem files. A segment contains:
 
-The important design choice is:
+- segment header
+- ordered records
+- segment footer
+- intra-segment index
 
-- Legato owns the semantic storage model
-- the host filesystem provides durable storage substrate
+Records include:
 
-This avoids two bad extremes:
+- `EXTENT`
+  File data payload plus extent metadata.
+- `INODE`
+  File metadata and extent map reference.
+- `DIRENT`
+  Directory membership.
+- `TOMBSTONE`
+  Logical deletion.
+- `CHECKPOINT`
+  Durable recovery boundary.
 
-- a SQLite metadata database plus opaque generic blob files with weak semantic
-  coupling
-- a bespoke kernel or raw-disk filesystem implementation that would explode
-  complexity and platform burden
+Each record carries:
 
-The store should support:
+- record type
+- monotonic sequence number
+- payload length
+- payload hash
+- payload bytes
 
-- append-only extent writes
-- checkpoints for bounded recovery
+Sealed segments are immutable.
+
+### Catalog
+
+The catalog maps:
+
+- path to file ID
+- file ID to active inode record
+- directory ID to active directory record
+- subscription cursor to replay position
+
+Catalog updates are append-only and compacted periodically into checkpointed catalog files. Startup loads the latest catalog checkpoint and replays later records.
+
+### Client Residency
+
+Client residency is part of local filesystem state.
+
+A client inode records:
+
+- the authoritative extent map
+- which extents are locally resident
+- local segment locations for resident extents
+- pin state
+- last-access and priority metadata for eviction
+
+Reads of absent extents enqueue fetch work and wait until the required data is resident or the read fails.
+
+## Compaction And Eviction
+
+Segments are reclaimed by compaction.
+
+Compaction:
+
+- selects segments with low retained utility
+- rewrites useful resident records into new segments
+- advances catalog references
+- drops obsolete sealed segments
+
+Client eviction uses:
+
+- pin state
+- prefetch priority
+- last access time
+- segment utility
+- configured maximum local store size
+
+Pinned project dependencies are not evicted while the pin remains active.
+
+## Checkpoint And Recovery
+
+Recovery is bounded by checkpoints.
+
+Startup sequence:
+
+1. Load the latest catalog checkpoint.
+2. Replay segment and catalog records after the checkpoint sequence.
+3. Validate record hashes.
+4. Truncate incomplete tail records.
+5. Rebuild in-memory indexes.
+6. Resume server subscription from the durable cursor.
+
+Unclean shutdown leaves at most an incomplete tail record and uncheckpointed replay work.
+
+## Server Store
+
+The server store is canonical.
+
+It contains:
+
+- complete catalog
+- complete inode set
+- complete directory set
+- authoritative extent records
+- ordered record stream
+
+The server can import from an existing directory tree. Import writes Legato records into the canonical store using the classification rules above.
+
+## Client Store
+
+The client store is a partial replica.
+
+It contains:
+
+- catalog records needed for mounted paths
+- resident extent records
+- local residency metadata
+- checkpoint state
+- client subscription cursor
+
+The client may know about a file without having all of its extents locally resident.
+
+## Mount Layer
+
+The mount layer is user-space-native:
+
+- macOS through the macOS adapter surface
+- Windows through WinFSP
+
+The mount layer translates filesystem callbacks into catalog lookup, extent-map lookup, residency checks, local segment reads, and remote fetches.
+
+## Design Boundaries
+
+Legato does not implement:
+
+- a raw storage-device filesystem
+- a kernel filesystem as the product surface
+- byte-level deduplication as the primary storage objective
+- writable library mutation through the mounted client filesystem
+
+## Implementation Consequences
+
+Code should align around these primitives:
+
+- record
+- segment
+- catalog
+- inode
+- directory entry
+- extent map
+- residency
+- checkpoint
 - compaction
-- eviction on the client
-- residency tracking on the client
-- ordered change propagation from the server
-
-## Mount Layer Position
-
-The mount layer remains user-space-native on macOS and Windows.
-
-Legato should become smarter in user space, not deeper in the kernel.
-
-That means:
-
-- the mount runtime should understand file layouts and extent residency
-- it should not depend on a bespoke kernel filesystem implementation
-- it should not attempt to become a general-purpose writable filesystem
-
-## Intentional What-Nots
-
-Legato should not build:
-
-- a full custom disk filesystem below the host filesystem
-- a bespoke kernel driver as the primary product direction
-- a fixed-block cache model as the long-term design center
-- a generalized distributed filesystem with full writable POSIX semantics
-- a design whose main goal is content-addressed deduplication
-
-## Consequence For Implementation
-
-The system should converge toward:
-
-- resolve to stable logical file identity plus layout
-- fetch semantic extents
-- subscribe to ordered logical changes
-- prefetch by file layout and residency requirements
-- mount from local catalog and extent residency state
-
-Anything that still assumes "open remote file handle, fetch generic block,
-track residency in a side table" should be treated as provisional.
+- subscription cursor

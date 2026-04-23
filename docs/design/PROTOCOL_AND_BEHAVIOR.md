@@ -1,33 +1,36 @@
 # Protocol And Behavior
 
-This document captures the final behavioral shape of Legato as a project-aware, read-only sample-library system. It focuses on the contract the system is designed to provide and the intentional boundaries around that contract.
+This document captures the behavioral contract for Legato as a read-only, project-aware sample-library filesystem.
 
 ## Scope
 
-Legato serves a large sample library from the TrueNAS side to macOS and Windows DAW clients, with project-aware prefetch designed to make playback-time reads hit local NVMe.
+Legato serves a large sample library from a TrueNAS-side canonical store to macOS and Windows DAW clients. Clients mount a local filesystem view backed by partial local residency.
 
 In scope:
 
 - read-only library access
 - native filesystem mounting on client machines
-- metadata resolution and extent fetches
-- local caching
+- catalog resolution
+- semantic extent fetches
+- ordered record subscription
+- local residency and eviction
 - project-aware prefetch
 
-Not in scope:
+Outside the product boundary:
 
-- write support for the library
+- write support through the mounted library
 - DAW project collaboration or project-file sync
-- generalized shared-filesystem semantics
+- generalized shared-filesystem mutation semantics
 
 ## Goals
 
-Legato is intended to provide these user-visible behaviors:
+Legato provides these user-visible behaviors:
 
 - the mounted library appears as a normal local directory to DAWs and plugins
-- playback-time reads come from the local cache after successful prefetch
-- cold project open is dominated by a bounded prefetch transfer instead of thousands of latency-sensitive small reads
-- the server remains the canonical source of truth and clients remain caches
+- cached playback-time reads come from local NVMe
+- cold project open is dominated by bounded prefetch and extent fetch work
+- the server is authoritative
+- each client is a partial local replica
 
 ## System Behavior
 
@@ -37,135 +40,144 @@ Legato consists of:
 2. a native user-space filesystem client
 3. a project-aware prefetch tool
 
-The server indexes the library, serves metadata and semantic extents, and emits invalidations. The client mounts the library, maintains the local extent store, serves filesystem reads, and retries through reconnect or stale-handle cases. The prefetch tool analyzes project or plugin state and asks the local client runtime to warm the cache.
+The server owns the canonical store and streams filesystem records. The client mounts a local read-only view, stores local segment records, tracks residency, and fetches misses. The prefetch tool analyzes project or plugin state and asks the local runtime to make specific extents resident.
 
-## Metadata And File Identity
+## File Identity And Catalog
 
-The server maintains a persistent metadata index in SQLite.
+Legato identifies files with stable logical file IDs.
 
-The important behavioral rules are:
+Catalog records define:
 
-- file identity is stable across normal daemon restarts
-- the metadata index is reconciled, not blindly rebuilt
-- library changes produce invalidation events that clients use to drop stale metadata or cache entries
+- file ID
+- path
+- inode metadata
+- directory entries
+- layout class
+- extent map
+- modification sequence
 
-File IDs are logical identifiers owned by the server index, not direct inode aliases.
+Directory listings and file stat behavior are satisfied from catalog records. Path resolution produces the active inode record for a path.
 
 ## Extent Model
 
 Legato addresses data in semantic extents:
 
-- extents are keyed by file identity plus extent index
-- extent size is derived from the server-side layout decision
+- extents are keyed by file identity plus extent map entry
+- extent size is derived from the file layout decision
+- extent records carry payload hashes for integrity
 - streamed files can be prefetched ahead of playback-sensitive reads
 
-The client extent store persists fetched extents locally and verifies integrity before use.
+Content hashes verify records. They are not the primary identity of a file.
 
 ## Wire Behavior
 
 Legato uses gRPC over TLS 1.3 with mTLS.
 
-The important request families are:
+Core request families:
 
-- attach/session negotiation
-- stat, path resolution, and directory listing
-- resolve and semantic extent fetch
-- explicit prefetch submission
-- invalidation subscription
+- `Attach`
+  Establish protocol version and capability negotiation.
+- `Resolve`
+  Resolve a path to file ID, inode metadata, and extent map.
+- `Fetch`
+  Stream requested extent records.
+- `Hint`
+  Submit prioritized residency work.
+- `Subscribe`
+  Stream ordered records after a sequence cursor.
 
-The key behavioral choices are:
+The hot path uses file identity and extent references. Path resolution happens before extent fetch.
 
-- path resolution exists independently of file open
-- prefetch is client-orchestrated and means client-cache residency, not just server warming
-- invalidations refresh correctness after library changes
+## Client Read Behavior
+
+Read path:
+
+1. Platform adapter receives a read for a mounted file.
+2. Client maps the path to an inode from the local catalog.
+3. Client maps the requested byte range to one or more extent records.
+4. Resident extents are read from local segments.
+5. Missing extents are fetched, appended to local segments, marked resident, and then read.
+
+Directory listing and stat calls are served from catalog state.
 
 ## Prefetch Behavior
 
-`legato-prefetch` analyzes project inputs and emits prioritized work for the local client runtime.
+`legato-prefetch` analyzes project inputs and emits prioritized residency work.
 
-Current input families are:
+Input families:
 
 - Ableton `.als`
 - Kontakt `.nki`
-- plugin state blobs such as `.fxp`, `.fxb`, and `.vstpreset`
+- plugin state files such as `.fxp`, `.fxb`, and `.vstpreset`
 
-Priority levels are intentionally coarse:
+Priority levels:
 
 - `P0`
   Direct sample references needed immediately.
 - `P1`
   Files needed to instantiate the project or plugin state.
 - `P2`
-  Referenced sample content that is likely needed soon after load.
+  Referenced sample content likely needed soon after load.
 - `P3`
   Speculative or readahead work.
 
-If the caller asks to wait through a priority, completion means those accepted ranges are durably resident in the client cache before the prefetch command returns.
-
-## Client Behavior
-
-The client runtime includes:
-
-- a metadata cache for path and directory lookups
-- an extent cache on local disk
-- fetch coordination so overlapping requests share work
-- prefetch scheduling and residency tracking
-- reconnect and stale-handle recovery
-
-The mounted filesystem is read-only. Unsupported mutating operations fail as read-only rather than pretending to succeed.
+If the caller waits through a priority, completion means accepted extents at or above that priority are locally resident before the command returns.
 
 ## Consistency Model
 
-The consistency model is intentionally simple:
+The server's record stream is totally ordered by sequence number.
 
-- the server is the source of truth
-- clients are caches
-- invalidations tell clients when to discard stale state
-- reconnect logic restores session state after transport loss
+Client behavior:
 
-Legato does not attempt cross-client cache coherence beyond the server invalidation stream. Each client cache is independent.
+- replay records in order
+- update local catalog records
+- preserve resident extents that still match active inode maps
+- drop residency for obsolete extent mappings
+- resume subscription from the last durable cursor
+
+Each client owns its own residency state. Cross-client residency coordination is not part of the protocol.
 
 ## Failure Behavior
 
-The system is designed to degrade in predictable ways:
+The system degrades predictably:
 
-- if the server is unavailable and the data is already cached, playback can continue from cache
-- if a cache miss occurs during a partition, the read waits until timeout and then fails
-- if a cached extent fails integrity verification, it is evicted and refetched
-- if transport state becomes stale after restart, the client reconnects and retries
-- if project parsing cannot produce a precise prefetch set, the system falls back to a broader but safe prefetch shape
+- resident data can be served while disconnected
+- a miss during disconnection waits until timeout and then fails
+- corrupt records are rejected by hash verification
+- unclean shutdown recovery replays from the last checkpoint
+- prefetch parser uncertainty results in broader safe residency requests
 
-The important design rule is that failure should degrade to slower behavior or over-fetching, not silent corruption.
+Failure should degrade to slower reads or broader fetching, not silent corruption.
 
 ## Observability
 
 The system emits structured tracing and Prometheus-style metrics.
 
-The intended visibility includes:
+Useful visibility includes:
 
-- cache hit and miss behavior
+- extent hit and miss behavior
 - extent-fetch latency
-- invalidation activity
-- prefetch queue or residency behavior
-- bytes served from cache versus network
+- record subscription lag
+- catalog replay duration
+- segment compaction and eviction activity
+- prefetch residency progress
 
-## Deliberate What-Nots
+## Deliberate Boundaries
 
-The following are intentionally outside the design:
+Legato does not implement:
 
-- a write path for library mutation
-- a POSIX-complete filesystem target
-- a custom bespoke transport protocol
-- shared external control of cache residency
-- multi-node or clustered metadata ownership
+- a write path for library mutation through the mounted filesystem
+- general collaborative filesystem semantics
+- shared external control of client residency
+- multi-server catalog ownership
 
 ## Explicit Trade-Offs
 
-- Read-only semantics over general filesystem behavior:
-  Chosen because the target workload is sample playback, not collaborative file mutation.
-- Coarse priority classes over highly dynamic scheduling models:
-  Chosen because they are easier to reason about and integrate into launcher behavior.
-- Client-owned residency guarantees over server-owned warming semantics:
-  Chosen so the place that serves reads is also the place that proves readiness.
-- Safe fallback prefetch over parser-perfect precision:
-  Chosen because over-fetching is preferable to a project opening with missing data.
+- Client-owned residency guarantees:
+  The client that serves reads is the component that proves readiness.
+- Coarse priority classes:
+  Four priorities are enough for project-open and playback-sensitive scheduling.
+- Record replay:
+  Ordered records make reconnect, catalog refresh, and partial replication one mechanism.
+- Read-only mount:
+  The useful workflow is fast, predictable sample-library reads.

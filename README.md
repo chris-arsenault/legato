@@ -1,23 +1,22 @@
 # Legato
 
-Legato is a Rust workspace for serving a read-only sample library from a TrueNAS-side server and exposing it to macOS or Windows clients through a native filesystem mount.
+Legato is a Rust workspace for a read-only, log-structured sample-library filesystem. A TrueNAS-side server owns the canonical Legato store, macOS and Windows clients mount partial local replicas, and project-aware prefetch makes playback-time reads hit local NVMe whenever possible.
 
-At a high level, this repo contains three things:
+At a high level, this repo contains three runtime pieces:
 
-- `legato-server`: the Docker-friendly server that indexes the library, serves metadata and extents, and emits invalidations.
-- `legatofs`: the native client binary that owns local cache state and mounts the remote library on end-user machines.
-- `legato-prefetch`: the project-aware helper that analyzes DAW or plugin state and warms the client cache before reads become latency-sensitive.
+- `legato-server`: the containerized TrueNAS-side daemon that serves the canonical store, publishes catalog records, streams extent records, and issues client bundles.
+- `legatofs`: the native client binary that mounts the library, maintains the local Legato store, and serves reads from resident extents.
+- `legato-prefetch`: the project-aware helper that analyzes DAW and plugin state, resolves referenced library content, and warms local residency before reads become latency-sensitive.
 
 ## Contents
 
-- [Project Overview](docs/INDEX.md)
+- [Documentation Index](docs/INDEX.md)
 - [Repository Structure](docs/REPO_STRUCTURE.md)
 - [Development Workflow](docs/DEVELOPMENT.md)
 - [System Shape](docs/architecture/SYSTEM_SHAPE.md)
 - [Protocol And Behavior](docs/design/PROTOCOL_AND_BEHAVIOR.md)
+- [Transfer Layout And Store Model](docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
 - [Operations Runbook](deploy/OPERATIONS.md)
-- [Platform Manifest](platform.yml)
-- [Komodo Compose Stack](compose.yaml)
 - [Client Packaging Notes](deploy/client/README.md)
 - [Protocol Versioning](crates/legato-proto/PROTO_VERSIONING.md)
 - [Agent/Contributor Index](CLAUDE.md)
@@ -25,7 +24,7 @@ At a high level, this repo contains three things:
 ## Workspace Map
 
 - `crates/legato-server`
-  High-level server runtime, metadata database, reconciliation, watcher handling, TLS bootstrap, integration tests, and benchmarks.
+  Server runtime, canonical store access, catalog publication, extent streaming, TLS bootstrap, integration tests, and benchmarks.
 - `crates/legatofs`
   Native client entrypoint and mount bootstrap for macOS and Windows adapters.
 - `crates/legato-prefetch`
@@ -33,11 +32,11 @@ At a high level, this repo contains three things:
 - `crates/legato-client-core`
   Shared client runtime behavior, reconnect planning, prefetch scheduling, and local control-plane logic.
 - `crates/legato-client-cache`
-  SQLite-backed cache metadata, extent storage, repair, and eviction primitives.
+  Client-side Legato store primitives: segment records, catalog state, residency, checkpointing, repair, compaction, and eviction.
 - `crates/legato-foundation`
   Shared config loading, tracing, metrics, and shutdown helpers.
 - `crates/legato-proto`
-  Protobuf definitions, generated bindings, and wire-compatibility notes.
+  Protobuf definitions, generated bindings, and protocol notes.
 - `crates/legato-types`
   Shared domain types used across the workspace.
 - `crates/legato-fs-macos`
@@ -48,21 +47,21 @@ At a high level, this repo contains three things:
 ## Start Here
 
 - Read [docs/INDEX.md](docs/INDEX.md) for the documentation map.
-- Read [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) if you want to orient yourself in the workspace before opening code.
-- Read [docs/architecture/SYSTEM_SHAPE.md](docs/architecture/SYSTEM_SHAPE.md) if you want the final application shape and intentional trade-offs.
-- Read [docs/design/PROTOCOL_AND_BEHAVIOR.md](docs/design/PROTOCOL_AND_BEHAVIOR.md) if you want the final behavioral contract without the exploratory design notes.
-- Read [deploy/OPERATIONS.md](deploy/OPERATIONS.md) if you care about deployment shape, runtime topology, or operational concerns.
-- Read [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) if you want the common build, test, lint, and benchmark commands.
+- Read [docs/REPO_STRUCTURE.md](docs/REPO_STRUCTURE.md) to orient yourself before opening code.
+- Read [docs/architecture/SYSTEM_SHAPE.md](docs/architecture/SYSTEM_SHAPE.md) for the application shape and trade-offs.
+- Read [docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md](docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md) for the storage format and transfer model.
+- Read [docs/design/PROTOCOL_AND_BEHAVIOR.md](docs/design/PROTOCOL_AND_BEHAVIOR.md) for the behavioral contract.
+- Read [deploy/OPERATIONS.md](deploy/OPERATIONS.md) for deployment shape and operational commands.
 
-## Current Scope
+## Scope
 
-This repository is for a personal Legato deployment:
+This repository targets a personal Legato deployment:
 
-- a Rust server container intended to run through Komodo on TrueNAS
-- a read-only sample-library view over the TrueNAS datasets
+- a Rust server container served through Komodo on TrueNAS
+- a read-only sample-library mount over TrueNAS-hosted data
 - native macOS and Windows client binaries
-- SQLite-backed server/client metadata
-- local client extent storage for cached reads
-- project-aware prefetch planning
+- a log-structured Legato store on server and clients
+- local NVMe-backed partial residency on clients
+- project-aware prefetch planning for DAW workflows
 
-The docs should describe the local workflow and the repo structure. They are not a public release plan and should not invent optional deployment modes that are not needed for this setup.
+The docs describe this local workflow and repository structure. They do not describe product packaging, multi-tenant hosting, or public SaaS deployment.

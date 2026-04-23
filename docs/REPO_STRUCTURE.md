@@ -7,34 +7,36 @@ This document describes the shape of the workspace so you can find the right cod
 - `Cargo.toml`
   Workspace manifest for all crates.
 - `crates/`
-  Rust crates that implement the server, client, protocol, and shared libraries.
+  Rust crates that implement the server, client, protocol, store, and shared libraries.
 - `deploy/`
   Deployment assets and operational documentation.
+- `docs/`
+  Architecture, behavior, and workflow documentation.
 
 ## Runtime Pieces
 
 - `crates/legato-server`
-  The server-side implementation. This is where library indexing, metadata APIs, extent fetches, invalidation fanout, TLS bootstrap, and watcher handling live.
+  Server runtime, canonical Legato store access, catalog publication, extent streaming, invalidation fanout, TLS bootstrap, watcher handling, and server benchmarks.
 - `crates/legatofs`
-  The native client entrypoint. It wires together config loading, telemetry bootstrap, local cache/control-plane setup, and the platform adapter.
+  Native client entrypoint. It wires config loading, telemetry bootstrap, local store setup, project-facing commands, and the platform adapter.
 - `crates/legato-prefetch`
-  The prefetch helper. It analyzes DAW or plugin-state inputs and emits or executes prefetch hints.
+  Project-aware prefetch helper. It analyzes DAW and plugin state, resolves referenced library paths, and emits or executes prefetch hints.
 
 ## Shared Client Libraries
 
 - `crates/legato-client-core`
-  Client runtime logic, reconnect handling, prefetch scheduling, and local control-plane behavior.
+  Client runtime logic, reconnect handling, prefetch scheduling, residency coordination, and local control-plane behavior.
 - `crates/legato-client-cache`
-  SQLite-backed cache metadata, extent storage, cache verification, eviction, and repair support.
+  Client-side Legato store primitives: segment records, catalog state, residency, checkpointing, repair, compaction, and eviction.
 
 ## Shared Foundations
 
 - `crates/legato-foundation`
   Cross-cutting config, tracing, metrics, and shutdown helpers.
 - `crates/legato-types`
-  Shared domain types and platform-neutral error or filesystem semantics.
+  Shared domain types and platform-neutral filesystem semantics.
 - `crates/legato-proto`
-  Protobuf schema, generated bindings, and compatibility rules.
+  Protobuf schema, generated bindings, and protocol notes.
 
 ## Platform Adapters
 
@@ -46,9 +48,9 @@ This document describes the shape of the workspace so you can find the right cod
 ## Tests And Benchmarks
 
 - `crates/legato-server/tests/end_to_end.rs`
-  Cross-crate integration coverage for the server, client cache/control plane, and prefetch path.
+  Cross-crate integration coverage for server, client store/control plane, mount reads, and prefetch behavior.
 - `crates/legato-server/benches/server_workloads.rs`
-  Benchmark targets for full scan, cold open, and semantic extent fetches.
+  Benchmark targets for library scan, catalog resolution, and semantic extent fetches.
 - Unit tests live alongside implementation files inside each crate.
 
 ## Deployment Docs
@@ -63,6 +65,7 @@ This document describes the shape of the workspace so you can find the right cod
 ## Practical Navigation
 
 - If you care about wire shape, start in `legato-proto`.
+- If you care about store layout, start with `docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md`, then `legato-client-cache` and `legato-server`.
 - If you care about server behavior, start in `legato-server`.
 - If you care about client mount or recovery behavior, start in `legatofs`, then `legato-client-core`, then `legato-client-cache`.
 - If you care about prefetch behavior, start in `legato-prefetch`, then follow calls into `legato-client-core`.
