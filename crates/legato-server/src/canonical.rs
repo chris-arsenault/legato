@@ -149,17 +149,33 @@ fn reconcile_file(
     })?;
     let path_string = logical_path(library_root, path)?;
     let decision = policy.file_decision(&path.to_string_lossy(), metadata.len(), false);
-    let file_payload = append_file_extents(
-        catalog,
-        path,
-        &decision.transfer_class,
-        decision.extent_bytes,
-    )?;
     let file_id = identities.file_id_for(path, &metadata, false)?;
     let existing_by_id = catalog.resolve_file_id(file_id).cloned();
+    let probed_payload = probe_file_extents(path, &decision.transfer_class, decision.extent_bytes)?;
+    let extents = if existing_by_id.as_ref().is_some_and(|existing| {
+        existing_extents_match(
+            existing,
+            &probed_payload,
+            decision.transfer_class,
+            metadata.len(),
+        )
+    }) {
+        existing_by_id
+            .as_ref()
+            .map(|existing| existing.extents.clone())
+            .unwrap_or_default()
+    } else {
+        append_file_extents(
+            catalog,
+            path,
+            &decision.transfer_class,
+            decision.extent_bytes,
+        )?
+        .extents
+    };
     let generation = next_inode_generation(
         existing_by_id.as_ref(),
-        Some(file_payload.content_hash.as_slice()),
+        Some(probed_payload.content_hash.as_slice()),
         &path_string,
         false,
     );
@@ -170,9 +186,9 @@ fn reconcile_file(
             inode_generation: generation,
             size: metadata.len(),
             mtime_ns: mtime_ns(&metadata)?,
-            content_hash: file_payload.content_hash,
+            content_hash: probed_payload.content_hash,
             transfer_class: decision.transfer_class,
-            extents: file_payload.extents,
+            extents,
         },
     );
     let existing = catalog.resolve_path(&path_string).cloned();
@@ -242,10 +258,7 @@ fn append_file_extents(
             &payload,
         )?);
     }
-    Ok(AppendedFilePayload {
-        extents,
-        content_hash: content_hasher.finalize().as_bytes().to_vec(),
-    })
+    Ok(AppendedFilePayload { extents })
 }
 
 fn directory_entries(
@@ -305,7 +318,100 @@ fn entries_to_map(entries: Vec<CatalogDirectoryEntry>) -> BTreeMap<String, Catal
 #[derive(Debug)]
 struct AppendedFilePayload {
     extents: Vec<CatalogExtent>,
+}
+
+#[derive(Debug)]
+struct ProbedFilePayload {
+    extents: Vec<ProbedExtent>,
     content_hash: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbedExtent {
+    extent_index: u32,
+    file_offset: u64,
+    length: u64,
+    payload_hash: Vec<u8>,
+}
+
+fn probe_file_extents(
+    path: &Path,
+    transfer_class: &TransferClass,
+    extent_bytes: u64,
+) -> Result<ProbedFilePayload, CanonicalStoreError> {
+    let mut file = fs::File::open(path).map_err(|source| CanonicalStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let size = file
+        .metadata()
+        .map_err(|source| CanonicalStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let extent_length = match transfer_class {
+        TransferClass::Unitary => size.max(1),
+        _ => extent_bytes.max(1),
+    };
+    let extent_count = if size == 0 {
+        1
+    } else {
+        size.div_ceil(extent_length)
+    };
+    let mut extents = Vec::with_capacity(extent_count as usize);
+    let mut content_hasher = blake3::Hasher::new();
+    for extent_index in 0..extent_count {
+        let file_offset = extent_index * extent_length;
+        let length = if size == 0 {
+            0
+        } else {
+            std::cmp::min(extent_length, size - file_offset)
+        };
+        file.seek(SeekFrom::Start(file_offset))
+            .map_err(|source| CanonicalStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut payload = vec![0_u8; length as usize];
+        file.read_exact(&mut payload)
+            .map_err(|source| CanonicalStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        content_hasher.update(&payload);
+        extents.push(ProbedExtent {
+            extent_index: extent_index as u32,
+            file_offset,
+            length,
+            payload_hash: blake3::hash(&payload).as_bytes().to_vec(),
+        });
+    }
+    Ok(ProbedFilePayload {
+        extents,
+        content_hash: content_hasher.finalize().as_bytes().to_vec(),
+    })
+}
+
+fn existing_extents_match(
+    existing: &CatalogInode,
+    probed: &ProbedFilePayload,
+    transfer_class: TransferClass,
+    size: u64,
+) -> bool {
+    existing.size == size
+        && existing.transfer_class == transfer_class as i32
+        && existing.extents.len() == probed.extents.len()
+        && existing
+            .extents
+            .iter()
+            .zip(probed.extents.iter())
+            .all(|(existing, probed)| {
+                existing.extent_index == probed.extent_index
+                    && existing.file_offset == probed.file_offset
+                    && existing.length == probed.length
+                    && existing.payload_hash == probed.payload_hash
+            })
 }
 
 fn next_inode_generation(
@@ -628,6 +734,37 @@ mod tests {
 
         assert_eq!(renamed_inode.file_id, original_id);
         assert!(second_catalog.resolve_path("/Kontakt/piano.wav").is_none());
+    }
+
+    #[test]
+    fn canonical_ingest_reuses_existing_extents_for_unchanged_files() {
+        let temp = tempdir().expect("tempdir should exist");
+        let library = temp.path().join("library");
+        let store = temp.path().join("store");
+        std::fs::create_dir_all(library.join("Kontakt")).expect("library should create");
+        std::fs::write(library.join("Kontakt").join("piano.wav"), b"sample-payload")
+            .expect("sample should write");
+
+        let first_stats =
+            reconcile_library_root_to_store(&store, &library).expect("initial ingest should work");
+        let first_catalog = CatalogStore::open(&store, 300).expect("catalog should open");
+        let first_inode = first_catalog
+            .resolve_path("/Kontakt/piano.wav")
+            .expect("first inode should resolve")
+            .clone();
+
+        let second_stats =
+            reconcile_library_root_to_store(&store, &library).expect("repeat ingest should work");
+        let second_catalog = CatalogStore::open(&store, 400).expect("catalog should reopen");
+        let second_inode = second_catalog
+            .resolve_path("/Kontakt/piano.wav")
+            .expect("second inode should resolve");
+
+        assert_eq!(first_stats.files_created, 1);
+        assert_eq!(second_stats.files_created, 0);
+        assert_eq!(second_stats.files_updated, 0);
+        assert_eq!(second_inode.inode_generation, first_inode.inode_generation);
+        assert_eq!(second_inode.extents, first_inode.extents);
     }
 
     #[test]
