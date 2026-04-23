@@ -1,21 +1,19 @@
 //! Project-aware prefetch planning, parsing, and CLI execution.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use flate2::read::GzDecoder;
-use legato_client_cache::{
-    ExtentCacheStore, MetadataCache, MetadataCachePolicy, open_cache_database,
-};
-use legato_client_core::LocalControlPlane;
-use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
+use legato_client_cache::open_cache_database;
+use legato_client_core::{ClientConfig, FilesystemOpenHandle, FilesystemService};
+use legato_foundation::load_config;
 use legato_types::{PrefetchHintPath, PrefetchPriority};
 use regex::Regex;
-use serde::Serialize;
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 
 /// Supported project/input formats understood by the prefetch planner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -120,7 +118,48 @@ pub enum PrefetchCommand {
         json: bool,
         /// Requested wait-through priority.
         wait_through: PrefetchPriority,
+        /// Path to the generated `legatofs.toml` client config.
+        config_path: Option<PathBuf>,
     },
+}
+
+/// Summary of one real local prefetch run.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ExecutionReport {
+    /// Hints accepted for processing after analysis.
+    pub accepted: usize,
+    /// Hints already resident before work began.
+    pub skipped: usize,
+    /// Hints that completed by fetching or reading through the local cache.
+    pub completed: usize,
+    /// Hints that failed without corrupting local state.
+    pub failed: usize,
+    /// Bytes returned by completed read-through work.
+    pub bytes_read: u64,
+    /// Net new bytes represented in the local extent store after the run.
+    pub bytes_fetched: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PrefetchClientProcessConfig {
+    #[serde(default)]
+    client: ClientConfig,
+    #[serde(default)]
+    mount: PrefetchMountConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrefetchMountConfig {
+    #[serde(default = "default_state_dir")]
+    state_dir: String,
+}
+
+impl Default for PrefetchMountConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: default_state_dir(),
+        }
+    }
 }
 
 /// Structured result returned by the CLI runner.
@@ -190,6 +229,7 @@ where
 
     let mut json = false;
     let mut wait_through = PrefetchPriority::P1;
+    let mut config_path = None;
     let mut positionals = Vec::new();
     let command = tokens[0].clone();
     let mut index = 1;
@@ -207,6 +247,15 @@ where
                     )));
                 };
                 wait_through = parse_priority(value)?;
+                index += 2;
+            }
+            "--config" => {
+                let Some(value) = tokens.get(index + 1) else {
+                    return Err(PrefetchError::InvalidCli(String::from(
+                        "missing value for --config",
+                    )));
+                };
+                config_path = Some(PathBuf::from(value));
                 index += 2;
             }
             other => {
@@ -231,6 +280,7 @@ where
             project_path: PathBuf::from(project_path),
             json,
             wait_through,
+            config_path,
         }),
         _ => Err(PrefetchError::InvalidCli(format!(
             "unknown command `{command}`"
@@ -252,10 +302,11 @@ pub fn run_cli_command(command: PrefetchCommand) -> Result<CommandResult, Prefet
             project_path,
             json,
             wait_through,
+            config_path,
         } => {
             let mut analysis = analyze_project(&project_path)?;
             analysis.wait_through = wait_through;
-            let execution = execute_analysis(&analysis)?;
+            let execution = execute_analysis(&analysis, config_path.as_deref())?;
             Ok(CommandResult {
                 exit_code: 0,
                 output: render_execution(&analysis, &execution, json)?,
@@ -534,67 +585,60 @@ fn detect_kontakt_version(bytes: &[u8]) -> KontaktVersion {
     }
 }
 
-fn execute_analysis(analysis: &ProjectAnalysis) -> Result<BTreeMap<String, usize>, PrefetchError> {
-    let cache_root = std::env::temp_dir().join(format!("legato-prefetch-{}", unix_now_ns()));
-    let database = open_cache_database(&cache_root.join("client.sqlite"))
+fn execute_analysis(
+    analysis: &ProjectAnalysis,
+    config_path: Option<&Path>,
+) -> Result<ExecutionReport, PrefetchError> {
+    let config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_config_path);
+    let process_config =
+        load_config::<PrefetchClientProcessConfig>(Some(&config_path), "LEGATO_FS")
+            .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    let mut store = ExtentCacheStore::new(&cache_root.join("extents"), database)
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-    let mut control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
+    runtime.block_on(execute_analysis_live(analysis, process_config))
+}
 
-    for (index, hint) in scheduled_hints(
+async fn execute_analysis_live(
+    analysis: &ProjectAnalysis,
+    process_config: PrefetchClientProcessConfig,
+) -> Result<ExecutionReport, PrefetchError> {
+    let state_dir = PathBuf::from(&process_config.mount.state_dir);
+    let bytes_before = local_extent_bytes(&state_dir)?;
+    let mut service = FilesystemService::connect(
+        process_config.client,
+        default_client_name(),
+        Path::new(&process_config.mount.state_dir),
+    )
+    .await
+    .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    let mut report = ExecutionReport::default();
+
+    for hint in scheduled_hints(
         analysis
             .hints
             .clone()
             .into_iter()
             .map(PrefetchHintPath::from)
             .collect(),
-    )
-    .into_iter()
-    .enumerate()
-    {
-        control.register_resolved_path(
-            InodeMetadata {
-                file_id: (index + 1) as u64,
-                path: hint.path.to_string_lossy().into_owned(),
-                size: hint.length.max(1),
-                mtime_ns: unix_now_ns(),
-                is_dir: false,
-                layout: Some(FileLayout {
-                    transfer_class: 0,
-                    extents: vec![ExtentDescriptor {
-                        extent_index: 0,
-                        file_offset: hint.file_offset,
-                        length: hint.length.max(1),
-                        extent_hash: Vec::new(),
-                    }],
-                }),
-            },
-            unix_now_ns(),
-        );
+    ) {
+        report.accepted += 1;
+        match prefetch_one_hint(&mut service, &state_dir, &hint).await {
+            Ok(PrefetchHintOutcome::AlreadyResident) => report.skipped += 1,
+            Ok(PrefetchHintOutcome::Completed { bytes_read }) => {
+                report.completed += 1;
+                report.bytes_read = report.bytes_read.saturating_add(bytes_read);
+            }
+            Err(_error) => report.failed += 1,
+        }
     }
 
-    let execution = control
-        .prefetch_paths(
-            &scheduled_hints(
-                analysis
-                    .hints
-                    .clone()
-                    .into_iter()
-                    .map(PrefetchHintPath::from)
-                    .collect(),
-            ),
-            analysis.wait_through,
-            &mut store,
-            unix_now_ns(),
-            |extent| format!("prefetch-{}-{}", extent.file_id.0, extent.extent_index).into_bytes(),
-        )
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
-
-    Ok(BTreeMap::from([
-        (String::from("accepted"), execution.accepted.len()),
-        (String::from("completed"), execution.completed.len()),
-    ]))
+    let bytes_after = local_extent_bytes(&state_dir)?;
+    report.bytes_fetched = bytes_after.saturating_sub(bytes_before);
+    Ok(report)
 }
 
 fn render_analysis(analysis: &ProjectAnalysis, json: bool) -> Result<String, PrefetchError> {
@@ -614,7 +658,7 @@ fn render_analysis(analysis: &ProjectAnalysis, json: bool) -> Result<String, Pre
 
 fn render_execution(
     analysis: &ProjectAnalysis,
-    execution: &BTreeMap<String, usize>,
+    execution: &ExecutionReport,
     json: bool,
 ) -> Result<String, PrefetchError> {
     if json {
@@ -623,11 +667,104 @@ fn render_execution(
     }
 
     Ok(format!(
-        "accepted: {}\ncompleted: {}\nwait-through: {:?}",
-        execution.get("accepted").copied().unwrap_or(0),
-        execution.get("completed").copied().unwrap_or(0),
+        "accepted: {}\nskipped: {}\ncompleted: {}\nfailed: {}\nbytes-read: {}\nbytes-fetched: {}\nwait-through: {:?}",
+        execution.accepted,
+        execution.skipped,
+        execution.completed,
+        execution.failed,
+        execution.bytes_read,
+        execution.bytes_fetched,
         analysis.wait_through
     ))
+}
+
+enum PrefetchHintOutcome {
+    AlreadyResident,
+    Completed { bytes_read: u64 },
+}
+
+async fn prefetch_one_hint(
+    service: &mut FilesystemService,
+    state_dir: &Path,
+    hint: &PrefetchHintPath,
+) -> Result<PrefetchHintOutcome, PrefetchError> {
+    let handle = service
+        .open(hint.path.to_string_lossy().as_ref())
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    if hint_already_resident(state_dir, &handle, hint)? {
+        service
+            .release(handle.local_handle)
+            .await
+            .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+        return Ok(PrefetchHintOutcome::AlreadyResident);
+    }
+
+    let read_size = hint
+        .length
+        .max(1)
+        .min(u64::from(u32::MAX))
+        .min(handle.size.saturating_sub(hint.file_offset)) as u32;
+    let bytes = service
+        .read(handle.local_handle, hint.file_offset, read_size)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    service
+        .release(handle.local_handle)
+        .await
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    Ok(PrefetchHintOutcome::Completed {
+        bytes_read: bytes.len() as u64,
+    })
+}
+
+fn hint_already_resident(
+    state_dir: &Path,
+    handle: &FilesystemOpenHandle,
+    hint: &PrefetchHintPath,
+) -> Result<bool, PrefetchError> {
+    let required = handle
+        .extents
+        .iter()
+        .filter(|extent| {
+            let extent_end = extent.file_offset.saturating_add(extent.length);
+            let hint_end = hint.file_offset.saturating_add(hint.length.max(1));
+            extent.file_offset < hint_end && extent_end > hint.file_offset
+        })
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return Ok(false);
+    }
+
+    let connection = open_cache_database(&state_dir.join("client.sqlite"))
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    for extent in required {
+        let present: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM extent_entries WHERE file_id = ?1 AND extent_index = ?2 AND state = 'ready'",
+                [handle.file_id.0 as i64, extent.extent_index as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+        if present.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn local_extent_bytes(state_dir: &Path) -> Result<u64, PrefetchError> {
+    let connection = open_cache_database(&state_dir.join("client.sqlite"))
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(content_size), 0) FROM extent_entries WHERE state = 'ready'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value.max(0) as u64)
+        .map_err(|error| PrefetchError::Runtime(error.to_string()))
 }
 
 fn scheduled_hints(mut hints: Vec<PrefetchHintPath>) -> Vec<PrefetchHintPath> {
@@ -726,10 +863,43 @@ fn has_sample_extension(path: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix))
 }
 
-fn unix_now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos() as u64)
+fn default_config_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return PathBuf::from("/Library/Application Support/Legato/legatofs.toml");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return PathBuf::from("C:\\ProgramData\\Legato\\legatofs.toml");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        PathBuf::from("/tmp/legatofs.toml")
+    }
+}
+
+fn default_state_dir() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return String::from("/Library/Application Support/Legato");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return String::from("C:\\ProgramData\\Legato");
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        String::from("/tmp/legato-state")
+    }
+}
+
+fn default_client_name() -> String {
+    std::env::var("LEGATO_CLIENT_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| String::from("legato-prefetch"))
 }
 
 #[cfg(test)]
@@ -740,9 +910,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        KontaktVersion, PrefetchCommand, ProjectFormat, analyze_project, detect_kontakt_version,
-        parse_cli_args, run_cli_command,
+        KontaktVersion, PrefetchCommand, ProjectAnalysis, ProjectFormat, analyze_project,
+        detect_kontakt_version, parse_cli_args,
     };
+    use legato_types::PrefetchPriority;
 
     #[test]
     fn als_analysis_extracts_samples_and_plugins_from_gzipped_xml() {
@@ -835,6 +1006,8 @@ mod tests {
             project.to_string_lossy().into_owned(),
             String::from("--wait-through"),
             String::from("P0"),
+            String::from("--config"),
+            String::from("/tmp/legatofs.toml"),
         ])
         .expect("run command should parse");
 
@@ -842,8 +1015,41 @@ mod tests {
             analyze,
             PrefetchCommand::Analyze { json: true, .. }
         ));
-        let result = run_cli_command(run).expect("run command should succeed");
-        assert_eq!(result.exit_code, 0);
-        assert!(result.output.contains("accepted"));
+        assert!(matches!(
+            run,
+            PrefetchCommand::Run {
+                wait_through: PrefetchPriority::P0,
+                config_path: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn execution_report_renders_residency_and_fetch_counts() {
+        let analysis = ProjectAnalysis {
+            format: ProjectFormat::AbletonAls,
+            hints: Vec::new(),
+            plugins: Vec::new(),
+            diagnostics: Vec::new(),
+            wait_through: PrefetchPriority::P1,
+        };
+        let output = super::render_execution(
+            &analysis,
+            &super::ExecutionReport {
+                accepted: 2,
+                skipped: 1,
+                completed: 1,
+                failed: 0,
+                bytes_read: 4096,
+                bytes_fetched: 4096,
+            },
+            false,
+        )
+        .expect("execution should render");
+
+        assert!(output.contains("accepted: 2"));
+        assert!(output.contains("skipped: 1"));
+        assert!(output.contains("bytes-fetched: 4096"));
     }
 }

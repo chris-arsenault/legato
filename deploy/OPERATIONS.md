@@ -149,7 +149,7 @@ Client setup flow:
 3. Run `legatofs install` with the issued bundle.
 4. Start the mount agent.
 5. Verify the mount root appears and resolves indexed paths.
-6. Run `legato-prefetch analyze <project>` against one representative session if prefetch is part of the current workflow.
+6. Run `legato-prefetch run <project> --config <path-to-legatofs.toml>` against one representative session if prefetch is part of the current workflow.
 
 Replacement flow:
 
