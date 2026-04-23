@@ -557,7 +557,7 @@ mod tests {
         let adapter = MacosFilesystem::new("/Volumes/Legato");
         let attrs = adapter.translate_attributes(&FilesystemAttributes {
             file_id: FileId(7),
-            path: "/srv/libraries/Kontakt/piano.nki".into(),
+            path: "/Kontakt/piano.nki".into(),
             is_dir: false,
             size: 4096,
             mtime_ns: 55,
@@ -572,13 +572,10 @@ mod tests {
 
     #[test]
     fn virtual_root_maps_into_library_root() {
+        assert_eq!(map_virtual_path("/", Path::new("/")), "/");
         assert_eq!(
-            map_virtual_path("/srv/libraries", Path::new("/")),
-            "/srv/libraries"
-        );
-        assert_eq!(
-            map_virtual_path("/srv/libraries", Path::new("/Kontakt/piano.nki")),
-            "/srv/libraries/Kontakt/piano.nki"
+            map_virtual_path("/", Path::new("/Kontakt/piano.nki")),
+            "/Kontakt/piano.nki"
         );
     }
 
@@ -664,23 +661,20 @@ mod tests {
         let adapter = MacosFilesystem::new("/Volumes/Legato");
 
         let attrs = adapter
-            .lookup(&mut service, sample_path.to_string_lossy().as_ref())
+            .lookup(&mut service, "/Kontakt/piano.nki")
             .await
             .expect("lookup should succeed");
         assert_ne!(attrs.inode, 0);
 
         let entries = adapter
-            .read_dir(
-                &mut service,
-                library_root.join("Kontakt").to_string_lossy().as_ref(),
-            )
+            .read_dir(&mut service, "/Kontakt")
             .await
             .expect("readdir should succeed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "piano.nki");
 
         let open = adapter
-            .open(&mut service, sample_path.to_string_lossy().as_ref())
+            .open(&mut service, "/Kontakt/piano.nki")
             .await
             .expect("open should succeed");
         let slice = adapter
@@ -711,7 +705,7 @@ mod tests {
         let project_path = library_root.join("Projects").join("session.als");
         let project_xml = format!(
             r#"<Ableton><Plugin Device="Kontakt"/><SampleRef Path="{}"/></Ableton>"#,
-            sample_path.to_string_lossy()
+            "/Samples/Kick.wav"
         );
         fs::write(&project_path, project_xml).expect("project should be written");
 
@@ -758,11 +752,11 @@ mod tests {
         let adapter = MacosFilesystem::new("/Volumes/Legato");
 
         let project = adapter
-            .open(&mut service, project_path.to_string_lossy().as_ref())
+            .open(&mut service, "/Projects/session.als")
             .await
             .expect("project open should succeed");
         let sample = service
-            .open(sample_path.to_string_lossy().as_ref())
+            .open("/Samples/Kick.wav")
             .await
             .expect("sample should open");
         let store =

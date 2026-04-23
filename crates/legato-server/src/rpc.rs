@@ -32,8 +32,9 @@ use legato_proto::{
 use legato_types::FileId;
 
 use crate::{
-    InvalidationHub, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend, create_poll_watcher,
-    create_recommended_watcher, reconcile_library_root_to_store, subtree_invalidation,
+    InvalidationHub, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend,
+    canonical::logical_request_path, create_poll_watcher, create_recommended_watcher,
+    reconcile_library_root_to_store, subtree_invalidation,
 };
 
 type InvalidationStream =
@@ -117,7 +118,7 @@ impl LiveServer {
         if let Some(metrics) = &metrics {
             metrics.record_bootstrap_reconcile(&stats, started.elapsed().as_nanos() as u64);
         }
-        let invalidations = InvalidationHub::new(config.library_root.clone());
+        let invalidations = InvalidationHub::new("/");
 
         Ok(Self {
             shell: Server::new(config.clone()),
@@ -239,7 +240,7 @@ fn spawn_watch_task(
             };
 
             let mut hub = invalidations.lock().await;
-            hub.publish(subtree_invalidation(&library_root.to_string_lossy(), 0));
+            hub.publish(subtree_invalidation("/", 0));
         }
     })
 }
@@ -261,7 +262,11 @@ impl Legato for LiveServer {
         &self,
         request: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
-        let path = request.into_inner().path;
+        let path = logical_request_path(
+            Path::new(&self.config.library_root),
+            &request.into_inner().path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let inode = self
             .catalog
             .lock()
@@ -341,11 +346,16 @@ impl Legato for LiveServer {
     }
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        let path = logical_request_path(
+            Path::new(&self.config.library_root),
+            &request.into_inner().path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let response = self
             .catalog
             .lock()
             .await
-            .resolve_path(&request.into_inner().path)
+            .resolve_path(&path)
             .cloned()
             .map(|inode| StatResponse {
                 metadata: Some(catalog_inode_to_metadata(inode)),
@@ -358,11 +368,16 @@ impl Legato for LiveServer {
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
+        let path = logical_request_path(
+            Path::new(&self.config.library_root),
+            &request.into_inner().path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let response = self
             .catalog
             .lock()
             .await
-            .list_directory(&request.into_inner().path)
+            .list_directory(&path)
             .map(|entries| ListDirResponse {
                 entries: entries
                     .into_iter()
@@ -382,11 +397,16 @@ impl Legato for LiveServer {
         &self,
         request: Request<ResolvePathRequest>,
     ) -> Result<Response<ResolvePathResponse>, Status> {
+        let path = logical_request_path(
+            Path::new(&self.config.library_root),
+            &request.into_inner().path,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let response = self
             .catalog
             .lock()
             .await
-            .resolve_path(&request.into_inner().path)
+            .resolve_path(&path)
             .cloned()
             .map(|inode| ResolvePathResponse {
                 metadata: Some(catalog_inode_to_metadata(inode)),
@@ -565,12 +585,12 @@ mod tests {
             .into_inner();
         assert_eq!(
             stat.metadata.expect("metadata should be present").path,
-            sample_path.to_string_lossy()
+            "/Kontakt/piano.nki"
         );
 
         let inode = client
             .resolve(ResolveRequest {
-                path: sample_path.to_string_lossy().into_owned(),
+                path: String::from("/Kontakt/piano.nki"),
             })
             .await
             .expect("resolve should succeed")
@@ -602,14 +622,14 @@ mod tests {
 
         let resolved = client
             .resolve_path(ResolvePathRequest {
-                path: sample_path.to_string_lossy().into_owned(),
+                path: String::from("/Kontakt/piano.nki"),
             })
             .await
             .expect("resolve should succeed")
             .into_inner();
         assert_eq!(
             resolved.metadata.expect("metadata should be present").path,
-            sample_path.to_string_lossy()
+            "/Kontakt/piano.nki"
         );
 
         bound
@@ -683,7 +703,7 @@ mod tests {
 
         let resolved = client
             .resolve(ResolveRequest {
-                path: sample_path.to_string_lossy().into_owned(),
+                path: String::from("/Kontakt/piano.nki"),
             })
             .await
             .expect("resolve should succeed")
@@ -752,9 +772,7 @@ mod tests {
         let catalog = Arc::new(Mutex::new(
             CatalogStore::open(&state_dir, 0).expect("catalog should open"),
         ));
-        let invalidations = Arc::new(Mutex::new(InvalidationHub::new(
-            library_root.to_string_lossy().into_owned(),
-        )));
+        let invalidations = Arc::new(Mutex::new(InvalidationHub::new(String::from("/"))));
         let subscription = invalidations.lock().await.subscribe();
         let (sender, receiver) = mpsc::unbounded_channel();
         let watch_task = spawn_watch_task(
@@ -779,10 +797,7 @@ mod tests {
             loop {
                 {
                     let catalog = catalog.lock().await;
-                    if catalog
-                        .resolve_path(new_path.to_string_lossy().as_ref())
-                        .is_some()
-                    {
+                    if catalog.resolve_path("/Kontakt/new.nki").is_some() {
                         break;
                     }
                 }
@@ -798,11 +813,8 @@ mod tests {
             .drain(subscription.subscriber_id)
             .expect("subscriber should exist");
         assert!(
-            queued
-                .iter()
-                .any(|event| event.path == library_root.to_string_lossy()),
-            "expected root invalidation for {}",
-            library_root.display()
+            queued.iter().any(|event| event.path == "/"),
+            "expected root invalidation for /"
         );
 
         watch_task.abort();

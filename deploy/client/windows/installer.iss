@@ -107,7 +107,7 @@ begin
         '--bundle-dir "' + BundleDir + '" ' +
         '--mount-point "' + MountPointPage.Values[0] + '" ' +
         '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
-        '--library-root "/srv/libraries" ' +
+        '--library-root "/" ' +
         '--force';
       if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
       begin
@@ -141,7 +141,7 @@ begin
         'multiplier = 2' + #13#10 + #13#10 +
         '[mount]' + #13#10 +
         'mount_point = "' + MountPointPage.Values[0] + '"' + #13#10 +
-        'library_root = "/srv/libraries"' + #13#10 +
+        'library_root = "/"' + #13#10 +
         'state_dir = "C:\\ProgramData\\Legato"' + #13#10;
       SaveStringToFile(ConfigPath, ConfigContents, False);
     end;

@@ -610,21 +610,21 @@ mod tests {
         .expect("service should connect");
 
         let attrs = service
-            .lookup(sample_path.to_string_lossy().as_ref())
+            .lookup("/Kontakt/piano.nki")
             .await
             .expect("lookup should succeed");
         assert_ne!(attrs.file_id.0, 0);
         assert!(!attrs.is_dir);
 
         let entries = service
-            .read_dir(library_root.join("Kontakt").to_string_lossy().as_ref())
+            .read_dir("/Kontakt")
             .await
             .expect("readdir should succeed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "piano.nki");
 
         let handle = service
-            .open(sample_path.to_string_lossy().as_ref())
+            .open("/Kontakt/piano.nki")
             .await
             .expect("open should succeed");
         let slice = service
@@ -696,7 +696,7 @@ mod tests {
         .await
         .expect("service should connect");
         let handle = service
-            .open(sample_path.to_string_lossy().as_ref())
+            .open("/Strings/long.ncw")
             .await
             .expect("open should succeed");
 
@@ -777,13 +777,13 @@ mod tests {
         assert!(service.has_active_subscription());
 
         let attrs = service
-            .lookup(sample_path.to_string_lossy().as_ref())
+            .lookup("/Kontakt/piano.nki")
             .await
             .expect("lookup should succeed");
         assert_ne!(attrs.file_id.0, 0);
 
         let initial_entries = service
-            .read_dir(library_root.join("Kontakt").to_string_lossy().as_ref())
+            .read_dir("/Kontakt")
             .await
             .expect("initial readdir should succeed");
         assert_eq!(initial_entries.len(), 1);
@@ -796,13 +796,13 @@ mod tests {
     fn invalidations_clear_cached_entries() {
         let event = legato_proto::InvalidationEvent {
             kind: InvalidationKind::Subtree as i32,
-            path: String::from("/srv/libraries/Kontakt"),
+            path: String::from("/Kontakt"),
             file_id: 0,
         };
         let timestamp = now_monotonic_ns();
 
         assert!(timestamp > 0);
-        assert_eq!(event.path, "/srv/libraries/Kontakt");
+        assert_eq!(event.path, "/Kontakt");
     }
 
     #[test]
@@ -811,7 +811,7 @@ mod tests {
             7,
             InodeMetadata {
                 file_id: 42,
-                path: String::from("/srv/libraries/Strings/legato.ncw"),
+                path: String::from("/Strings/legato.ncw"),
                 size: 8192,
                 mtime_ns: 123,
                 is_dir: false,
@@ -840,7 +840,7 @@ mod tests {
             1,
             InodeMetadata {
                 file_id: 9,
-                path: String::from("/srv/libraries/Strings/long.ncw"),
+                path: String::from("/Strings/long.ncw"),
                 size: 16 * 1024 * 1024,
                 mtime_ns: 55,
                 is_dir: false,

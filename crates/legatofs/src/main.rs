@@ -854,7 +854,7 @@ fn default_config_path() -> &'static Path {
 }
 
 fn default_library_root() -> String {
-    String::from("/srv/libraries")
+    String::from("/")
 }
 
 fn load_bundle_manifest(
@@ -1281,7 +1281,7 @@ mod tests {
             String::from("--state-dir"),
             String::from("/tmp/legato-state"),
             String::from("--library-root"),
-            String::from("/srv/libraries"),
+            String::from("/"),
             String::from("--force"),
         ])
         .expect("command should parse");
@@ -1294,7 +1294,7 @@ mod tests {
                 server_name: Some(String::from("legato.lan")),
                 mount_point: Some(String::from("/Volumes/Legato")),
                 state_dir: PathBuf::from("/tmp/legato-state"),
-                library_root: Some(String::from("/srv/libraries")),
+                library_root: Some(String::from("/")),
                 force: true,
             })
         );
@@ -1396,7 +1396,7 @@ mod tests {
             String::from("--config"),
             String::from("/tmp/legato-state/legatofs.toml"),
             String::from("--path"),
-            String::from("/srv/libraries/Kontakt/piano.nki"),
+            String::from("/Kontakt/piano.nki"),
             String::from("--offset"),
             String::from("8"),
             String::from("--size"),
@@ -1408,7 +1408,7 @@ mod tests {
             command,
             Some(Command::Smoke {
                 config_path: Some(PathBuf::from("/tmp/legato-state/legatofs.toml")),
-                path: String::from("/srv/libraries/Kontakt/piano.nki"),
+                path: String::from("/Kontakt/piano.nki"),
                 offset: 8,
                 size: 16,
             })
@@ -1431,7 +1431,7 @@ mod tests {
             "legato.lan:7823",
             "legato.lan",
             "/Volumes/Legato",
-            "/srv/libraries",
+            "/",
             false,
         )
         .expect("install should succeed");
@@ -1463,7 +1463,7 @@ mod tests {
   "endpoint":"legato.lan:7823",
   "server_name":"legato.lan",
   "mount_point":"/Volumes/Legato",
-  "library_root":"/srv/libraries",
+  "library_root":"/",
   "issued_at_unix_ms":1
 }"#,
         )
@@ -1547,7 +1547,7 @@ mod tests {
         let fixture = tempdir().expect("tempdir should be created");
         let mount = MountConfig {
             mount_point: String::from("/tmp/legato-mount"),
-            library_root: String::from("/srv/libraries"),
+            library_root: String::from("/"),
             state_dir: fixture.path().join("state").to_string_lossy().into_owned(),
         };
         let mut store =
@@ -1555,7 +1555,7 @@ mod tests {
         store
             .record_inode(InodeMetadata {
                 file_id: 7,
-                path: String::from("/srv/libraries/piano.wav"),
+                path: String::from("/piano.wav"),
                 size: 7,
                 mtime_ns: 100,
                 is_dir: false,

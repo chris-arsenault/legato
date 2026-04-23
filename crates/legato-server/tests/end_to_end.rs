@@ -35,7 +35,7 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
     let catalog = CatalogStore::open(&store_root, 0).expect("catalog should open");
     let inode = inode_to_proto(
         catalog
-            .resolve_path(sample_path.to_string_lossy().as_ref())
+            .resolve_path("/Strings/long.ncw")
             .expect("sample should resolve")
             .clone(),
     );
@@ -47,7 +47,7 @@ fn indexed_server_and_client_prefetch_round_trip_sample_data() {
     let execution = control
         .prefetch_paths(
             &[PrefetchHintPath {
-                path: sample_path.clone(),
+                path: Path::new("/Strings/long.ncw").to_path_buf(),
                 file_offset: 0,
                 length: inode.size,
                 priority: PrefetchPriority::P0,
@@ -89,7 +89,7 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
     let project_path = temp.path().join("session.als");
     let xml = format!(
         r#"<Ableton><Plugin Device="Kontakt"/><SampleRef Path="{}"/></Ableton>"#,
-        sample_path.to_string_lossy()
+        "/Drums/kick.wav"
     );
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
@@ -121,7 +121,7 @@ fn project_analysis_hints_feed_directly_into_prefetch_execution() {
     let execution = control
         .prefetch_paths(
             &[PrefetchHintPath {
-                path: sample_path.clone(),
+                path: Path::new("/Drums/kick.wav").to_path_buf(),
                 file_offset: hint.file_offset,
                 length: hint.length,
                 priority: hint.priority,
@@ -203,7 +203,7 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
     .await
     .expect("first service should connect");
     let handle = first_service
-        .open(sample_path.to_string_lossy().as_ref())
+        .open("/Strings/long.ncw")
         .await
         .expect("open should succeed");
     let first_read = first_service
@@ -231,7 +231,7 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
     .await
     .expect("restarted service should connect");
     let reopened = restarted_service
-        .open(sample_path.to_string_lossy().as_ref())
+        .open("/Strings/long.ncw")
         .await
         .expect("open after restart should succeed");
     let second_read = restarted_service

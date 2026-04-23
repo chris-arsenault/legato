@@ -500,13 +500,25 @@ fn apply_catalog_payload(state: &mut CatalogState, sequence: u64, payload: Catal
                 .or_else(|| state.paths.get(&tombstone.path).copied());
             state.paths.remove(&tombstone.path);
             if let Some(file_id) = removed_file_id {
-                state.inodes.remove(&file_id.0);
-                state.directories.remove(&file_id.0);
+                if state
+                    .inodes
+                    .get(&file_id.0)
+                    .is_some_and(|inode| inode.path == tombstone.path)
+                {
+                    state.inodes.remove(&file_id.0);
+                }
+                if state
+                    .directories
+                    .get(&file_id.0)
+                    .is_some_and(|directory| directory.path == tombstone.path)
+                {
+                    state.directories.remove(&file_id.0);
+                }
             }
             for directory in state.directories.values_mut() {
-                directory.entries.retain(|_, entry| {
-                    entry.path != tombstone.path && Some(entry.file_id) != removed_file_id
-                });
+                directory
+                    .entries
+                    .retain(|_, entry| entry.path != tombstone.path);
             }
         }
         CatalogRecordPayload::Checkpoint(checkpoint) => {

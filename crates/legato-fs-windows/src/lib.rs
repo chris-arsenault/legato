@@ -712,7 +712,7 @@ mod tests {
         let adapter = WindowsFilesystem::new("L:\\Legato");
         let attrs = adapter.translate_attributes(&FilesystemAttributes {
             file_id: FileId(7),
-            path: "C:\\Legato\\Kontakt\\piano.nki".into(),
+            path: "/Kontakt/piano.nki".into(),
             is_dir: false,
             size: 4096,
             mtime_ns: 55,
@@ -727,13 +727,10 @@ mod tests {
 
     #[test]
     fn virtual_root_maps_into_library_root() {
+        assert_eq!(map_virtual_path("/", Path::new("/")), "/");
         assert_eq!(
-            map_virtual_path("/srv/libraries", Path::new("/")),
-            "/srv/libraries"
-        );
-        assert_eq!(
-            map_virtual_path("/srv/libraries", Path::new("/Kontakt/piano.nki")),
-            "/srv/libraries/Kontakt/piano.nki"
+            map_virtual_path("/", Path::new("/Kontakt/piano.nki")),
+            "/Kontakt/piano.nki"
         );
     }
 
@@ -819,23 +816,20 @@ mod tests {
         let adapter = WindowsFilesystem::new("L:\\Legato");
 
         let attrs = adapter
-            .lookup(&mut service, sample_path.to_string_lossy().as_ref())
+            .lookup(&mut service, "/Strings/long.ncw")
             .await
             .expect("lookup should succeed");
         assert_ne!(attrs.file_index, 0);
 
         let entries = adapter
-            .read_dir(
-                &mut service,
-                library_root.join("Strings").to_string_lossy().as_ref(),
-            )
+            .read_dir(&mut service, "/Strings")
             .await
             .expect("readdir should succeed");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "long.ncw");
 
         let open = adapter
-            .open(&mut service, sample_path.to_string_lossy().as_ref())
+            .open(&mut service, "/Strings/long.ncw")
             .await
             .expect("open should succeed");
         let slice = adapter

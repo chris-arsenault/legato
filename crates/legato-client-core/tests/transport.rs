@@ -84,13 +84,13 @@ async fn grpc_client_transport_attaches_resolves_and_fetches_extents() {
     );
 
     let metadata = transport
-        .stat(sample_path.to_string_lossy().into_owned())
+        .stat(String::from("/Kontakt/piano.nki"))
         .await
         .expect("stat should succeed");
-    assert_eq!(metadata.path, sample_path.to_string_lossy());
+    assert_eq!(metadata.path, "/Kontakt/piano.nki");
 
     let inode = transport
-        .resolve(sample_path.to_string_lossy().into_owned())
+        .resolve(String::from("/Kontakt/piano.nki"))
         .await
         .expect("resolve should succeed");
     let layout = inode.layout.expect("file layout should be present");
@@ -113,7 +113,7 @@ async fn grpc_client_transport_attaches_resolves_and_fetches_extents() {
     assert_eq!(records[0].transfer_class, TransferClass::Unitary as i32);
 
     let entries = transport
-        .list_dir(library_root.join("Kontakt").to_string_lossy().into_owned())
+        .list_dir(String::from("/Kontakt"))
         .await
         .expect("list dir should succeed");
     assert_eq!(entries.len(), 1);
@@ -173,7 +173,7 @@ async fn grpc_client_transport_reconnects_and_fetches_extents_after_restart() {
         .await
         .expect("client should connect");
     let inode = transport
-        .resolve(sample_path.to_string_lossy().into_owned())
+        .resolve(String::from("/Strings/long.ncw"))
         .await
         .expect("resolve should succeed");
     fetch_first_extent(&mut transport, &inode)
@@ -215,9 +215,7 @@ async fn grpc_client_transport_reconnects_and_fetches_extents_after_restart() {
             subscription_active: false,
         }
     );
-    let inode_after_restart = transport
-        .resolve(sample_path.to_string_lossy().into_owned())
-        .await;
+    let inode_after_restart = transport.resolve(String::from("/Strings/long.ncw")).await;
     assert!(
         inode_after_restart.is_ok(),
         "resolve should work after reconnect"
@@ -332,7 +330,7 @@ async fn grpc_client_transport_streams_change_records_after_upstream_mutation() 
             .expect("change records should load");
         if observed
             .iter()
-            .any(|record| record.path == new_sample_path.to_string_lossy())
+            .any(|record| record.path == "/Kontakt/strings.nki")
         {
             break;
         }
@@ -341,8 +339,7 @@ async fn grpc_client_transport_streams_change_records_after_upstream_mutation() 
 
     assert!(
         observed.iter().any(|record| {
-            record.path == new_sample_path.to_string_lossy()
-                && record.kind == ChangeKind::Upsert as i32
+            record.path == "/Kontakt/strings.nki" && record.kind == ChangeKind::Upsert as i32
         }),
         "expected new file to appear in ordered change records"
     );

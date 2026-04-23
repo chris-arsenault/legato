@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn subscribe_emits_reconnect_safe_root_invalidation() {
-        let mut hub = InvalidationHub::new("/srv/libraries");
+        let mut hub = InvalidationHub::new("/");
 
         let subscription = hub.subscribe();
 
@@ -107,54 +107,54 @@ mod tests {
         assert_eq!(subscription.subscriber_id, 1);
         assert_eq!(
             subscription.initial_events,
-            vec![subtree_invalidation("/srv/libraries", 0)]
+            vec![subtree_invalidation("/", 0)]
         );
     }
 
     #[test]
     fn published_invalidations_are_fanned_out_to_every_subscriber() {
-        let mut hub = InvalidationHub::new("/srv/libraries");
+        let mut hub = InvalidationHub::new("/");
         let first = hub.subscribe();
         let second = hub.subscribe();
 
         hub.publish_all([
-            subtree_invalidation("/srv/libraries/Kontakt", 12),
-            subtree_invalidation("/srv/libraries/Spitfire", 44),
+            subtree_invalidation("/Kontakt", 12),
+            subtree_invalidation("/Spitfire", 44),
         ]);
 
         assert_eq!(
             hub.drain(first.subscriber_id)
                 .expect("first subscriber should exist"),
             vec![
-                subtree_invalidation("/srv/libraries/Kontakt", 12),
-                subtree_invalidation("/srv/libraries/Spitfire", 44),
+                subtree_invalidation("/Kontakt", 12),
+                subtree_invalidation("/Spitfire", 44),
             ]
         );
         assert_eq!(
             hub.drain(second.subscriber_id)
                 .expect("second subscriber should exist"),
             vec![
-                subtree_invalidation("/srv/libraries/Kontakt", 12),
-                subtree_invalidation("/srv/libraries/Spitfire", 44),
+                subtree_invalidation("/Kontakt", 12),
+                subtree_invalidation("/Spitfire", 44),
             ]
         );
     }
 
     #[test]
     fn unsubscribe_stops_future_delivery() {
-        let mut hub = InvalidationHub::new("/srv/libraries");
+        let mut hub = InvalidationHub::new("/");
         let first = hub.subscribe();
         let second = hub.subscribe();
         hub.unsubscribe(first.subscriber_id);
 
-        hub.publish(subtree_invalidation("/srv/libraries/Kontakt", 12));
+        hub.publish(subtree_invalidation("/Kontakt", 12));
 
         assert_eq!(hub.subscriber_count(), 1);
         assert!(hub.drain(first.subscriber_id).is_none());
         assert_eq!(
             hub.drain(second.subscriber_id)
                 .expect("second subscriber should exist"),
-            vec![subtree_invalidation("/srv/libraries/Kontakt", 12)]
+            vec![subtree_invalidation("/Kontakt", 12)]
         );
     }
 }

@@ -827,7 +827,8 @@ fn prefetch_priority_ordinal(priority: PrefetchPriority) -> u8 {
 }
 
 fn path_is_invalidated(path: &str, invalidated_root: &str) -> bool {
-    path == invalidated_root
+    invalidated_root == "/"
+        || path == invalidated_root
         || path
             .strip_prefix(invalidated_root)
             .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
@@ -925,7 +926,7 @@ mod tests {
         runtime.mark_transport_ready(true);
 
         let plan = runtime.reconnect_plan("legatofs");
-        let completion = runtime.complete_reconnect(Some("/srv/libraries"));
+        let completion = runtime.complete_reconnect(Some("/"));
 
         assert!(plan.resubscribe);
         assert_eq!(
@@ -934,7 +935,7 @@ mod tests {
                 reopened_paths: Vec::new(),
                 invalidation: Some(InvalidationEvent {
                     kind: InvalidationKind::Subtree as i32,
-                    path: String::from("/srv/libraries"),
+                    path: String::from("/"),
                     file_id: 0,
                 }),
             }
@@ -1114,7 +1115,7 @@ mod tests {
         control.register_resolved_path(
             InodeMetadata {
                 file_id: 7,
-                path: String::from("/srv/libraries/Kontakt/piano.nki"),
+                path: String::from("/Kontakt/piano.nki"),
                 size: 8192,
                 mtime_ns: 10,
                 is_dir: false,
@@ -1140,14 +1141,14 @@ mod tests {
         );
 
         let resolved = control
-            .resolve_path("/srv/libraries/Kontakt/piano.nki", 101)
+            .resolve_path("/Kontakt/piano.nki", 101)
             .expect("path should resolve");
         assert_eq!(resolved.file_id, 7);
 
         let execution = control
             .prefetch_paths(
                 &[PrefetchHintPath {
-                    path: "/srv/libraries/Kontakt/piano.nki".into(),
+                    path: "/Kontakt/piano.nki".into(),
                     file_offset: 0,
                     length: 8192,
                     priority: PrefetchPriority::P0,
@@ -1203,20 +1204,16 @@ mod tests {
 
         control.apply_invalidation(&InvalidationEvent {
             kind: InvalidationKind::File as i32,
-            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+            path: String::from("/Kontakt/piano.nki"),
             file_id: 7,
         });
-        assert!(
-            control
-                .resolve_path("/srv/libraries/Kontakt/piano.nki", 201)
-                .is_none()
-        );
+        assert!(control.resolve_path("/Kontakt/piano.nki", 201).is_none());
     }
 
     fn sample_prefetch_inode() -> InodeMetadata {
         InodeMetadata {
             file_id: 7,
-            path: String::from("/srv/libraries/Kontakt/piano.nki"),
+            path: String::from("/Kontakt/piano.nki"),
             size: 8192,
             mtime_ns: 10,
             is_dir: false,
@@ -1251,7 +1248,7 @@ mod tests {
         control.register_path(
             FileMetadata {
                 file_id: 11,
-                path: String::from("/srv/libraries/Strings/long.ncw"),
+                path: String::from("/Strings/long.ncw"),
                 size: 64,
                 mtime_ns: 1,
                 content_hash: Vec::new(),
@@ -1259,23 +1256,19 @@ mod tests {
             },
             10,
         );
-        let completion = runtime.complete_reconnect(Some("/srv/libraries"));
+        let completion = runtime.complete_reconnect(Some("/"));
 
         control.apply_invalidation(
             &completion
                 .invalidation
                 .expect("server restart should invalidate the control plane"),
         );
-        assert!(
-            control
-                .resolve_path("/srv/libraries/Strings/long.ncw", 11)
-                .is_none()
-        );
+        assert!(control.resolve_path("/Strings/long.ncw", 11).is_none());
 
         control.register_path(
             FileMetadata {
                 file_id: 11,
-                path: String::from("/srv/libraries/Strings/long.ncw"),
+                path: String::from("/Strings/long.ncw"),
                 size: 64,
                 mtime_ns: 2,
                 content_hash: Vec::new(),
@@ -1283,11 +1276,7 @@ mod tests {
             },
             12,
         );
-        assert!(
-            control
-                .resolve_path("/srv/libraries/Strings/long.ncw", 13)
-                .is_some()
-        );
+        assert!(control.resolve_path("/Strings/long.ncw", 13).is_some());
     }
 
     #[test]

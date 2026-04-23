@@ -164,7 +164,8 @@ fn lookup_entry<T: Clone>(
 }
 
 fn path_starts_with(path: &str, root: &str) -> bool {
-    path == root
+    root == "/"
+        || path == root
         || path
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
