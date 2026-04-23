@@ -538,14 +538,9 @@ impl WindowsMountService {
         write_dir_entry(&lock, ".", &context.attributes)?;
         write_dir_entry(&lock, "..", &context.attributes)?;
         for entry in entries {
-            let attributes = WindowsAttributes {
-                file_index: entry.file_id,
-                allocation_size: if entry.is_dir { 0 } else { entry.size },
-                end_of_file: if entry.is_dir { 0 } else { entry.size },
-                mtime_ns: entry.mtime_ns,
-                directory: entry.is_dir,
-                read_only: true,
-            };
+            let mut attributes = self.lookup_attributes(&entry.path)?;
+            attributes.file_index = entry.file_id;
+            attributes.directory = entry.is_dir;
             write_dir_entry(&lock, &entry.name, &attributes)?;
         }
         Ok(())
