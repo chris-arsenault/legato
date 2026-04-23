@@ -251,7 +251,9 @@ impl FilesystemService {
                 .await?;
         }
 
-        assemble_read(&mut self.store, &snapshot, offset, size)
+        let bytes = assemble_read(&mut self.store, &snapshot, offset, size)?;
+        self.enforce_cache_budget()?;
+        Ok(bytes)
     }
 
     /// Applies one invalidation to the local metadata and extent caches.
@@ -368,14 +370,20 @@ impl FilesystemService {
     fn store_extents(
         &mut self,
         extents: &[legato_proto::ExtentRecord],
-        now_ns: u64,
+        _now_ns: u64,
     ) -> Result<(), FilesystemServiceError> {
         for extent in extents {
             let _ = self.store.put_extent(extent)?;
         }
-        let _ = self.max_cache_bytes;
-        let _ = now_ns;
-        self.store.checkpoint()?;
+        Ok(())
+    }
+
+    fn enforce_cache_budget(&mut self) -> Result<(), FilesystemServiceError> {
+        if self.store.resident_bytes() > self.max_cache_bytes {
+            let _ = self.store.evict_to_limit(self.max_cache_bytes)?;
+        } else {
+            self.store.checkpoint()?;
+        }
         Ok(())
     }
 
@@ -725,6 +733,88 @@ mod tests {
 
         drop(service);
         second_bound.shutdown().await.expect("server should stop");
+    }
+
+    #[tokio::test]
+    async fn filesystem_service_enforces_cache_budget_after_read_through() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        fs::create_dir_all(library_root.join("Strings")).expect("library tree should be created");
+        fs::write(
+            library_root.join(".legato-layout.toml"),
+            "[policy]\nunitary_max_bytes = 0\nstreamed_extent_bytes = 4\n",
+        )
+        .expect("policy override should be written");
+        let sample_path = library_root.join("Strings").join("long.ncw");
+        fs::write(&sample_path, b"abcdefgh").expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "budget-client",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let mut client_config = local_client_config(address.to_string(), &bundle_dir, "localhost");
+        client_config.cache.max_bytes = 4;
+        let mut service = FilesystemService::connect(
+            client_config,
+            "budget-client",
+            fixture.path().join("client-state").as_path(),
+        )
+        .await
+        .expect("service should connect");
+
+        let handle = service
+            .open("/Strings/long.ncw")
+            .await
+            .expect("open should succeed");
+        let bytes = service
+            .read(handle.local_handle, 0, 1)
+            .await
+            .expect("read should succeed");
+
+        assert_eq!(bytes, b"a");
+        assert_eq!(service.store.resident_bytes(), 4);
+        assert_eq!(service.store.resident_extent_count(), 1);
+        assert_eq!(
+            service
+                .store
+                .resolve_path("/Strings/long.ncw")
+                .and_then(|inode| inode.layout.map(|layout| layout.extents.len())),
+            Some(2)
+        );
+
+        drop(service);
+        bound.shutdown().await.expect("server should stop");
     }
 
     #[test]
