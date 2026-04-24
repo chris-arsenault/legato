@@ -1273,7 +1273,11 @@ fn default_client_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use super::{
         CacheCommand, ClientProcessConfig, Command, MountConfig, cache_repair_report,
@@ -1281,13 +1285,37 @@ mod tests {
         default_mount_point, default_state_dir, endpoint_socket, install_client_bundle,
         load_bundle_manifest, mount_root_attributes, parse_command_impl,
         render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
-        startup_context, windows_task_command_for_executable,
+        spawn_prefetch_control_server, startup_context, windows_task_command_for_executable,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
+    use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
+    use legato_prefetch::{read_control_endpoint, request_control_prefetch};
     use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata};
     use legato_proto::{ExtentRecord, TransferClass};
+    use legato_server::{
+        LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
+        issue_client_tls_bundle, load_runtime_tls,
+    };
     use legato_types::{FilesystemOperation, FilesystemSemantics};
     use tempfile::tempdir;
+    use tokio::{
+        net::TcpListener,
+        sync::Mutex,
+        time::{Duration, timeout},
+    };
+
+    fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
+        ClientConfig {
+            endpoint,
+            tls: ClientTlsConfig::local_dev(bundle_dir, server_name),
+            retry: RetryPolicy {
+                initial_delay_ms: 0,
+                max_delay_ms: 0,
+                multiplier: 2,
+            },
+            ..ClientConfig::default()
+        }
+    }
 
     #[test]
     fn mount_config_defaults_are_present() {
@@ -1652,5 +1680,101 @@ mod tests {
                 .expect("status should render")
                 .contains("resident_extents 1")
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_control_server_handles_one_request() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        let client_state_dir = fixture.path().join("client-state");
+        fs::create_dir_all(library_root.join("Projects")).expect("project tree should exist");
+        fs::create_dir_all(library_root.join("Samples")).expect("sample tree should exist");
+        fs::write(
+            library_root.join("Projects").join("session.nki"),
+            b"Kontakt 7 /Samples/piano.wav",
+        )
+        .expect("project file should be written");
+        fs::write(
+            library_root.join("Samples").join("piano.wav"),
+            b"piano-sample",
+        )
+        .expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let _bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-mount",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let service = Arc::new(Mutex::new(
+            FilesystemService::connect(
+                local_client_config(address.to_string(), &bundle_dir, "localhost"),
+                "studio-mount",
+                &client_state_dir,
+            )
+            .await
+            .expect("service should connect"),
+        ));
+        timeout(Duration::from_secs(10), async {
+            let mut service = service.lock().await;
+            let handle = service
+                .open("/Projects/session.nki")
+                .await
+                .expect("direct open should succeed");
+            service
+                .release(handle.local_handle)
+                .await
+                .expect("direct release should succeed");
+        })
+        .await
+        .expect("direct service open should complete");
+        let mount = MountConfig {
+            mount_point: String::from("/tmp/legato-mount"),
+            library_root: String::from("/"),
+            state_dir: client_state_dir.to_string_lossy().into_owned(),
+        };
+        let _control_server = spawn_prefetch_control_server(&mount, Arc::clone(&service))
+            .await
+            .expect("control server should start");
+        let endpoint =
+            read_control_endpoint(&client_state_dir).expect("control endpoint should load");
+
+        let report = timeout(Duration::from_secs(10), async {
+            request_control_prefetch(&endpoint, "/Projects/session.nki").await
+        })
+        .await
+        .expect("control prefetch request should complete")
+        .expect("control prefetch request should succeed");
+
+        assert!(report.accepted > 0);
     }
 }

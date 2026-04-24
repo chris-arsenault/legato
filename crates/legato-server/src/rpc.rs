@@ -38,9 +38,9 @@ use legato_proto::{
 use legato_types::FileId;
 
 use crate::{
-    InvalidationHub, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend,
+    InvalidationHub, NotificationAction, Server, ServerConfig, ServerRuntimeMetrics, WatchBackend,
     canonical::logical_request_path, create_poll_watcher, create_recommended_watcher,
-    reconcile_library_root_to_store, subtree_invalidation,
+    plan_notification_result, reconcile_library_root_to_store, subtree_invalidation,
 };
 
 type InvalidationStream =
@@ -233,7 +233,8 @@ fn spawn_watch_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(result) = receiver.recv().await {
-            if result.is_err() {
+            let action = plan_notification_result(&library_root, result);
+            if matches!(action, NotificationAction::Ignore) {
                 continue;
             }
             if reconcile_library_root_to_store(&state_dir, &library_root).is_err() {
@@ -366,29 +367,21 @@ impl Legato for LiveServer {
         request: Request<SubscribeChangesRequest>,
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
         let since_sequence = request.into_inner().since_sequence;
-        let (initial_records, mut next_sequence) = {
+        let (initial_records, initial_checkpoint, mut next_sequence) = {
             let catalog = self.catalog.lock().await;
             let records = catalog
                 .change_records_since(since_sequence)
                 .map_err(map_catalog_error)?;
             let current_sequence = catalog.last_sequence();
-            let initial_records = if records.is_empty() {
-                vec![ChangeRecord {
-                    sequence: current_sequence,
-                    kind: legato_proto::ChangeKind::Checkpoint as i32,
-                    file_id: 0,
-                    path: format!("checkpoint:{current_sequence}"),
-                    inode: None,
-                    entries: Vec::new(),
-                }]
-            } else {
-                records
+            let checkpoint = ChangeRecord {
+                sequence: current_sequence,
+                kind: legato_proto::ChangeKind::Checkpoint as i32,
+                file_id: 0,
+                path: format!("checkpoint:{current_sequence}"),
+                inode: None,
+                entries: Vec::new(),
             };
-            let next_sequence = initial_records
-                .last()
-                .map(|record| record.sequence)
-                .unwrap_or(since_sequence);
-            (initial_records, next_sequence)
+            (records, checkpoint, current_sequence)
         };
         let catalog = Arc::clone(&self.catalog);
         let (sender, receiver) = mpsc::channel(16);
@@ -420,6 +413,7 @@ impl Legato for LiveServer {
             }
         });
         let stream = tokio_stream::iter(initial_records.into_iter().map(Ok))
+            .chain(tokio_stream::iter(std::iter::once(Ok(initial_checkpoint))))
             .chain(ReceiverStream::new(receiver));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -1026,6 +1020,102 @@ mod tests {
         assert!(
             saw_boundary,
             "caught-up replay should surface a checkpoint boundary"
+        );
+
+        bound
+            .shutdown()
+            .await
+            .expect("server should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn subscribe_changes_yields_checkpoint_boundary_after_initial_backlog() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        fs::create_dir_all(library_root.join("Kontakt")).expect("library tree should be created");
+        fs::write(
+            library_root.join("Kontakt").join("piano.nki"),
+            b"hello legato",
+        )
+        .expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: crate::ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+        let runtime_tls = load_runtime_tls(&config.tls).expect("runtime tls should load");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener addr should exist");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(listener, Some(runtime_tls))
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-backlog",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("https://{}", address))
+            .expect("endpoint should parse")
+            .tls_config(
+                tonic::transport::ClientTlsConfig::new()
+                    .ca_certificate(tonic::transport::Certificate::from_pem(
+                        fs::read(bundle_dir.join("server-ca.pem")).expect("ca should exist"),
+                    ))
+                    .identity(tonic::transport::Identity::from_pem(
+                        fs::read(bundle_dir.join("client.pem")).expect("client cert should exist"),
+                        fs::read(bundle_dir.join("client-key.pem"))
+                            .expect("client key should exist"),
+                    ))
+                    .domain_name("localhost"),
+            )
+            .expect("tls config should be valid")
+            .connect()
+            .await
+            .expect("client should connect");
+        let mut client = LegatoClient::new(channel);
+
+        let mut stream = client
+            .subscribe_changes(SubscribeChangesRequest { since_sequence: 0 })
+            .await
+            .expect("backlog subscribe should succeed")
+            .into_inner();
+        let mut saw_upsert = false;
+        let mut saw_boundary = false;
+        for _ in 0..32 {
+            let Some(record) = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .expect("stream should respond promptly")
+                .expect("stream read should succeed")
+            else {
+                break;
+            };
+            saw_upsert |= record.kind == legato_proto::ChangeKind::Upsert as i32;
+            saw_boundary |= record.kind == legato_proto::ChangeKind::Checkpoint as i32;
+            if saw_upsert && saw_boundary {
+                break;
+            }
+        }
+        assert!(saw_upsert, "backlog replay should include current upserts");
+        assert!(
+            saw_boundary,
+            "backlog replay should surface a checkpoint boundary"
         );
 
         bound

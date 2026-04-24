@@ -5,7 +5,9 @@ use std::{
     time::Duration,
 };
 
-use notify::{Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Result, Watcher};
+use notify::{
+    Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Result, Watcher,
+};
 
 /// The watcher backend selected for a given deployment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +24,8 @@ pub enum WatchBackend {
 /// Action derived from an incoming filesystem notification result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotificationAction {
+    /// Ignore the notification because it does not imply namespace or content change.
+    Ignore,
     /// Reconcile the entire library root because targeted handling is unsafe.
     FullRescan,
     /// Reconcile a targeted set of paths derived from the event payload.
@@ -57,6 +61,9 @@ where
 pub fn plan_notification_result(library_root: &Path, result: Result<Event>) -> NotificationAction {
     match result {
         Ok(event) => {
+            if matches!(event.kind, EventKind::Access(_)) {
+                return NotificationAction::Ignore;
+            }
             let mut paths = event
                 .paths
                 .into_iter()
@@ -110,6 +117,22 @@ mod tests {
         let root = Path::new("/tmp/legato");
         let action = plan_notification_result(root, Err(notify::Error::generic("overflow")));
         assert_eq!(action, NotificationAction::FullRescan);
+    }
+
+    #[test]
+    fn access_notifications_are_ignored() {
+        let root = Path::new("/tmp/legato");
+        let action = plan_notification_result(
+            root,
+            Ok(Event {
+                kind: EventKind::Access(notify::event::AccessKind::Close(
+                    notify::event::AccessMode::Read,
+                )),
+                paths: vec![root.join("Kontakt").join("piano.nki")],
+                attrs: Default::default(),
+            }),
+        );
+        assert_eq!(action, NotificationAction::Ignore);
     }
 
     #[test]

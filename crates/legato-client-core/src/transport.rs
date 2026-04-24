@@ -17,9 +17,9 @@ use tonic::{
 
 use crate::{ClientConfig, ClientRuntime, ClientTlsConfig, ClientTlsError, RecoveryCompletion};
 use legato_proto::{
-    AttachResponse, ChangeRecord, DirectoryEntry, ExtentRecord, ExtentRef, FetchRequest,
-    FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, MetricKind, MetricLabel,
-    PROTOCOL_VERSION, ReportClientMetricsRequest, ReportedMetric, ResolvePathRequest,
+    AttachResponse, ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, ExtentRef,
+    FetchRequest, FileMetadata, InodeMetadata, InvalidationEvent, ListDirRequest, MetricKind,
+    MetricLabel, PROTOCOL_VERSION, ReportClientMetricsRequest, ReportedMetric, ResolvePathRequest,
     ResolveRequest, StatRequest, SubscribeChangesRequest, SubscribeRequest,
     legato_client::LegatoClient,
 };
@@ -214,6 +214,7 @@ pub struct GrpcClientTransport {
     client_name: String,
     runtime: ClientRuntime,
     client: LegatoClient<Channel>,
+    stream_client: LegatoClient<Channel>,
     attach: ClientAttachSession,
 }
 
@@ -227,12 +228,19 @@ impl GrpcClientTransport {
         let mut runtime = ClientRuntime::new(config);
         let mut client = connect_client(runtime.config()).await?;
         let attach = attach_session(&mut client, runtime.attach_request(&client_name)).await?;
+        let mut stream_client = connect_client(runtime.config()).await?;
+        let _ = attach_session(
+            &mut stream_client,
+            runtime.attach_request(&format!("{client_name}-stream")),
+        )
+        .await?;
         runtime.mark_transport_ready(false);
 
         Ok(Self {
             client_name,
             runtime,
             client,
+            stream_client,
             attach,
         })
     }
@@ -264,10 +272,18 @@ impl GrpcClientTransport {
         let plan = self.runtime.reconnect_plan(&self.client_name);
         let mut client = connect_client(self.runtime.config()).await?;
         let attach = attach_session(&mut client, plan.attach).await?;
+        let mut stream_client = connect_client(self.runtime.config()).await?;
+        let _ = attach_session(
+            &mut stream_client,
+            self.runtime
+                .attach_request(&format!("{}-stream", self.client_name)),
+        )
+        .await?;
         self.runtime.mark_transport_ready(false);
 
         let recovery = self.runtime.complete_reconnect(None);
         self.client = client;
+        self.stream_client = stream_client;
         self.attach = attach;
         Ok(recovery)
     }
@@ -320,9 +336,10 @@ impl GrpcClientTransport {
         &mut self,
         path: impl Into<String>,
     ) -> Result<InodeMetadata, ClientTransportError> {
+        let path = path.into();
         let response = self
             .client
-            .resolve(ResolveRequest { path: path.into() })
+            .resolve(ResolveRequest { path: path.clone() })
             .await?
             .into_inner();
         response
@@ -386,13 +403,25 @@ impl GrpcClientTransport {
         &mut self,
         since_sequence: u64,
     ) -> Result<Vec<ChangeRecord>, ClientTransportError> {
-        let mut subscription = self.subscribe_changes(since_sequence).await?;
+        let mut client = self.stream_client.clone();
+        let mut stream = client
+            .subscribe_changes(SubscribeChangesRequest { since_sequence })
+            .await?
+            .into_inner();
         let mut records = Vec::new();
         loop {
-            match timeout(Duration::from_millis(100), subscription.recv_next()).await {
-                Ok(Ok(Some(record))) => records.push(record),
-                Ok(Ok(None)) | Err(_) => break,
-                Ok(Err(error)) => return Err(error),
+            match timeout(Duration::from_secs(5), stream.message()).await {
+                Ok(Ok(Some(record))) => {
+                    if ChangeKind::try_from(record.kind).unwrap_or(ChangeKind::Unspecified)
+                        == ChangeKind::Checkpoint
+                    {
+                        break;
+                    }
+                    records.push(record);
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => break,
             }
         }
         Ok(records)
@@ -403,7 +432,7 @@ impl GrpcClientTransport {
         &mut self,
         since_sequence: u64,
     ) -> Result<GrpcChangeSubscription, ClientTransportError> {
-        let mut client = self.client.clone();
+        let mut client = self.stream_client.clone();
         self.runtime.mark_subscription_active();
         let (sender, receiver) = mpsc::channel(16);
         let task = tokio::spawn(async move {
@@ -447,7 +476,7 @@ impl GrpcClientTransport {
         &mut self,
     ) -> Result<GrpcInvalidationSubscription, ClientTransportError> {
         let mut stream = self
-            .client
+            .stream_client
             .subscribe(SubscribeRequest {})
             .await?
             .into_inner();
