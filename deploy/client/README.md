@@ -1,36 +1,30 @@
 # Legato Client Installation
 
-This guide explains how to install and run the native `legatofs` client on macOS and Windows.
+The normal client install flow is:
 
-The client does three things:
+1. Download the macOS `.pkg` or Windows `.exe` from the `v0.8` release.
+2. Run the installer.
+3. Accept the defaults, or change the mount point in the installer UI.
 
-- mounts the server-owned Legato library as a read-only local filesystem
-- keeps a local partial cache under the client state directory
-- uses a server-issued bundle for mutual TLS and default connection settings
+The installer/setup path contacts the Legato server, asks it for a client certificate bundle, writes the local config, installs the background service, and starts the mount. You should not need to copy bundle directories, edit TOML, or run registration commands by hand.
 
-Start with [deploy/OPERATIONS.md](../OPERATIONS.md) if the server is not already running.
+## What The Server Provides
 
-## Prerequisites
+`legato-server` exposes three client-facing ports:
 
-- A running `legato-server` reachable from the client.
-- A client bundle issued by the server. The bundle directory must contain `server-ca.pem`, `client.pem`, `client-key.pem`, and preferably `bundle.json`.
-- The native client installer from the GitHub Release tagged `v0.8`.
-- macOS clients need a macFUSE-compatible runtime installed.
-- Windows clients need WinFSP installed.
+- `7823`: the mTLS filesystem API used after setup
+- `7824`: the HTTP bootstrap endpoint used by installers before the client has a certificate
+- `7825/udp`: LAN discovery for finding the bootstrap endpoint
 
-Issue a bundle on the server:
+The bootstrap endpoint is:
 
-```bash
-docker exec legato-server legato-server issue-client \
-  --name studio-mac \
-  --output-dir /tmp/studio-mac \
-  --endpoint legato.lan:7823 \
-  --server-name legato.lan
+```text
+http://<server>:7824/v1/client-bundles
 ```
 
-Transfer the generated bundle directory to the target client machine before running the client install command.
+Installers first try UDP discovery. If discovery is blocked by the network, enter the bootstrap URL in the setup UI.
 
-## macOS Install
+## macOS
 
 Install the package:
 
@@ -38,171 +32,97 @@ Install the package:
 sudo installer -pkg legatofs-0.8-macos.pkg -target /
 ```
 
-Register the client bundle:
+The package attempts LAN discovery, registers the client, installs the launchd agent for the logged-in user, and starts the client with the default mount point.
+
+If you need to override discovery or the mount point after installation, run the setup helper:
 
 ```bash
-sudo legato-register-client --bundle-dir /path/to/studio-mac
+legato-setup-client
 ```
 
-That command writes the runtime config to:
+The helper prompts for:
 
-```text
-/Library/Application Support/Legato/legatofs.toml
-```
+- bootstrap URL, optional because LAN discovery is the default
+- client name, defaulting to the host name
+- mount point, defaulting to `/Volumes/Legato`
 
-Install and start the launchd agent:
+The helper reinstalls the launchd agent and restarts the client.
 
-```bash
-legatofs service install
-legatofs service start
-legatofs service status
-```
+Default macOS runtime paths:
 
-By default the mount appears at:
+- Mount point: `/Volumes/Legato`
+- Config: `/Library/Application Support/Legato/legatofs.toml`
+- Logs: `~/Library/Logs/Legato/`
 
-```text
-/Volumes/Legato
-```
+## Windows
 
-Logs are written under:
-
-```text
-~/Library/Logs/Legato/
-```
-
-## Windows Install
-
-Run the installer from an elevated PowerShell session:
+Run the installer from an elevated PowerShell session or by double-clicking it and accepting the UAC prompt:
 
 ```powershell
 Start-Process .\legatofs-0.8-windows.exe -Verb RunAs -Wait
 ```
 
-The installer prompts for an optional bundle directory, server endpoint, TLS server name, and mount point. If you provide a valid bundle directory during setup, the installer registers the client automatically.
+The installer prompts for:
 
-If you skipped bundle registration during setup, register it afterward:
+- bootstrap URL, optional because LAN discovery is the default
+- client name, defaulting to the computer name
+- mount point, defaulting to `L:\Legato`
 
-```powershell
-& "C:\Program Files\Legato\legatofs.exe" install `
-  --bundle-dir C:\Temp\studio-win
-```
+The installer registers the client, installs the scheduled task, and starts the client before it exits.
 
-That command writes the runtime config to:
+Default Windows runtime paths:
 
-```text
-C:\ProgramData\Legato\legatofs.toml
-```
+- Mount point: `L:\Legato`
+- Config: `C:\ProgramData\Legato\legatofs.toml`
+- Logs: `C:\ProgramData\Legato\logs\`
 
-Install and start the scheduled task:
+## Verify
 
-```powershell
-& "C:\Program Files\Legato\legatofs.exe" service install
-& "C:\Program Files\Legato\legatofs.exe" service start
-& "C:\Program Files\Legato\legatofs.exe" service status
-```
+After install, verify that the mount exists:
 
-By default the mount appears at:
+- macOS: open `/Volumes/Legato`
+- Windows: open `L:\Legato`
 
-```text
-L:\Legato
-```
-
-Logs are written under:
-
-```text
-C:\ProgramData\Legato\logs\
-```
-
-## Verify The Client
-
-Check the generated config and host prerequisites:
+If you need a command-line check:
 
 ```bash
+legatofs service status
 legatofs doctor
 ```
 
-Check local cache state:
-
-```bash
-legatofs cache status
-```
-
-Run a mounted read smoke test against a known path in the Legato library:
-
-```bash
-legatofs smoke --path /path/inside/library --offset 0 --size 4096
-```
-
-Open a representative DAW project or preset through the mounted filesystem. Supported project and preset opens trigger prefetch through the mounted runtime.
-
-Use manual prefetch only for diagnostics or intentional warm-up:
-
-```bash
-legato-prefetch run /Volumes/Legato/path/to/project.als \
-  --config "/Library/Application Support/Legato/legatofs.toml"
-```
-
-## Common Overrides
-
-If the bundle does not include `bundle.json`, provide the endpoint and TLS server name explicitly:
-
-```bash
-legatofs install \
-  --bundle-dir /path/to/bundle \
-  --endpoint legato.lan:7823 \
-  --server-name legato.lan
-```
-
-Override the mount point or state directory:
-
-```bash
-legatofs install \
-  --bundle-dir /path/to/bundle \
-  --mount-point /Volumes/Legato-Alt \
-  --state-dir "/Library/Application Support/Legato" \
-  --force
-```
-
-The `--force` flag overwrites the generated `legatofs.toml`; it does not delete the local cache directories.
-
 ## Upgrade
 
-1. Stop the service.
-2. Install the newer `.pkg` or `.exe`.
-3. Start the service again.
-4. Run `legatofs service status` and `legatofs doctor`.
+Install the newer client package over the old one. The installer preserves the client cache, certificates, and generated config unless setup is explicitly rerun with `--force`.
 
-The installer and registration commands are designed to preserve:
+Preserved state:
 
 - `catalog/`
 - `segments/`
 - `checkpoints/`
 - `certs/`
-- an existing `legatofs.toml`, unless you rerun `legatofs install --force`
+- `legatofs.toml`
 
-## Renewal Or Replacement
+## Advanced Recovery
 
-Reissue the bundle from the server when a client certificate is expiring, lost, or intentionally replaced:
+These commands are for break-glass recovery, not normal setup.
 
-```bash
-docker exec legato-server legato-server issue-client \
-  --name studio-mac \
-  --output-dir /tmp/studio-mac \
-  --endpoint legato.lan:7823 \
-  --server-name legato.lan
-```
-
-Then reinstall the bundle on the client:
+Re-run client setup from discovery:
 
 ```bash
-legatofs install --bundle-dir /path/to/new-bundle --force
-legatofs service stop
+legatofs install --force
+legatofs service install --force
 legatofs service start
 ```
 
-## Remove The Service
+Re-run client setup against an explicit bootstrap URL:
 
-Remove the background service without deleting client state:
+```bash
+legatofs install --bootstrap-url http://legato.lan:7824 --force
+legatofs service install --force
+legatofs service start
+```
+
+Stop and remove the background service without deleting client state:
 
 ```bash
 legatofs service stop
@@ -210,27 +130,3 @@ legatofs service uninstall
 ```
 
 Delete the state directory only if you intentionally want the client to rebuild its local cache from the server.
-
-## Runtime Layout
-
-Default macOS paths:
-
-- State directory: `/Library/Application Support/Legato`
-- Config: `/Library/Application Support/Legato/legatofs.toml`
-- Mount point: `/Volumes/Legato`
-- Logs: `~/Library/Logs/Legato/`
-
-Default Windows paths:
-
-- State directory: `C:\ProgramData\Legato`
-- Config: `C:\ProgramData\Legato\legatofs.toml`
-- Mount point: `L:\Legato`
-- Logs: `C:\ProgramData\Legato\logs\`
-
-Inside the state directory:
-
-- `catalog/` stores path, inode, directory, extent-map, residency, and subscription-cursor state.
-- `segments/` stores local resident extent records.
-- `checkpoints/` stores compacted recovery boundaries.
-- `certs/` stores the server CA, client certificate, and client key.
-- `prefetch-control.json` exists only while the mounted runtime is active.

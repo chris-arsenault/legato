@@ -16,3 +16,11 @@ tls_dir = "/etc/legato/certs"
 cert_path = "/etc/legato/certs/server.pem"
 key_path = "/etc/legato/certs/server-key.pem"
 client_ca_path = "/etc/legato/certs/client-ca.pem"
+
+[server.bootstrap]
+enabled = true
+bind_address = "0.0.0.0:7824"
+discovery_bind_address = "0.0.0.0:7825"
+advertised_endpoint = "legato.lan:7823"
+advertised_bootstrap_url = "http://legato.lan:7824"
+server_name = "legato.lan"

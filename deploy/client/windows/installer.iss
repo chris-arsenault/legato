@@ -40,44 +40,34 @@ Name: "{group}\Uninstall Legato Client"; Filename: "{uninstallexe}"
 
 [Code]
 var
-  BundleDirPage: TInputQueryWizardPage;
-  ServerEndpointPage: TInputQueryWizardPage;
-  ServerNamePage: TInputQueryWizardPage;
+  BootstrapPage: TInputQueryWizardPage;
+  ClientNamePage: TInputQueryWizardPage;
   MountPointPage: TInputQueryWizardPage;
 
 procedure InitializeWizard;
 begin
-  BundleDirPage := CreateInputQueryPage(
+  BootstrapPage := CreateInputQueryPage(
     wpSelectDir,
-    'Client Bundle',
-    'Optionally install a server-issued client bundle',
-    'Enter the directory containing server-ca.pem, client.pem, and client-key.pem if you want the installer to register this client now.'
-  );
-  BundleDirPage.Add('Bundle directory:', False);
-  BundleDirPage.Values[0] := '';
-
-  ServerEndpointPage := CreateInputQueryPage(
-    BundleDirPage.ID,
     'Legato Server',
-    'Configure the Legato server endpoint',
-    'Enter the Legato server endpoint the client should connect to.'
+    'Discover or connect to the Legato server',
+    'Leave the bootstrap URL blank to discover the Legato server on your LAN, or enter the server bootstrap URL if discovery is blocked.'
   );
-  ServerEndpointPage.Add('Server endpoint:', False);
-  ServerEndpointPage.Values[0] := 'legato.lan:7823';
+  BootstrapPage.Add('Bootstrap URL:', False);
+  BootstrapPage.Values[0] := '';
 
-  ServerNamePage := CreateInputQueryPage(
-    ServerEndpointPage.ID,
-    'TLS Server Name',
-    'Configure the expected TLS server name',
-    'Enter the DNS name expected in the Legato server certificate.'
+  ClientNamePage := CreateInputQueryPage(
+    BootstrapPage.ID,
+    'Client Name',
+    'Name this client',
+    'This name is embedded into the client certificate issued by the server.'
   );
-  ServerNamePage.Add('Server name:', False);
-  ServerNamePage.Values[0] := 'legato.lan';
+  ClientNamePage.Add('Client name:', False);
+  ClientNamePage.Values[0] := GetComputerNameString;
 
   MountPointPage := CreateInputQueryPage(
-    ServerNamePage.ID,
+    ClientNamePage.ID,
     'Mount Point',
-    'Configure the default Legato mount point',
+    'Choose the Legato mount point',
     'Enter the Windows mount point the client should expose.'
   );
   MountPointPage.Add('Mount point:', False);
@@ -86,64 +76,50 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  ConfigPath: string;
-  ConfigContents: string;
-  BundleDir: string;
+  BootstrapUrl: string;
   InstallArgs: string;
   ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
-    ConfigPath := ExpandConstant('{commonappdata}\Legato\legatofs.toml');
-    BundleDir := Trim(BundleDirPage.Values[0]);
+    BootstrapUrl := Trim(BootstrapPage.Values[0]);
 
-    if (BundleDir <> '') and DirExists(BundleDir) and
-       FileExists(AddBackslash(BundleDir) + 'server-ca.pem') and
-       FileExists(AddBackslash(BundleDir) + 'client.pem') and
-       FileExists(AddBackslash(BundleDir) + 'client-key.pem') then
+    InstallArgs :=
+      'install ' +
+      '--client-name "' + ClientNamePage.Values[0] + '" ' +
+      '--mount-point "' + MountPointPage.Values[0] + '" ' +
+      '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
+      '--library-root "/" ' +
+      '--force';
+    if BootstrapUrl <> '' then
     begin
-      InstallArgs :=
-        'install ' +
-        '--bundle-dir "' + BundleDir + '" ' +
-        '--mount-point "' + MountPointPage.Values[0] + '" ' +
-        '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
-        '--library-root "/" ' +
-        '--force';
-      if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-      begin
-        RaiseException('Failed to execute legatofs install during Windows client registration.');
-      end;
-      if ResultCode <> 0 then
-      begin
-        RaiseException('legatofs install failed during Windows client registration.');
-      end;
-    end
-    else if not FileExists(ConfigPath) then
+      InstallArgs := InstallArgs + ' --bootstrap-url "' + BootstrapUrl + '"';
+    end;
+    if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     begin
-      ConfigContents :=
-        '[common.tracing]' + #13#10 +
-        'json = false' + #13#10 +
-        'level = "info"' + #13#10 + #13#10 +
-        '[common.metrics]' + #13#10 +
-        'prefix = "legatofs"' + #13#10 + #13#10 +
-        '[client]' + #13#10 +
-        'endpoint = "' + ServerEndpointPage.Values[0] + '"' + #13#10 + #13#10 +
-        '[client.cache]' + #13#10 +
-        'max_bytes = 1610612736000' + #13#10 + #13#10 +
-        '[client.tls]' + #13#10 +
-        'ca_cert_path = "C:\\ProgramData\\Legato\\certs\\server-ca.pem"' + #13#10 +
-        'client_cert_path = "C:\\ProgramData\\Legato\\certs\\client.pem"' + #13#10 +
-        'client_key_path = "C:\\ProgramData\\Legato\\certs\\client-key.pem"' + #13#10 +
-        'server_name = "' + ServerNamePage.Values[0] + '"' + #13#10 + #13#10 +
-        '[client.retry]' + #13#10 +
-        'initial_delay_ms = 250' + #13#10 +
-        'max_delay_ms = 5000' + #13#10 +
-        'multiplier = 2' + #13#10 + #13#10 +
-        '[mount]' + #13#10 +
-        'mount_point = "' + MountPointPage.Values[0] + '"' + #13#10 +
-        'library_root = "/"' + #13#10 +
-        'state_dir = "C:\\ProgramData\\Legato"' + #13#10;
-      SaveStringToFile(ConfigPath, ConfigContents, False);
+      RaiseException('Failed to run Legato client setup.');
+    end;
+    if ResultCode <> 0 then
+    begin
+      RaiseException('Legato client setup failed. Confirm the server bootstrap endpoint is reachable, then rerun this installer.');
+    end;
+
+    if not Exec(ExpandConstant('{app}\legatofs.exe'), 'service install --force', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      RaiseException('Failed to install the Legato scheduled task.');
+    end;
+    if ResultCode <> 0 then
+    begin
+      RaiseException('Legato scheduled task installation failed.');
+    end;
+
+    if not Exec(ExpandConstant('{app}\legatofs.exe'), 'service start', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      RaiseException('Failed to start the Legato scheduled task.');
+    end;
+    if ResultCode <> 0 then
+    begin
+      RaiseException('Legato scheduled task start failed.');
     end;
   end;
 end;

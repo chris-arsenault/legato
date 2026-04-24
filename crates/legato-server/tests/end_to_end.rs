@@ -168,6 +168,7 @@ async fn mounted_cold_read_reuses_persisted_extent_state_after_client_restart() 
         state_dir: state_dir.to_string_lossy().into_owned(),
         tls_dir: tls_dir.to_string_lossy().into_owned(),
         tls: ServerTlsConfig::local_dev(&tls_dir),
+        bootstrap: Default::default(),
     };
     config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)

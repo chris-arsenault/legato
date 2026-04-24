@@ -19,7 +19,24 @@ fi
 
 chmod 755 /usr/local/bin/legatofs
 chmod 755 /usr/local/bin/legato-register-client
+chmod 755 /usr/local/bin/legato-setup-client
 chmod 755 "${STATE_DIR}"
 chmod 700 "${CERT_DIR}"
+
+CLIENT_NAME="$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || /bin/hostname)"
+/usr/local/bin/legatofs install \
+  --client-name "${CLIENT_NAME}" \
+  --mount-point "/Volumes/Legato" \
+  --state-dir "${STATE_DIR}" \
+  --library-root "/" \
+  --force
+
+CONSOLE_USER="$(/usr/bin/stat -f %Su /dev/console)"
+if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ] && [ "${CONSOLE_USER}" != "loginwindow" ]; then
+  CONSOLE_UID="$(/usr/bin/id -u "${CONSOLE_USER}")"
+  CONSOLE_HOME="$(/usr/bin/dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory | /usr/bin/awk '{print $2}')"
+  /bin/launchctl asuser "${CONSOLE_UID}" /usr/bin/sudo -u "${CONSOLE_USER}" HOME="${CONSOLE_HOME}" /usr/local/bin/legatofs service install --force
+  /bin/launchctl asuser "${CONSOLE_UID}" /usr/bin/sudo -u "${CONSOLE_USER}" HOME="${CONSOLE_HOME}" /usr/local/bin/legatofs service start
+fi
 
 exit 0

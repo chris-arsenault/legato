@@ -56,6 +56,7 @@ async fn grpc_client_transport_attaches_resolves_and_fetches_extents() {
         state_dir: state_dir.to_string_lossy().into_owned(),
         tls_dir: tls_dir.to_string_lossy().into_owned(),
         tls: ServerTlsConfig::local_dev(&tls_dir),
+        bootstrap: Default::default(),
     };
     config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
@@ -165,6 +166,7 @@ async fn grpc_client_transport_reconnects_and_fetches_extents_after_restart() {
         state_dir: state_dir.to_string_lossy().into_owned(),
         tls_dir: tls_dir.to_string_lossy().into_owned(),
         tls: ServerTlsConfig::local_dev(&tls_dir),
+        bootstrap: Default::default(),
     };
     config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
@@ -277,6 +279,7 @@ async fn grpc_client_transport_reports_metrics_to_server_aggregation_surface() {
         state_dir: state_dir.to_string_lossy().into_owned(),
         tls_dir: tls_dir.to_string_lossy().into_owned(),
         tls: ServerTlsConfig::local_dev(&tls_dir),
+        bootstrap: Default::default(),
     };
     config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
@@ -358,6 +361,7 @@ async fn grpc_client_transport_rejects_fetches_for_stale_inode_generation() {
         state_dir: state_dir.to_string_lossy().into_owned(),
         tls_dir: tls_dir.to_string_lossy().into_owned(),
         tls: ServerTlsConfig::local_dev(&tls_dir),
+        bootstrap: Default::default(),
     };
     config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)

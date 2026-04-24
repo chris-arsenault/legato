@@ -10,9 +10,9 @@ use legato_foundation::{
     CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
 };
 use legato_server::{
-    ClientBundleManifest, LiveServer, ServerConfig, ServerRuntimeMetrics, build_tls_server_config,
-    ensure_server_tls_materials, issue_client_tls_bundle, load_runtime_tls, parse_bind_address,
-    write_client_bundle_manifest,
+    ClientBootstrapServices, ClientBundleManifest, LiveServer, ServerConfig, ServerRuntimeMetrics,
+    build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
+    load_runtime_tls, parse_bind_address, write_client_bundle_manifest,
 };
 use serde::Deserialize;
 
@@ -52,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &process_config.server.tls,
     )?;
     build_tls_server_config(&process_config.server.tls)?;
+    let _bootstrap_services =
+        ClientBootstrapServices::spawn(process_config.server.clone(), shutdown.token()).await?;
     let runtime_tls = load_runtime_tls(&process_config.server.tls)?;
     let bind_address = parse_bind_address(&process_config.server.bind_address)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
@@ -319,6 +321,7 @@ mod tests {
             state_dir: state_dir.to_string_lossy().into_owned(),
             tls_dir: tls_dir.to_string_lossy().into_owned(),
             tls,
+            bootstrap: Default::default(),
         };
 
         let report = server_doctor_report(&config).expect("doctor should pass");

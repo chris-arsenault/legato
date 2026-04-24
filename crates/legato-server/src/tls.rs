@@ -124,6 +124,19 @@ impl ClientBundleManifest {
     }
 }
 
+/// In-memory client bundle returned by the server bootstrap endpoint.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientBundlePayload {
+    /// Installation metadata used to hydrate client config.
+    pub manifest: ClientBundleManifest,
+    /// PEM-encoded CA certificate that verifies the server certificate.
+    pub server_ca_pem: String,
+    /// PEM-encoded client certificate chain.
+    pub client_pem: String,
+    /// PEM-encoded client private key.
+    pub client_key_pem: String,
+}
+
 /// Fail-fast errors encountered while loading listener TLS state.
 #[derive(Debug)]
 pub enum TlsConfigError {
@@ -255,36 +268,72 @@ pub fn issue_client_tls_bundle(
     client_name: &str,
     output_dir: &Path,
 ) -> Result<(), TlsConfigError> {
-    let paths = ensure_server_tls_materials(tls_dir, config)?;
-    fs::create_dir_all(output_dir).map_err(|source| TlsConfigError::Io {
-        path: output_dir.to_path_buf(),
-        source,
-    })?;
+    let payload = issue_client_tls_bundle_payload(
+        tls_dir,
+        config,
+        ClientBundleManifest::for_issue(client_name, None, None, None, None),
+    )?;
+    write_client_bundle_payload(output_dir, &payload)
+}
 
+/// Issues a new client certificate bundle and returns it in memory.
+pub fn issue_client_tls_bundle_payload(
+    tls_dir: &Path,
+    config: &ServerTlsConfig,
+    manifest: ClientBundleManifest,
+) -> Result<ClientBundlePayload, TlsConfigError> {
+    let paths = ensure_server_tls_materials(tls_dir, config)?;
     let issuer = load_ca_issuer(&paths.server_ca_cert_path, &paths.server_ca_key_path)?;
     let client_key = KeyPair::generate().map_err(TlsConfigError::Rcgen)?;
-    let mut client_params =
-        CertificateParams::new(vec![client_name.to_owned()]).map_err(TlsConfigError::Rcgen)?;
+    let mut client_params = CertificateParams::new(vec![manifest.client_name.clone()])
+        .map_err(TlsConfigError::Rcgen)?;
     let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, client_name);
+    distinguished_name.push(DnType::CommonName, manifest.client_name.as_str());
     distinguished_name.push(DnType::OrganizationName, "Legato");
     client_params.distinguished_name = distinguished_name;
     let client_cert = client_params
         .signed_by(&client_key, &issuer)
         .map_err(TlsConfigError::Rcgen)?;
+    let server_ca_pem =
+        fs::read_to_string(&paths.server_ca_cert_path).map_err(|source| TlsConfigError::Io {
+            path: paths.server_ca_cert_path.clone(),
+            source,
+        })?;
 
-    write_file(&output_dir.join("client.pem"), client_cert.pem(), 0o644)?;
+    Ok(ClientBundlePayload {
+        manifest,
+        server_ca_pem,
+        client_pem: client_cert.pem(),
+        client_key_pem: client_key.serialize_pem(),
+    })
+}
+
+/// Writes an in-memory client bundle to the standard bundle directory layout.
+pub fn write_client_bundle_payload(
+    output_dir: &Path,
+    payload: &ClientBundlePayload,
+) -> Result<(), TlsConfigError> {
+    fs::create_dir_all(output_dir).map_err(|source| TlsConfigError::Io {
+        path: output_dir.to_path_buf(),
+        source,
+    })?;
+
+    write_file(
+        &output_dir.join("client.pem"),
+        payload.client_pem.clone(),
+        0o644,
+    )?;
     write_file(
         &output_dir.join("client-key.pem"),
-        client_key.serialize_pem(),
+        payload.client_key_pem.clone(),
         0o600,
     )?;
-    fs::copy(&paths.server_ca_cert_path, output_dir.join("server-ca.pem")).map_err(|source| {
-        TlsConfigError::Io {
-            path: output_dir.join("server-ca.pem"),
-            source,
-        }
-    })?;
+    write_file(
+        &output_dir.join("server-ca.pem"),
+        payload.server_ca_pem.clone(),
+        0o644,
+    )?;
+    write_client_bundle_manifest(output_dir, &payload.manifest)?;
 
     Ok(())
 }

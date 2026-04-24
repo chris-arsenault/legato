@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::client_store::ClientLegatoStore;
@@ -17,12 +17,15 @@ use legato_prefetch::{
     PrefetchControlEndpoint, PrefetchControlRequest, PrefetchControlResponse,
     prefetch_project_path, write_control_endpoint,
 };
-use legato_server::ClientBundleManifest;
+use legato_server::{
+    ClientBootstrapAdvertisement, ClientBootstrapRequest, ClientBundleManifest,
+    ClientBundlePayload, write_client_bundle_payload,
+};
 use legato_types::{ClientPlatform, FilesystemError, FilesystemSemantics, platform_error_code};
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
     time::timeout,
 };
@@ -181,7 +184,9 @@ enum Command {
         force: bool,
     },
     Install {
-        bundle_dir: PathBuf,
+        bundle_dir: Option<PathBuf>,
+        bootstrap_url: Option<String>,
+        client_name: Option<String>,
         endpoint: Option<String>,
         server_name: Option<String>,
         mount_point: Option<String>,
@@ -288,6 +293,8 @@ where
         }
         "install" => {
             let mut bundle_dir = None;
+            let mut bootstrap_url = None;
+            let mut client_name = None;
             let mut endpoint = None;
             let mut server_name = None;
             let mut mount_point = None;
@@ -298,6 +305,8 @@ where
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--bundle-dir" => bundle_dir = arguments.next().map(PathBuf::from),
+                    "--bootstrap-url" | "--server" => bootstrap_url = arguments.next(),
+                    "--client-name" => client_name = arguments.next(),
                     "--endpoint" => endpoint = arguments.next(),
                     "--server-name" => server_name = arguments.next(),
                     "--mount-point" => mount_point = arguments.next(),
@@ -311,7 +320,9 @@ where
             }
 
             Ok(Some(Command::Install {
-                bundle_dir: bundle_dir.ok_or("missing --bundle-dir for install")?,
+                bundle_dir,
+                bootstrap_url,
+                client_name,
                 endpoint,
                 server_name,
                 mount_point,
@@ -397,6 +408,8 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
         } => run_service_command(action, config_path, force),
         Command::Install {
             bundle_dir,
+            bootstrap_url,
+            client_name,
             endpoint,
             server_name,
             mount_point,
@@ -404,7 +417,29 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             library_root,
             force,
         } => {
-            let manifest = load_bundle_manifest(&bundle_dir)?;
+            let downloaded_bundle = if bundle_dir.is_none() {
+                Some(
+                    fetch_or_discover_client_bundle(
+                        bootstrap_url,
+                        client_name,
+                        mount_point.clone().or_else(|| Some(default_mount_point())),
+                        library_root
+                            .clone()
+                            .or_else(|| Some(default_library_root())),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let manifest = if let Some(bundle) = &downloaded_bundle {
+                Some(bundle.manifest.clone())
+            } else {
+                let bundle_dir = bundle_dir
+                    .as_deref()
+                    .ok_or("missing --bundle-dir or bootstrap-discoverable server for install")?;
+                load_bundle_manifest(bundle_dir)?
+            };
             let endpoint = resolve_required_install_value(
                 endpoint,
                 manifest.as_ref().and_then(|bundle| bundle.endpoint.clone()),
@@ -431,15 +466,29 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
                     .and_then(|bundle| bundle.library_root.clone()),
                 default_library_root,
             );
-            install_client_bundle(
-                &bundle_dir,
-                &state_dir,
-                &endpoint,
-                &server_name,
-                &mount_point,
-                &library_root,
-                force,
-            )?;
+            if let Some(bundle) = downloaded_bundle {
+                install_downloaded_client_bundle(
+                    &bundle,
+                    &state_dir,
+                    &endpoint,
+                    &server_name,
+                    &mount_point,
+                    &library_root,
+                    force,
+                )?;
+            } else {
+                install_client_bundle(
+                    bundle_dir
+                        .as_deref()
+                        .ok_or("missing --bundle-dir for file-backed install")?,
+                    &state_dir,
+                    &endpoint,
+                    &server_name,
+                    &mount_point,
+                    &library_root,
+                    force,
+                )?;
+            }
             println!(
                 "installed Legato client config into {}",
                 state_dir.display()
@@ -977,6 +1026,142 @@ fn load_bundle_manifest(
     Ok(Some(serde_json::from_slice(&fs::read(&manifest_path)?)?))
 }
 
+async fn fetch_or_discover_client_bundle(
+    bootstrap_url: Option<String>,
+    client_name: Option<String>,
+    mount_point: Option<String>,
+    library_root: Option<String>,
+) -> Result<ClientBundlePayload, Box<dyn std::error::Error>> {
+    let bootstrap_url = match bootstrap_url {
+        Some(url) => normalize_bootstrap_url(&url)?,
+        None => discover_bootstrap_url().await?,
+    };
+    fetch_client_bundle(
+        &bootstrap_url,
+        &ClientBootstrapRequest {
+            client_name: client_name.unwrap_or_else(default_client_name),
+            mount_point,
+            library_root,
+        },
+    )
+    .await
+}
+
+async fn discover_bootstrap_url() -> Result<String, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.set_broadcast(true)?;
+    socket
+        .send_to(b"LEGATO_DISCOVER_V1", "255.255.255.255:7825")
+        .await?;
+    let mut buffer = [0_u8; 2048];
+    let (length, peer) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .map_err(|_| "no Legato server answered LAN discovery")??;
+    let advertisement: ClientBootstrapAdvertisement = serde_json::from_slice(&buffer[..length])?;
+    if advertisement.service != "legato" || advertisement.version != 1 {
+        return Err("discovered service is not a compatible Legato bootstrap endpoint".into());
+    }
+    match advertisement.bootstrap_url {
+        Some(url) => normalize_bootstrap_url(&url),
+        None => Ok(format!("http://{}:7824/v1/client-bundles", peer.ip())),
+    }
+}
+
+async fn fetch_client_bundle(
+    bootstrap_url: &str,
+    request: &ClientBootstrapRequest,
+) -> Result<ClientBundlePayload, Box<dyn std::error::Error>> {
+    let endpoint = parse_http_url(bootstrap_url)?;
+    let body = serde_json::to_vec(request)?;
+    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    let request = format!(
+        "POST {} HTTP/1.1\r\nhost: {}:{}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        endpoint.path,
+        endpoint.host,
+        endpoint.port,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let (status, body) = parse_http_response(&response)?;
+    if status != 200 {
+        return Err(format!(
+            "Legato bootstrap endpoint returned HTTP {status}: {}",
+            String::from_utf8_lossy(body)
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(body)?)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedHttpUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn normalize_bootstrap_url(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("http://{url}")
+    };
+    let parsed = parse_http_url(&url)?;
+    Ok(format!(
+        "http://{}:{}{}",
+        parsed.host, parsed.port, parsed.path
+    ))
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl, Box<dyn std::error::Error>> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or("Legato bootstrap URL must use http://")?;
+    let (authority, path) = if let Some((authority, raw_path)) = rest.split_once('/') {
+        if raw_path.is_empty() {
+            (authority, String::from("/v1/client-bundles"))
+        } else {
+            (authority, format!("/{raw_path}"))
+        }
+    } else {
+        (rest, String::from("/v1/client-bundles"))
+    };
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            let port = port.parse::<u16>()?;
+            Ok::<_, Box<dyn std::error::Error>>((host, port))
+        })
+        .transpose()?
+        .unwrap_or((authority, 7824));
+    if host.trim().is_empty() {
+        return Err("Legato bootstrap URL host is empty".into());
+    }
+    Ok(ParsedHttpUrl {
+        host: host.to_owned(),
+        port,
+        path,
+    })
+}
+
+fn parse_http_response(response: &[u8]) -> Result<(u16, &[u8]), Box<dyn std::error::Error>> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("bootstrap response was not valid HTTP")?;
+    let header_text = std::str::from_utf8(&response[..header_end])?;
+    let status = header_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or("bootstrap response did not include an HTTP status")?
+        .parse::<u16>()?;
+    Ok((status, &response[(header_end + 4)..]))
+}
+
 fn resolve_required_install_value(
     command_value: Option<String>,
     manifest_value: Option<String>,
@@ -1192,6 +1377,33 @@ fn install_client_bundle(
     Ok(())
 }
 
+fn install_downloaded_client_bundle(
+    payload: &ClientBundlePayload,
+    state_dir: &Path,
+    endpoint: &str,
+    server_name: &str,
+    mount_point: &str,
+    library_root: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bundle_dir = state_dir.join("bootstrap-bundle");
+    if bundle_dir.exists() {
+        fs::remove_dir_all(&bundle_dir)?;
+    }
+    write_client_bundle_payload(&bundle_dir, payload)?;
+    let result = install_client_bundle(
+        &bundle_dir,
+        state_dir,
+        endpoint,
+        server_name,
+        mount_point,
+        library_root,
+        force,
+    );
+    let _ = fs::remove_dir_all(&bundle_dir);
+    result
+}
+
 fn require_readable_file(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !path.is_file() {
         return Err(format!("{label} is not a readable file: {}", path.display()).into());
@@ -1336,9 +1548,9 @@ mod tests {
         acquire_state_dir_lock, cache_repair_report, cache_status_report, default_client_name,
         default_config_path, default_library_root, default_mount_point, default_state_dir,
         endpoint_socket, install_client_bundle, load_bundle_manifest, mount_root_attributes,
-        parse_command_impl, render_macos_launchd_plist, resolve_optional_install_value,
-        resolve_required_install_value, spawn_prefetch_control_server, startup_context,
-        windows_task_command_for_executable,
+        normalize_bootstrap_url, parse_command_impl, parse_http_response,
+        render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
+        spawn_prefetch_control_server, startup_context, windows_task_command_for_executable,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
@@ -1428,7 +1640,9 @@ mod tests {
         assert_eq!(
             command,
             Some(Command::Install {
-                bundle_dir: PathBuf::from("/tmp/bundle"),
+                bundle_dir: Some(PathBuf::from("/tmp/bundle")),
+                bootstrap_url: None,
+                client_name: None,
                 endpoint: Some(String::from("legato.lan:7823")),
                 server_name: Some(String::from("legato.lan")),
                 mount_point: Some(String::from("/Volumes/Legato")),
@@ -1451,10 +1665,41 @@ mod tests {
         assert_eq!(
             command,
             Some(Command::Install {
-                bundle_dir: PathBuf::from("/tmp/bundle"),
+                bundle_dir: Some(PathBuf::from("/tmp/bundle")),
+                bootstrap_url: None,
+                client_name: None,
                 endpoint: None,
                 server_name: None,
                 mount_point: None,
+                state_dir: PathBuf::from(default_state_dir()),
+                library_root: None,
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_install_command_allows_bootstrap_discovery() {
+        let command = parse_command_impl([
+            String::from("install"),
+            String::from("--bootstrap-url"),
+            String::from("http://legato.lan:7824"),
+            String::from("--client-name"),
+            String::from("studio-win"),
+            String::from("--mount-point"),
+            String::from("L:\\Legato"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Install {
+                bundle_dir: None,
+                bootstrap_url: Some(String::from("http://legato.lan:7824")),
+                client_name: Some(String::from("studio-win")),
+                endpoint: None,
+                server_name: None,
+                mount_point: Some(String::from("L:\\Legato")),
                 state_dir: PathBuf::from(default_state_dir()),
                 library_root: None,
                 force: false,
@@ -1653,6 +1898,27 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_url_defaults_port_and_path() {
+        assert_eq!(
+            normalize_bootstrap_url("legato.lan").expect("url should normalize"),
+            "http://legato.lan:7824/v1/client-bundles"
+        );
+        assert_eq!(
+            normalize_bootstrap_url("http://legato.lan:9000/custom").expect("url should normalize"),
+            "http://legato.lan:9000/custom"
+        );
+    }
+
+    #[test]
+    fn bootstrap_response_parser_returns_status_and_body() {
+        let (status, body) = parse_http_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+            .expect("response should parse");
+
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{}");
+    }
+
+    #[test]
     fn launchd_plist_runs_legatofs_with_config_and_logs() {
         let plist = render_macos_launchd_plist(
             &PathBuf::from("/Applications/Legato/legatofs"),
@@ -1800,6 +2066,7 @@ mod tests {
             state_dir: state_dir.to_string_lossy().into_owned(),
             tls_dir: tls_dir.to_string_lossy().into_owned(),
             tls: ServerTlsConfig::local_dev(&tls_dir),
+            bootstrap: Default::default(),
         };
         config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
         ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
@@ -1896,6 +2163,7 @@ mod tests {
             state_dir: state_dir.to_string_lossy().into_owned(),
             tls_dir: tls_dir.to_string_lossy().into_owned(),
             tls: ServerTlsConfig::local_dev(&tls_dir),
+            bootstrap: Default::default(),
         };
         config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
         ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)

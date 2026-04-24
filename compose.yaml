@@ -7,8 +7,13 @@ services:
     environment:
       LEGATO_SERVER__COMMON__TRACING__JSON: "true"
       LEGATO_SERVER__COMMON__TRACING__LEVEL: "info"
+      LEGATO_SERVER__COMMON__METRICS__BIND_ADDRESS: "0.0.0.0:9464"
+      LEGATO_SERVER__COMMON__METRICS__PREFIX: "legato_server"
     ports:
       - "7823:7823"
+      - "7824:7824"
+      - "7825:7825/udp"
+      - "9464:9464"
     volumes:
       - /mnt/apps/shares/legato:/srv/libraries:ro
       - /mnt/apps/apps/legato:/var/lib/legato

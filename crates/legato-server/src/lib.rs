@@ -2,6 +2,7 @@
 
 pub mod canonical;
 
+mod bootstrap;
 mod invalidation;
 mod layout;
 mod metrics;
@@ -9,6 +10,10 @@ mod rpc;
 mod tls;
 mod watcher;
 
+pub use bootstrap::{
+    ClientBootstrapAdvertisement, ClientBootstrapConfig, ClientBootstrapRequest,
+    ClientBootstrapServices,
+};
 pub use canonical::{CanonicalStoreError, reconcile_library_root_to_store};
 pub use invalidation::{InvalidationHub, InvalidationSubscription, subtree_invalidation};
 pub use layout::{DEFAULT_POLICY_FILE, LayoutDecision, LayoutPolicy, is_policy_path, policy_path};
@@ -17,9 +22,9 @@ pub use metrics::ServerRuntimeMetrics;
 pub use rpc::{BoundServer, LiveServer, RuntimeTlsConfig, load_runtime_tls, parse_bind_address};
 use serde::Deserialize;
 pub use tls::{
-    BootstrappedServerTlsPaths, ClientBundleManifest, ServerTlsConfig, TlsConfigError,
-    build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
-    write_client_bundle_manifest,
+    BootstrappedServerTlsPaths, ClientBundleManifest, ClientBundlePayload, ServerTlsConfig,
+    TlsConfigError, build_tls_server_config, ensure_server_tls_materials, issue_client_tls_bundle,
+    issue_client_tls_bundle_payload, write_client_bundle_manifest, write_client_bundle_payload,
 };
 pub use watcher::{
     NotificationAction, WatchBackend, create_poll_watcher, create_recommended_watcher,
@@ -66,6 +71,9 @@ pub struct ServerConfig {
     /// TLS certificate and mTLS trust material used by the listener.
     #[serde(default)]
     pub tls: ServerTlsConfig,
+    /// Unauthenticated LAN bootstrap endpoint used by installers before mTLS exists.
+    #[serde(default)]
+    pub bootstrap: ClientBootstrapConfig,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +84,7 @@ impl Default for ServerConfig {
             state_dir: String::from("/var/lib/legato"),
             tls_dir: String::from("/etc/legato/certs"),
             tls: ServerTlsConfig::default(),
+            bootstrap: ClientBootstrapConfig::default(),
         }
     }
 }

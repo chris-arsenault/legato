@@ -47,7 +47,15 @@ Server-managed TLS files:
 - `server-ca.pem`
 - `server-ca-key.pem`
 
-Client registration is handled by the server binary:
+Client registration is normally handled by the server bootstrap endpoint. Installers discover the server on UDP `7825` and request a client bundle from HTTP `7824`.
+
+Bootstrap endpoint:
+
+```text
+http://legato.lan:7824/v1/client-bundles
+```
+
+Manual bundle issuing remains available for recovery or offline installs:
 
 ```bash
 docker exec legato-server legato-server issue-client \
@@ -64,7 +72,7 @@ That writes:
 - `server-ca.pem`
 - `bundle.json`
 
-Install the bundle on the client:
+Install the manually issued bundle on the client:
 
 ```bash
 legatofs install --bundle-dir /tmp/studio-mac
@@ -91,10 +99,11 @@ legatofs install \
 The base example is [deploy/server/server.toml.example](/home/dev/repos/legato/deploy/server/server.toml.example).
 
 - `server.bind_address`: gRPC/control-plane listener
+- `server.bootstrap.*`: client installer discovery and bundle issuing endpoint
 - `server.library_root`: mounted sample-library import root
 - `server.state_dir`: canonical Legato store root
 - `server.tls.*`: mTLS certificate chain and client CA
-- `common.metrics.bind_address`: optional Prometheus scrape endpoint
+- `common.metrics.bind_address`: Prometheus scrape endpoint
 
 Recommended defaults:
 
@@ -127,19 +136,17 @@ Under `/etc/legato/certs`, the expected durable layout is:
 
 Client setup flow:
 
-1. Install the native binary.
-2. Issue a bundle from the server with `legato-server issue-client`.
-3. Run `legatofs install` with the issued bundle.
-4. Start the mount agent.
+1. Run the native client installer.
+2. Accept the default discovery/bootstrap settings, or enter `http://legato.lan:7824` if discovery is blocked.
+3. Choose the mount point or accept the platform default.
+4. Let setup register the client, install the service, and start the mount.
 5. Verify the mount root appears and resolves indexed paths.
-6. Open one representative project or preset through the mounted filesystem and confirm its referenced sample content becomes resident. Use `legato-prefetch run <mounted-project-path> --config <path-to-legatofs.toml>` only as an explicit diagnostic or manual warm-up request while the mount agent is running.
 
 Replacement flow:
 
-1. Reissue the client bundle on the server for the same logical client name.
-2. Transfer the new bundle to the client host.
-3. Reinstall with `legatofs install --bundle-dir <bundle> --force`.
-4. Restart the native client runtime.
+1. Re-run client setup from the installer or setup helper.
+2. Use the same logical client name if you want to replace that client identity.
+3. Restart the native client runtime if setup did not already do it.
 
 ## Client State Layout
 
@@ -166,7 +173,7 @@ Each binary exposes:
 
 - structured tracing via `init_tracing`
 - process startup and lifecycle metrics
-- optional Prometheus exposition when `common.metrics.bind_address` is set
+- Prometheus exposition from the server on `:9464` in the default compose stack
 
 Suggested starter alerts:
 
