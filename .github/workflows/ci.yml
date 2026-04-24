@@ -12,6 +12,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  LEGATO_RELEASE_TAG: v0.8
+  LEGATO_RELEASE_VERSION: "0.8"
+
 jobs:
   ci:
     uses: chris-arsenault/ahara/.github/workflows/ci.yml@main
@@ -28,6 +32,8 @@ jobs:
       - name: Build legatofs
         run: cargo build --release -p legatofs
       - name: Package macOS installer
+        env:
+          VERSION: ${{ env.LEGATO_RELEASE_VERSION }}
         run: bash ./deploy/client/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -75,8 +81,53 @@ jobs:
         run: cargo build --release -p legatofs
       - name: Package Windows installer
         shell: pwsh
+        env:
+          LEGATO_VERSION: ${{ env.LEGATO_RELEASE_VERSION }}
         run: .\deploy\client\package-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: legatofs-windows-installer
           path: artifacts/windows/*.exe
+
+  publish-client-release:
+    name: Publish Client Release
+    needs: [package-macos-client, package-windows-client]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' && needs.package-macos-client.result == 'success' && needs.package-windows-client.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: legatofs-macos-installer
+          path: release-artifacts
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: legatofs-windows-installer
+          path: release-artifacts
+      - name: Publish installers to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          assets=(release-artifacts/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release artifacts found."
+            exit 1
+          fi
+
+          if gh release view "${LEGATO_RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${LEGATO_RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${LEGATO_RELEASE_TAG}" "${assets[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "Legato ${LEGATO_RELEASE_TAG}" \
+              --generate-notes \
+              --latest
+          fi
