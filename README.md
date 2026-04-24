@@ -17,7 +17,8 @@ At a high level, this repo contains three runtime pieces:
 - [Protocol And Behavior](docs/design/PROTOCOL_AND_BEHAVIOR.md)
 - [Transfer Layout And Store Model](docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
 - [Operations Runbook](deploy/OPERATIONS.md)
-- [Client Packaging Notes](deploy/client/README.md)
+- [Observability Guide](deploy/OBSERVABILITY.md)
+- [Client Installation Guide](deploy/client/README.md)
 - [Protocol Versioning](crates/legato-proto/PROTO_VERSIONING.md)
 - [Agent/Contributor Index](CLAUDE.md)
 

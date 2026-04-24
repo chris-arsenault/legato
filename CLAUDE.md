@@ -11,9 +11,10 @@ This is a lightweight working index for agents operating in the Legato repositor
 - [Protocol And Behavior](docs/design/PROTOCOL_AND_BEHAVIOR.md)
 - [Transfer Layout And Store Model](docs/design/TRANSFER_LAYOUT_AND_STORE_MODEL.md)
 - [Operations Runbook](deploy/OPERATIONS.md)
+- [Observability Guide](deploy/OBSERVABILITY.md)
 - [Platform Manifest](platform.yml)
 - [Komodo Compose Stack](compose.yaml)
-- [Client Packaging Notes](deploy/client/README.md)
+- [Client Installation Guide](deploy/client/README.md)
 - [Protocol Versioning](crates/legato-proto/PROTO_VERSIONING.md)
 
 ## Repository Shape
@@ -35,7 +36,7 @@ This is a lightweight working index for agents operating in the Legato repositor
 - `crates/legato-types`
   Shared domain model types.
 - `deploy/`
-  Server deployment assets, operations notes, and client packaging notes.
+  Server deployment assets, operations notes, observability guidance, and client installation docs.
 
 ## Development Lifecycle
 

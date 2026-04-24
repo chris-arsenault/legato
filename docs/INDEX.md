@@ -28,12 +28,14 @@ This directory is the short-form map of the repository documentation.
 
 - [deploy/OPERATIONS.md](../deploy/OPERATIONS.md)
   Local TrueNAS/Komodo deployment shape, client registration, and recovery notes.
+- [deploy/OBSERVABILITY.md](../deploy/OBSERVABILITY.md)
+  Elastic/Kibana, structured-log, and Prometheus metrics integration guide.
 - [platform.yml](../platform.yml)
   Shared Ahara CI manifest that declares stack, deploy shape, and Rust artifact outputs.
 - [compose.yaml](../compose.yaml)
   Root Komodo/TrueNAS stack definition used by the shared deploy workflow.
 - [deploy/client/README.md](../deploy/client/README.md)
-  Packaging, install layout, and upgrade expectations for native clients.
+  Step-by-step macOS and Windows client install, verification, upgrade, and service commands.
 - [crates/legato-proto/PROTO_VERSIONING.md](../crates/legato-proto/PROTO_VERSIONING.md)
   Protocol namespace and field-number rules.
 

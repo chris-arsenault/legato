@@ -160,6 +160,8 @@ Under the chosen client state root, the expected durable layout is:
 
 ## Observability
 
+For Elastic/Kibana setup, see [OBSERVABILITY.md](OBSERVABILITY.md).
+
 Each binary exposes:
 
 - structured tracing via `init_tracing`
