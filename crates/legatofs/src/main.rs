@@ -69,6 +69,12 @@ struct StateDirLock {
     file: fs::File,
 }
 
+#[derive(Debug)]
+struct PrefetchControlServer {
+    task: tokio::task::JoinHandle<()>,
+    endpoint_path: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(command) = parse_command()? {
@@ -828,18 +834,26 @@ impl Drop for StateDirLock {
     }
 }
 
+impl Drop for PrefetchControlServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = fs::remove_file(&self.endpoint_path);
+    }
+}
+
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 async fn spawn_prefetch_control_server(
     mount: &MountConfig,
     service: Arc<Mutex<FilesystemService>>,
-) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+) -> Result<PrefetchControlServer, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let endpoint = PrefetchControlEndpoint {
         host: String::from("127.0.0.1"),
         port: listener.local_addr()?.port(),
     };
+    let endpoint_path = legato_prefetch::control_endpoint_path(Path::new(&mount.state_dir));
     write_control_endpoint(Path::new(&mount.state_dir), &endpoint)?;
-    Ok(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
                 break;
@@ -851,7 +865,11 @@ async fn spawn_prefetch_control_server(
                 }
             });
         }
-    }))
+    });
+    Ok(PrefetchControlServer {
+        task,
+        endpoint_path,
+    })
 }
 
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -1314,12 +1332,13 @@ mod tests {
     };
 
     use super::{
-        CacheCommand, ClientProcessConfig, Command, MountConfig, acquire_state_dir_lock,
-        cache_repair_report, cache_status_report, default_client_name, default_config_path,
-        default_library_root, default_mount_point, default_state_dir, endpoint_socket,
-        install_client_bundle, load_bundle_manifest, mount_root_attributes, parse_command_impl,
-        render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
-        spawn_prefetch_control_server, startup_context, windows_task_command_for_executable,
+        CacheCommand, ClientProcessConfig, Command, MountConfig, PrefetchControlServer,
+        acquire_state_dir_lock, cache_repair_report, cache_status_report, default_client_name,
+        default_config_path, default_library_root, default_mount_point, default_state_dir,
+        endpoint_socket, install_client_bundle, load_bundle_manifest, mount_root_attributes,
+        parse_command_impl, render_macos_launchd_plist, resolve_optional_install_value,
+        resolve_required_install_value, spawn_prefetch_control_server, startup_context,
+        windows_task_command_for_executable,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
@@ -1733,6 +1752,26 @@ mod tests {
         drop(first);
 
         let _third = acquire_state_dir_lock(&state_dir).expect("lock should be reacquired");
+    }
+
+    #[tokio::test]
+    async fn prefetch_control_server_drop_removes_endpoint_manifest() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let endpoint_path = fixture.path().join("prefetch-control.json");
+        fs::write(&endpoint_path, b"{\"host\":\"127.0.0.1\",\"port\":8123}")
+            .expect("endpoint manifest should be written");
+
+        let server = PrefetchControlServer {
+            task: tokio::spawn(async {}),
+            endpoint_path: endpoint_path.clone(),
+        };
+        drop(server);
+        tokio::task::yield_now().await;
+
+        assert!(
+            !endpoint_path.exists(),
+            "endpoint manifest should be removed when the control server exits"
+        );
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use legato_client_core::{
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
+    time::timeout,
 };
 
 mod analyzers;
@@ -245,6 +246,7 @@ impl From<std::io::Error> for PrefetchError {
 }
 
 const MAX_INLINE_PROJECT_BYTES: u64 = 16 * 1024 * 1024;
+const PREFETCH_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Parses a `legato-prefetch` CLI invocation.
 pub fn parse_cli_args<I, S>(args: I) -> Result<PrefetchCommand, PrefetchError>
@@ -569,23 +571,66 @@ pub async fn request_control_prefetch(
     endpoint: &PrefetchControlEndpoint,
     project_path: &str,
 ) -> Result<ExecutionReport, PrefetchError> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-        .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    request_control_prefetch_with_timeout(endpoint, project_path, PREFETCH_CONTROL_TIMEOUT).await
+}
+
+async fn request_control_prefetch_with_timeout(
+    endpoint: &PrefetchControlEndpoint,
+    project_path: &str,
+    timeout_budget: Duration,
+) -> Result<ExecutionReport, PrefetchError> {
+    let mut stream = timeout(
+        timeout_budget,
+        TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+    )
+    .await
+    .map_err(|_error| {
+        PrefetchError::Runtime(format!(
+            "mounted Legato runtime did not accept a local prefetch control connection within {}s",
+            timeout_budget.as_secs()
+        ))
+    })?
+    .map_err(|error| {
+        PrefetchError::Runtime(format!(
+            "failed to connect to the mounted Legato runtime at {}:{}: {error}",
+            endpoint.host, endpoint.port
+        ))
+    })?;
     let mut request = serde_json::to_vec(&PrefetchControlRequest {
         project_path: String::from(project_path),
     })
     .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
     request.push(b'\n');
-    stream
-        .write_all(&request)
+    timeout(timeout_budget, stream.write_all(&request))
         .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+        .map_err(|_error| {
+            PrefetchError::Runtime(format!(
+                "mounted Legato runtime did not accept a local prefetch control request within {}s",
+                timeout_budget.as_secs()
+            ))
+        })?
+        .map_err(|error| {
+            PrefetchError::Runtime(format!(
+                "failed to send a local prefetch control request to the mounted runtime: {error}"
+            ))
+        })?;
     let mut response = Vec::new();
-    BufReader::new(stream)
-        .read_until(b'\n', &mut response)
-        .await
-        .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
+    timeout(
+        timeout_budget,
+        BufReader::new(stream).read_until(b'\n', &mut response),
+    )
+    .await
+    .map_err(|_error| {
+        PrefetchError::Runtime(format!(
+            "mounted Legato runtime did not respond to the local prefetch control request within {}s",
+            timeout_budget.as_secs()
+        ))
+    })?
+    .map_err(|error| {
+        PrefetchError::Runtime(format!(
+            "failed while waiting for the mounted runtime prefetch response: {error}"
+        ))
+    })?;
     let response: PrefetchControlResponse = serde_json::from_slice(&response)
         .map_err(|error| PrefetchError::Runtime(error.to_string()))?;
     match (response.report, response.error) {
@@ -713,16 +758,17 @@ fn default_state_dir() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write, path::Path};
+    use std::{fs, io::Write, path::Path, time::Duration};
 
     use flate2::{Compression, write::GzEncoder};
     use tempfile::tempdir;
+    use tokio::{net::TcpListener, time::sleep};
 
     use super::{
         KontaktVersion, PrefetchCommand, PrefetchControlEndpoint, PrefetchMountConfig,
         ProjectAnalysis, ProjectFormat, analyze_project, control_project_path,
         detect_kontakt_version, parse_cli_args, project_analyzer_registry, read_control_endpoint,
-        supports_project_prefetch, write_control_endpoint,
+        request_control_prefetch_with_timeout, supports_project_prefetch, write_control_endpoint,
     };
     use legato_types::PrefetchPriority;
 
@@ -907,5 +953,42 @@ mod tests {
         let loaded = read_control_endpoint(temp.path()).expect("endpoint should load");
 
         assert_eq!(loaded, endpoint);
+    }
+
+    #[test]
+    fn control_prefetch_request_times_out_when_runtime_stalls() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+        runtime.block_on(async {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("listener should bind");
+            let endpoint = PrefetchControlEndpoint {
+                host: String::from("127.0.0.1"),
+                port: listener.local_addr().expect("addr should exist").port(),
+            };
+            let server = tokio::spawn(async move {
+                let (stream, _peer) = listener.accept().await.expect("accept should succeed");
+                sleep(Duration::from_millis(200)).await;
+                drop(stream);
+            });
+
+            let error = request_control_prefetch_with_timeout(
+                &endpoint,
+                "/Projects/session.nki",
+                Duration::from_millis(25),
+            )
+            .await
+            .expect_err("stalled runtime should time out");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not respond to the local prefetch control request"),
+                "unexpected error: {error}"
+            );
+            let _ = server.await;
+        });
     }
 }
