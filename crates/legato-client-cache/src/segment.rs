@@ -1,6 +1,7 @@
 //! Append-only Legato segment file primitives.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -8,11 +9,14 @@ use std::{
 };
 
 const SEGMENT_MAGIC: &[u8; 8] = b"LGTOSEG1";
+const INDEX_MAGIC: &[u8; 8] = b"LGTOIDX1";
 const RECORD_MAGIC: &[u8; 4] = b"LREC";
 const FOOTER_MAGIC: &[u8; 4] = b"LEND";
 const SEGMENT_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 1;
 const RECORD_HEADER_LEN: u64 = 4 + 1 + 8 + 8 + 32;
 const FOOTER_LEN: u64 = 4 + 8 + 8;
+const INDEX_ENTRY_LEN: usize = 8 + 1 + 7 + 8 + 8 + 8 + 32;
 
 /// Type tag for a Legato record stored inside a segment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,11 +118,28 @@ pub struct SegmentScan {
     pub truncated_tail: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SegmentIndex {
+    segment_id: u64,
+    entries: BTreeMap<u64, SegmentIndexEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SegmentIndexEntry {
+    record_offset: u64,
+    kind: StoreRecordKind,
+    sequence: u64,
+    payload_offset: u64,
+    payload_len: u64,
+    payload_hash: [u8; 32],
+}
+
 /// Append-only writer for one active segment file.
 #[derive(Debug)]
 pub struct SegmentWriter {
     path: PathBuf,
     file: File,
+    index_file: File,
     segment_id: u64,
     record_count: u64,
     last_sequence: u64,
@@ -148,6 +169,16 @@ impl SegmentWriter {
                 path: path.to_path_buf(),
                 source,
             })?;
+        let index_path = segment_index_path(path);
+        let mut index_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .map_err(|source| SegmentStoreError::Io {
+                path: index_path.clone(),
+                source,
+            })?;
 
         file.write_all(SEGMENT_MAGIC)
             .and_then(|()| file.write_all(&SEGMENT_VERSION.to_le_bytes()))
@@ -157,10 +188,19 @@ impl SegmentWriter {
                 path: path.to_path_buf(),
                 source,
             })?;
+        index_file
+            .write_all(INDEX_MAGIC)
+            .and_then(|()| index_file.write_all(&INDEX_VERSION.to_le_bytes()))
+            .and_then(|()| index_file.write_all(&segment_id.to_le_bytes()))
+            .map_err(|source| SegmentStoreError::Io {
+                path: index_path,
+                source,
+            })?;
 
         Ok(Self {
             path: path.to_path_buf(),
             file,
+            index_file,
             segment_id,
             record_count: 0,
             last_sequence: 0,
@@ -211,6 +251,18 @@ impl SegmentWriter {
                 path: self.path.clone(),
                 source,
             })?;
+        append_index_entry(
+            &mut self.index_file,
+            &segment_index_path(&self.path),
+            SegmentIndexEntry {
+                record_offset: segment_offset,
+                kind,
+                sequence,
+                payload_offset: segment_offset + RECORD_HEADER_LEN,
+                payload_len: payload.len() as u64,
+                payload_hash: record.payload_hash,
+            },
+        )?;
         self.record_count = self.record_count.saturating_add(1);
         self.last_sequence = sequence;
         Ok(record)
@@ -237,6 +289,12 @@ impl SegmentWriter {
                 path: self.path.clone(),
                 source,
             })?;
+        self.index_file
+            .flush()
+            .map_err(|source| SegmentStoreError::Io {
+                path: segment_index_path(&self.path),
+                source,
+            })?;
         self.sealed = true;
         Ok(footer)
     }
@@ -253,6 +311,19 @@ pub fn read_record_at(
     record_offset: u64,
 ) -> Result<StoreRecord, SegmentStoreError> {
     let path = path.as_ref();
+    let mut index = load_or_rebuild_segment_index(path)?;
+    let entry = match index.entries.get(&record_offset).cloned() {
+        Some(entry) => entry,
+        None => {
+            index = rebuild_segment_index(path)?;
+            index.entries.get(&record_offset).cloned().ok_or_else(|| {
+                SegmentStoreError::MissingRecord {
+                    path: path.to_path_buf(),
+                    offset: record_offset,
+                }
+            })?
+        }
+    };
     let mut file =
         OpenOptions::new()
             .read(true)
@@ -261,31 +332,32 @@ pub fn read_record_at(
                 path: path.to_path_buf(),
                 source,
             })?;
-    let _ = read_segment_header(path, &mut file)?;
-    file.seek(SeekFrom::Start(record_offset))
+    file.seek(SeekFrom::Start(entry.payload_offset))
         .map_err(|source| SegmentStoreError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-
-    let magic = match read_magic_or_tail(path, &mut file)? {
-        MagicRead::Complete(magic) if magic == *RECORD_MAGIC => magic,
-        _ => {
-            return Err(SegmentStoreError::MissingRecord {
-                path: path.to_path_buf(),
-                offset: record_offset,
-            });
-        }
-    };
-    let _ = magic;
-
-    match read_record_body(path, &mut file, record_offset)? {
-        TailRead::Complete(record) => Ok(record),
-        TailRead::Incomplete => Err(SegmentStoreError::MissingRecord {
+    let mut payload = vec![0_u8; entry.payload_len as usize];
+    file.read_exact(&mut payload)
+        .map_err(|source| SegmentStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let actual_hash = *blake3::hash(&payload).as_bytes();
+    if actual_hash != entry.payload_hash {
+        return Err(SegmentStoreError::HashMismatch {
             path: path.to_path_buf(),
             offset: record_offset,
-        }),
+            sequence: entry.sequence,
+        });
     }
+    Ok(StoreRecord {
+        kind: entry.kind,
+        sequence: entry.sequence,
+        segment_offset: record_offset,
+        payload,
+        payload_hash: entry.payload_hash,
+    })
 }
 
 /// Scans a segment file and truncates an incomplete tail when one is present.
@@ -373,6 +445,148 @@ fn scan_segment_impl(path: &Path, repair: bool) -> Result<SegmentScan, SegmentSt
         records,
         footer,
         truncated_tail,
+    })
+}
+
+fn segment_index_path(path: &Path) -> PathBuf {
+    path.with_extension("lidx")
+}
+
+fn append_index_entry(
+    file: &mut File,
+    path: &Path,
+    entry: SegmentIndexEntry,
+) -> Result<(), SegmentStoreError> {
+    let mut bytes = [0_u8; INDEX_ENTRY_LEN];
+    bytes[0..8].copy_from_slice(&entry.record_offset.to_le_bytes());
+    bytes[8] = entry.kind.into();
+    bytes[16..24].copy_from_slice(&entry.sequence.to_le_bytes());
+    bytes[24..32].copy_from_slice(&entry.payload_offset.to_le_bytes());
+    bytes[32..40].copy_from_slice(&entry.payload_len.to_le_bytes());
+    bytes[40..72].copy_from_slice(&entry.payload_hash);
+    file.write_all(&bytes)
+        .map_err(|source| SegmentStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn load_or_rebuild_segment_index(path: &Path) -> Result<SegmentIndex, SegmentStoreError> {
+    match load_segment_index(path) {
+        Ok(index) => Ok(index),
+        Err(_error) => rebuild_segment_index(path),
+    }
+}
+
+fn load_segment_index(path: &Path) -> Result<SegmentIndex, SegmentStoreError> {
+    let index_path = segment_index_path(path);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(&index_path)
+        .map_err(|source| SegmentStoreError::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+    let mut magic = [0_u8; 8];
+    file.read_exact(&mut magic)
+        .map_err(|source| SegmentStoreError::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+    if &magic != INDEX_MAGIC {
+        return Err(SegmentStoreError::InvalidMagic {
+            path: index_path,
+            offset: 0,
+        });
+    }
+    let version = read_u32(&segment_index_path(path), &mut file)?;
+    if version != INDEX_VERSION {
+        return Err(SegmentStoreError::UnsupportedVersion(version));
+    }
+    let segment_id = read_u64(&segment_index_path(path), &mut file)?;
+    let mut entries = BTreeMap::new();
+    loop {
+        let mut bytes = [0_u8; INDEX_ENTRY_LEN];
+        match file
+            .read(&mut bytes)
+            .map_err(|source| SegmentStoreError::Io {
+                path: segment_index_path(path),
+                source,
+            })? {
+            0 => break,
+            INDEX_ENTRY_LEN => {
+                let kind = StoreRecordKind::try_from(bytes[8])?;
+                let mut payload_hash = [0_u8; 32];
+                payload_hash.copy_from_slice(&bytes[40..72]);
+                let entry = SegmentIndexEntry {
+                    record_offset: u64::from_le_bytes(copy_array::<8>(&bytes[0..8])),
+                    kind,
+                    sequence: u64::from_le_bytes(copy_array::<8>(&bytes[16..24])),
+                    payload_offset: u64::from_le_bytes(copy_array::<8>(&bytes[24..32])),
+                    payload_len: u64::from_le_bytes(copy_array::<8>(&bytes[32..40])),
+                    payload_hash,
+                };
+                entries.insert(entry.record_offset, entry);
+            }
+            _ => {
+                return Err(SegmentStoreError::MissingRecord {
+                    path: segment_index_path(path),
+                    offset: 20,
+                });
+            }
+        }
+    }
+    Ok(SegmentIndex {
+        segment_id,
+        entries,
+    })
+}
+
+fn rebuild_segment_index(path: &Path) -> Result<SegmentIndex, SegmentStoreError> {
+    let scan = repair_incomplete_tail(path)?;
+    let index_path = segment_index_path(path);
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| SegmentStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&index_path)
+        .map_err(|source| SegmentStoreError::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+    file.write_all(INDEX_MAGIC)
+        .and_then(|()| file.write_all(&INDEX_VERSION.to_le_bytes()))
+        .and_then(|()| file.write_all(&scan.header.segment_id.to_le_bytes()))
+        .map_err(|source| SegmentStoreError::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+    let mut entries = BTreeMap::new();
+    for record in scan.records {
+        let entry = SegmentIndexEntry {
+            record_offset: record.segment_offset,
+            kind: record.kind,
+            sequence: record.sequence,
+            payload_offset: record.segment_offset + RECORD_HEADER_LEN,
+            payload_len: record.payload.len() as u64,
+            payload_hash: record.payload_hash,
+        };
+        append_index_entry(&mut file, &index_path, entry.clone())?;
+        entries.insert(entry.record_offset, entry);
+    }
+    file.flush().map_err(|source| SegmentStoreError::Io {
+        path: index_path,
+        source,
+    })?;
+    Ok(SegmentIndex {
+        segment_id: scan.header.segment_id,
+        entries,
     })
 }
 
@@ -619,7 +833,7 @@ impl std::error::Error for SegmentStoreError {
 mod tests {
     use super::{
         SegmentStoreError, SegmentWriter, StoreRecord, StoreRecordKind, read_record_at,
-        repair_incomplete_tail, scan_segment,
+        repair_incomplete_tail, scan_segment, segment_index_path,
     };
     use std::{
         fs::{self, OpenOptions},
@@ -734,6 +948,54 @@ mod tests {
             read_record_at(&path, record.segment_offset).expect_err("corrupt lookup should fail");
 
         assert!(matches!(error, SegmentStoreError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn direct_record_lookup_rebuilds_missing_index() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("missing-index.lseg");
+        let mut writer = SegmentWriter::create(&path, 1, 100).expect("segment should create");
+        let record = writer
+            .append(StoreRecordKind::Extent, 1, b"healthy")
+            .expect("record should append");
+        writer.seal().expect("segment should seal");
+
+        fs::remove_file(segment_index_path(&path)).expect("index should be removed");
+
+        let loaded = read_record_at(&path, record.segment_offset).expect("record should load");
+
+        assert_eq!(loaded, record);
+        assert!(
+            segment_index_path(&path).exists(),
+            "index should be rebuilt"
+        );
+    }
+
+    #[test]
+    fn direct_record_lookup_rebuilds_corrupt_index() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("corrupt-index.lseg");
+        let mut writer = SegmentWriter::create(&path, 1, 100).expect("segment should create");
+        let record = writer
+            .append(StoreRecordKind::Extent, 1, b"healthy")
+            .expect("record should append");
+        writer.seal().expect("segment should seal");
+
+        let index_path = segment_index_path(&path);
+        let mut index = OpenOptions::new()
+            .write(true)
+            .open(&index_path)
+            .expect("index should open for corruption");
+        index
+            .seek(SeekFrom::Start(0))
+            .expect("seek to index head should work");
+        index
+            .write_all(b"broken!!")
+            .expect("index magic should be corrupted");
+
+        let loaded = read_record_at(&path, record.segment_offset).expect("record should load");
+
+        assert_eq!(loaded, record);
     }
 
     #[test]

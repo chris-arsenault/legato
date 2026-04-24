@@ -1,6 +1,11 @@
 //! Client partial-replica store built on Legato catalog and segment records.
 
-use std::{cmp::Ordering, collections::BTreeMap, fs, path::Path};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BTreeMap,
+    fs,
+    path::Path,
+};
 
 use legato_proto::{
     ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, InodeMetadata, InvalidationEvent,
@@ -507,16 +512,16 @@ impl Ord for EvictionCandidate {
             self.active_pin_bonus(),
             u8::MAX.saturating_sub(self.pin_priority),
             self.last_access_ns,
-            self.file_offset,
-            self.extent_index,
+            Reverse(self.file_offset),
+            Reverse(self.extent_index),
             self.file_id,
         )
             .cmp(&(
                 other.active_pin_bonus(),
                 u8::MAX.saturating_sub(other.pin_priority),
                 other.last_access_ns,
-                other.file_offset,
-                other.extent_index,
+                Reverse(other.file_offset),
+                Reverse(other.extent_index),
                 other.file_id,
             ))
     }
