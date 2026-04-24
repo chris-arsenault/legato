@@ -109,25 +109,13 @@ jobs:
           name: legatofs-windows-installer
           path: release-artifacts
       - name: Publish installers to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          assets=(release-artifacts/*)
-          if (( ${#assets[@]} == 0 )); then
-            echo "No release artifacts found."
-            exit 1
-          fi
-
-          if gh release view "${LEGATO_RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${LEGATO_RELEASE_TAG}" "${assets[@]}" --clobber
-          else
-            gh release create "${LEGATO_RELEASE_TAG}" "${assets[@]}" \
-              --target "${GITHUB_SHA}" \
-              --title "Legato ${LEGATO_RELEASE_TAG}" \
-              --generate-notes \
-              --latest
-          fi
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.LEGATO_RELEASE_TAG }}
+          name: Legato ${{ env.LEGATO_RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          make_latest: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: release-artifacts/*
