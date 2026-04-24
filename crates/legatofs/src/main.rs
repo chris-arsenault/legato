@@ -64,6 +64,11 @@ struct StartupContext {
     semantics: FilesystemSemantics,
 }
 
+#[derive(Debug)]
+struct StateDirLock {
+    file: fs::File,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(command) = parse_command()? {
@@ -74,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let process_config =
         load_config::<ClientProcessConfig>(Some(&runtime_config_path), "LEGATO_FS")
             .unwrap_or_else(|_| ClientProcessConfig::default());
+    let _state_lock = acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
     init_tracing("legatofs", &process_config.common.tracing)?;
     let shutdown = ShutdownController::new();
     let telemetry = ProcessTelemetry::new("legatofs", &process_config.common.metrics);
@@ -357,10 +363,14 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             )?;
             let report = match action {
                 CacheCommand::Status => cache_status_report(&process_config.mount)?,
-                CacheCommand::Repair => cache_repair_report(
-                    &process_config.mount,
-                    process_config.client.cache.max_bytes,
-                )?,
+                CacheCommand::Repair => {
+                    let _state_lock =
+                        acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
+                    cache_repair_report(
+                        &process_config.mount,
+                        process_config.client.cache.max_bytes,
+                    )?
+                }
             };
             println!("{report}");
             Ok(())
@@ -438,6 +448,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
         } => {
             let process_config =
                 load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
+            let _state_lock = acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
             let mut service = FilesystemService::connect(
                 process_config.client.clone(),
                 default_client_name(),
@@ -791,6 +802,29 @@ fn startup_context(mount: &MountConfig) -> StartupContext {
         platform,
         mount_point: mount.mount_point.clone(),
         semantics,
+    }
+}
+
+fn acquire_state_dir_lock(state_dir: &Path) -> Result<StateDirLock, Box<dyn std::error::Error>> {
+    fs::create_dir_all(state_dir)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(state_dir.join("runtime.lock"))?;
+    file.try_lock().map_err(|_error| {
+        format!(
+            "state_dir {} is already owned by another legatofs runtime or mutating command",
+            state_dir.display()
+        )
+    })?;
+    Ok(StateDirLock { file })
+}
+
+impl Drop for StateDirLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -1280,10 +1314,10 @@ mod tests {
     };
 
     use super::{
-        CacheCommand, ClientProcessConfig, Command, MountConfig, cache_repair_report,
-        cache_status_report, default_client_name, default_config_path, default_library_root,
-        default_mount_point, default_state_dir, endpoint_socket, install_client_bundle,
-        load_bundle_manifest, mount_root_attributes, parse_command_impl,
+        CacheCommand, ClientProcessConfig, Command, MountConfig, acquire_state_dir_lock,
+        cache_repair_report, cache_status_report, default_client_name, default_config_path,
+        default_library_root, default_mount_point, default_state_dir, endpoint_socket,
+        install_client_bundle, load_bundle_manifest, mount_root_attributes, parse_command_impl,
         render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
         spawn_prefetch_control_server, startup_context, windows_task_command_for_executable,
     };
@@ -1682,6 +1716,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn state_dir_lock_prevents_second_writer_until_released() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let state_dir = fixture.path().join("state");
+
+        let first = acquire_state_dir_lock(&state_dir).expect("first lock should succeed");
+        let second = acquire_state_dir_lock(&state_dir).expect_err("second lock should fail");
+        assert!(
+            second
+                .to_string()
+                .contains("already owned by another legatofs runtime"),
+            "unexpected error: {second}"
+        );
+
+        drop(first);
+
+        let _third = acquire_state_dir_lock(&state_dir).expect("lock should be reacquired");
+    }
+
     #[tokio::test]
     async fn prefetch_control_server_handles_one_request() {
         let fixture = tempdir().expect("tempdir should be created");
@@ -1776,5 +1829,134 @@ mod tests {
         .expect("control prefetch request should succeed");
 
         assert!(report.accepted > 0);
+    }
+
+    #[tokio::test]
+    async fn control_prefetch_and_mounted_reads_share_one_runtime_without_store_corruption() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        let client_state_dir = fixture.path().join("client-state");
+        fs::create_dir_all(library_root.join("Projects")).expect("project tree should exist");
+        fs::create_dir_all(library_root.join("Samples")).expect("sample tree should exist");
+        fs::write(
+            library_root.join("Projects").join("session.nki"),
+            b"Kontakt 7 /Samples/piano.wav",
+        )
+        .expect("project file should be written");
+        fs::write(
+            library_root.join("Samples").join("piano.wav"),
+            b"piano-sample",
+        )
+        .expect("sample should be written");
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let _bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-shared-runtime",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let service = Arc::new(Mutex::new(
+            FilesystemService::connect(
+                local_client_config(address.to_string(), &bundle_dir, "localhost"),
+                "studio-shared-runtime",
+                &client_state_dir,
+            )
+            .await
+            .expect("service should connect"),
+        ));
+        let mount = MountConfig {
+            mount_point: String::from("/tmp/legato-mount"),
+            library_root: String::from("/"),
+            state_dir: client_state_dir.to_string_lossy().into_owned(),
+        };
+        let _control_server = spawn_prefetch_control_server(&mount, Arc::clone(&service))
+            .await
+            .expect("control server should start");
+        let endpoint =
+            read_control_endpoint(&client_state_dir).expect("control endpoint should load");
+
+        let sample_handle = {
+            let mut service = service.lock().await;
+            service
+                .open("/Samples/piano.wav")
+                .await
+                .expect("sample open should succeed")
+        };
+
+        let prefetch = timeout(Duration::from_secs(10), async {
+            request_control_prefetch(&endpoint, "/Projects/session.nki").await
+        });
+        let read_loop = timeout(Duration::from_secs(10), async {
+            for _ in 0..8 {
+                let bytes = {
+                    let mut service = service.lock().await;
+                    service
+                        .read(sample_handle.local_handle, 0, 5)
+                        .await
+                        .expect("mounted read should succeed")
+                };
+                assert_eq!(bytes, b"piano");
+            }
+        });
+
+        let (prefetch, read_loop) = tokio::join!(prefetch, read_loop);
+        let report = prefetch
+            .expect("control prefetch request should complete")
+            .expect("control prefetch request should succeed");
+        read_loop.expect("mounted read loop should complete");
+
+        assert!(report.accepted > 0);
+        assert!(report.completed > 0);
+
+        {
+            let mut service = service.lock().await;
+            service
+                .release(sample_handle.local_handle)
+                .await
+                .expect("sample release should succeed");
+        }
+
+        let store = ClientLegatoStore::open(&client_state_dir, 0).expect("store should open");
+        assert!(
+            store.resolve_path("/Projects/session.nki").is_some(),
+            "project metadata should remain intact"
+        );
+        assert!(
+            store.resolve_path("/Samples/piano.wav").is_some(),
+            "sample metadata should remain intact"
+        );
+        assert!(
+            store.resident_extent_count() >= 2,
+            "expected resident extents for project and sample warm data"
+        );
     }
 }
