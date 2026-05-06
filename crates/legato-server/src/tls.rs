@@ -41,7 +41,7 @@ impl Default for ServerTlsConfig {
             key_path: String::from("/etc/legato/certs/server-key.pem"),
             client_ca_path: String::from("/etc/legato/certs/client-ca.pem"),
             server_names: vec![
-                String::from("legato.lan"),
+                String::from("legato.local.ahara.io"),
                 String::from("localhost"),
                 String::from("legato-server"),
             ],
@@ -63,7 +63,10 @@ impl ServerTlsConfig {
                 .join("client-ca.pem")
                 .to_string_lossy()
                 .into_owned(),
-            server_names: vec![String::from("legato.lan"), String::from("localhost")],
+            server_names: vec![
+                String::from("legato.local.ahara.io"),
+                String::from("localhost"),
+            ],
         }
     }
 }
@@ -248,6 +251,14 @@ pub fn ensure_server_tls_materials(
             &server_cert_path,
             &server_key_path,
             &client_ca_path,
+            &config.server_names,
+        )?;
+    } else {
+        refresh_server_identity_materials(
+            &server_ca_cert_path,
+            &server_ca_key_path,
+            &server_cert_path,
+            &server_key_path,
             &config.server_names,
         )?;
     }
@@ -444,6 +455,31 @@ fn generate_server_tls_materials(
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let issuer = CertifiedIssuer::self_signed(ca_params, ca_key).map_err(TlsConfigError::Rcgen)?;
 
+    write_file(server_ca_cert_path, issuer.pem(), 0o644)?;
+    write_file(server_ca_key_path, issuer.key().serialize_pem(), 0o600)?;
+    write_file(client_ca_path, issuer.pem(), 0o644)?;
+    sign_server_identity(server_cert_path, server_key_path, &issuer, server_names)?;
+
+    Ok(())
+}
+
+fn refresh_server_identity_materials(
+    server_ca_cert_path: &Path,
+    server_ca_key_path: &Path,
+    server_cert_path: &Path,
+    server_key_path: &Path,
+    server_names: &[String],
+) -> Result<(), TlsConfigError> {
+    let issuer = load_ca_issuer(server_ca_cert_path, server_ca_key_path)?;
+    sign_server_identity(server_cert_path, server_key_path, &issuer, server_names)
+}
+
+fn sign_server_identity(
+    server_cert_path: &Path,
+    server_key_path: &Path,
+    issuer: &Issuer<'_, KeyPair>,
+    server_names: &[String],
+) -> Result<(), TlsConfigError> {
     let server_key = KeyPair::generate().map_err(TlsConfigError::Rcgen)?;
     let mut server_params =
         CertificateParams::new(server_names.to_vec()).map_err(TlsConfigError::Rcgen)?;
@@ -459,14 +495,11 @@ fn generate_server_tls_materials(
         })
         .collect();
     let server_cert = server_params
-        .signed_by(&server_key, &issuer)
+        .signed_by(&server_key, issuer)
         .map_err(TlsConfigError::Rcgen)?;
 
-    write_file(server_ca_cert_path, issuer.pem(), 0o644)?;
-    write_file(server_ca_key_path, issuer.key().serialize_pem(), 0o600)?;
     write_file(server_cert_path, server_cert.pem(), 0o644)?;
     write_file(server_key_path, server_key.serialize_pem(), 0o600)?;
-    write_file(client_ca_path, issuer.pem(), 0o644)?;
 
     Ok(())
 }

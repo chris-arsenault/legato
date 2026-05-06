@@ -51,7 +51,7 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            endpoint: String::from("legato.lan:7823"),
+            endpoint: String::from("legato.local.ahara.io:7823"),
             cache: CacheConfig::default(),
             tls: ClientTlsConfig::default(),
             retry: RetryPolicy::default(),
@@ -79,7 +79,7 @@ impl Default for ClientTlsConfig {
             ca_cert_path: String::from("/etc/legato/certs/server-ca.pem"),
             client_cert_path: String::from("/etc/legato/certs/client.pem"),
             client_key_path: String::from("/etc/legato/certs/client-key.pem"),
-            server_name: String::from("legato.lan"),
+            server_name: String::from("legato.local.ahara.io"),
         }
     }
 }
@@ -905,7 +905,7 @@ mod tests {
 
         assert_eq!(attach.protocol_version, PROTOCOL_VERSION);
         assert_eq!(attach.client_name, "legatofs");
-        assert_eq!(runtime.config().endpoint, "legato.lan:7823");
+        assert_eq!(runtime.config().endpoint, "legato.local.ahara.io:7823");
         assert_eq!(runtime.config().retry, RetryPolicy::default());
     }
 

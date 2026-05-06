@@ -9,6 +9,9 @@ services:
       LEGATO_SERVER__COMMON__TRACING__LEVEL: "info"
       LEGATO_SERVER__COMMON__METRICS__BIND_ADDRESS: "0.0.0.0:9464"
       LEGATO_SERVER__COMMON__METRICS__PREFIX: "legato_server"
+      LEGATO_SERVER__SERVER__BOOTSTRAP__ADVERTISED_ENDPOINT: "legato.local.ahara.io:7823"
+      LEGATO_SERVER__SERVER__BOOTSTRAP__ADVERTISED_BOOTSTRAP_URL: "http://legato.local.ahara.io:7824"
+      LEGATO_SERVER__SERVER__BOOTSTRAP__SERVER_NAME: "legato.local.ahara.io"
     ports:
       - "7823:7823"
       - "7824:7824"
