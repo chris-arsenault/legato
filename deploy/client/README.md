@@ -74,6 +74,8 @@ The installer prompts for:
 - client name, defaulting to the computer name
 - mount point, defaulting to `L:\Legato`
 
+Windows mounts require the WinFsp MSI from `https://winfsp.dev/rel/`. The Legato installer validates the installed runtime and fixes the WinFsp registry compatibility key used by the client before starting the background task.
+
 The installer registers the client, installs the scheduled task, and starts the client before it exits.
 
 Default Windows runtime paths:

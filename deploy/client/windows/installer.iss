@@ -23,6 +23,8 @@ OutputBaseFilename=legatofs-{#MyAppVersion}-windows
 
 [Files]
 Source: "{#MyAppSourceDir}\legatofs.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\winfsp-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\ensure-winfsp.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\register-client.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\certs-README.txt"; DestDir: "{commonappdata}\Legato"; Flags: ignoreversion
 
@@ -82,6 +84,15 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\ensure-winfsp.ps1') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      RaiseException('Failed to verify the WinFsp runtime.');
+    end;
+    if ResultCode <> 0 then
+    begin
+      RaiseException('WinFsp runtime was not detected. Install WinFsp from https://winfsp.dev/rel/ and rerun this installer.');
+    end;
+
     BootstrapUrl := Trim(BootstrapPage.Values[0]);
 
     InstallArgs :=
