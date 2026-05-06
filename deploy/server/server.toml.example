@@ -1,6 +1,7 @@
 [common.tracing]
 json = true
 level = "info"
+log_dir = "/var/lib/legato/logs"
 
 [common.metrics]
 bind_address = "0.0.0.0:9464"

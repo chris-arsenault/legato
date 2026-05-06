@@ -4,12 +4,14 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::TcpListener,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{FoundationError, ShutdownToken};
@@ -21,6 +23,8 @@ pub struct TracingConfig {
     pub json: bool,
     /// Default filter expression when `RUST_LOG` is unset.
     pub level: String,
+    /// Optional directory for an append-only service log file.
+    pub log_dir: Option<String>,
 }
 
 impl Default for TracingConfig {
@@ -28,8 +32,22 @@ impl Default for TracingConfig {
         Self {
             json: false,
             level: String::from("info"),
+            log_dir: None,
         }
     }
+}
+
+/// Keeps any background tracing writer alive for the lifetime of the process.
+#[derive(Debug)]
+pub struct TracingGuard {
+    _file_guard: Option<WorkerGuard>,
+}
+
+#[derive(Debug)]
+struct TracingFileSink {
+    writer: NonBlocking,
+    guard: WorkerGuard,
+    path: PathBuf,
 }
 
 /// Metrics naming and bind conventions shared across binaries.
@@ -379,31 +397,100 @@ impl ProcessTelemetry {
 pub fn init_tracing(
     service_name: &str,
     tracing_config: &TracingConfig,
-) -> Result<(), FoundationError> {
+) -> Result<TracingGuard, FoundationError> {
     let env_filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(tracing_config.level.as_str()))?;
+    let file_sink = tracing_file_sink(service_name, tracing_config.log_dir.as_deref())?;
+    let file_path = file_sink.as_ref().map(|sink| sink.path.clone());
 
-    let formatting = fmt::layer().with_target(true).with_thread_ids(true);
-
-    if tracing_config.json {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                formatting
-                    .json()
-                    .with_current_span(false)
-                    .flatten_event(true),
-            )
-            .try_init()?;
+    let file_guard = if tracing_config.json {
+        let formatting = fmt::layer().with_target(true).with_thread_ids(true);
+        if let Some(sink) = file_sink {
+            let file_layer = fmt::layer()
+                .with_writer(sink.writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .json()
+                .with_current_span(false)
+                .flatten_event(true);
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    formatting
+                        .json()
+                        .with_current_span(false)
+                        .flatten_event(true),
+                )
+                .with(file_layer)
+                .try_init()?;
+            Some(sink.guard)
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(
+                    formatting
+                        .json()
+                        .with_current_span(false)
+                        .flatten_event(true),
+                )
+                .try_init()?;
+            None
+        }
     } else {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(formatting.compact())
-            .try_init()?;
-    }
+        let formatting = fmt::layer().with_target(true).with_thread_ids(true);
+        if let Some(sink) = file_sink {
+            let file_layer = fmt::layer()
+                .with_writer(sink.writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .compact();
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(formatting.compact())
+                .with(file_layer)
+                .try_init()?;
+            Some(sink.guard)
+        } else {
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(formatting.compact())
+                .try_init()?;
+            None
+        }
+    };
 
-    tracing::info!(service = service_name, "tracing initialized");
-    Ok(())
+    tracing::info!(
+        service = service_name,
+        log_path = file_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        "tracing initialized"
+    );
+    Ok(TracingGuard {
+        _file_guard: file_guard,
+    })
+}
+
+fn tracing_file_sink(
+    service_name: &str,
+    log_dir: Option<&str>,
+) -> Result<Option<TracingFileSink>, FoundationError> {
+    let Some(log_dir) = log_dir.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let log_dir = Path::new(log_dir);
+    std::fs::create_dir_all(log_dir)?;
+    let file_name = format!("{service_name}.log");
+    let path = log_dir.join(&file_name);
+    let file_appender = tracing_appender::rolling::never(log_dir, file_name);
+    let (writer, guard) = tracing_appender::non_blocking(file_appender);
+    Ok(Some(TracingFileSink {
+        writer,
+        guard,
+        path,
+    }))
 }
 
 /// Builds a namespaced metric name from a configured prefix and suffix.

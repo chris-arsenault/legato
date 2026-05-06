@@ -14,9 +14,8 @@ struct PrefetchProcessConfig {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let process_config = load_config::<PrefetchProcessConfig>(None, "LEGATO_PREFETCH")
-        .unwrap_or_else(|_| PrefetchProcessConfig::default());
-    init_tracing("legato-prefetch", &process_config.common.tracing)?;
+    let process_config = load_config::<PrefetchProcessConfig>(None, "LEGATO_PREFETCH")?;
+    let _tracing_guard = init_tracing("legato-prefetch", &process_config.common.tracing)?;
     let shutdown = ShutdownController::new();
     let telemetry = ProcessTelemetry::new("legato-prefetch", &process_config.common.metrics);
     telemetry.record_startup();

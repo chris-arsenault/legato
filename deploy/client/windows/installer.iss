@@ -34,6 +34,7 @@ Name: "{commonappdata}\Legato\certs"
 Name: "{commonappdata}\Legato\catalog"
 Name: "{commonappdata}\Legato\segments"
 Name: "{commonappdata}\Legato\checkpoints"
+Name: "{commonappdata}\Legato\logs"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{commonappdata}\Legato"

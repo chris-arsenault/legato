@@ -1,6 +1,7 @@
 [common.tracing]
 json = false
 level = "info"
+log_dir = "__STATE_DIR__/logs"
 
 [common.metrics]
 prefix = "legatofs"

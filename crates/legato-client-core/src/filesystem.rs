@@ -537,9 +537,18 @@ impl FilesystemService {
         {
             return;
         }
-        if self.transport.report_metrics(&snapshot).await.is_ok() {
-            self.last_metrics_report_ns = now_ns;
-            self.metrics_dirty = false;
+        match self.transport.report_metrics(&snapshot).await {
+            Ok(()) => {
+                self.last_metrics_report_ns = now_ns;
+                self.metrics_dirty = false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    samples = snapshot.len(),
+                    "client metrics report failed"
+                );
+            }
         }
     }
 

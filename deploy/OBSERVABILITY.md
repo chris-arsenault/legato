@@ -1,6 +1,6 @@
 # Legato Observability
 
-The default deployment exposes Prometheus metrics from `legato-server` on port `9464`.
+The default deployment exposes Prometheus metrics from `legato-server` on port `9464` and writes a persistent server log under `/var/lib/legato/logs/legato-server.log`.
 
 For Kibana/Elastic, the normal setup is one action: register a Prometheus scraper for the server endpoint.
 
@@ -78,6 +78,8 @@ Client logs are local host diagnostics:
 
 - macOS: `~/Library/Logs/Legato/`
 - Windows: `C:\ProgramData\Legato\logs\`
+
+New client installs also write a tracing log file named `legatofs.log` in the client log directory. The scheduled service still redirects stdout and stderr to `legatofs.out.log` and `legatofs.err.log`.
 
 The Windows client logs any mount callback or client metadata/read operation that takes longer than 250 ms. Slow lines include the operation name, path or handle, and elapsed milliseconds.
 

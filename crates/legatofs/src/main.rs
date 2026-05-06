@@ -60,6 +60,17 @@ impl Default for MountConfig {
     }
 }
 
+fn apply_client_operational_defaults(process_config: &mut ClientProcessConfig) {
+    if process_config.common.tracing.log_dir.is_none() {
+        process_config.common.tracing.log_dir = Some(
+            Path::new(&process_config.mount.state_dir)
+                .join("logs")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StartupContext {
     platform: ClientPlatform,
@@ -85,16 +96,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let runtime_config_path = runtime_config_path();
-    let process_config =
-        load_config::<ClientProcessConfig>(Some(&runtime_config_path), "LEGATO_FS")
-            .unwrap_or_else(|_| ClientProcessConfig::default());
+    let mut process_config =
+        load_config::<ClientProcessConfig>(Some(&runtime_config_path), "LEGATO_FS")?;
+    apply_client_operational_defaults(&mut process_config);
     let _state_lock = acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
-    init_tracing("legatofs", &process_config.common.tracing)?;
+    let _tracing_guard = init_tracing("legatofs", &process_config.common.tracing)?;
+    tracing::info!(
+        endpoint = process_config.client.endpoint.as_str(),
+        mount_point = process_config.mount.mount_point.as_str(),
+        state_dir = process_config.mount.state_dir.as_str(),
+        library_root = process_config.mount.library_root.as_str(),
+        "client runtime configured"
+    );
     let shutdown = ShutdownController::new();
     let telemetry = ProcessTelemetry::new("legatofs", &process_config.common.metrics);
     telemetry.record_startup();
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
+    if process_config.common.metrics.bind_address.is_none() {
+        tracing::info!("local client metrics exporter is disabled; metrics report through server");
+    }
 
     #[allow(unused_variables)]
     let startup = startup_context(&process_config.mount);
@@ -374,10 +395,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             action,
             config_path,
         } => {
-            let process_config = load_config::<ClientProcessConfig>(
+            let mut process_config = load_config::<ClientProcessConfig>(
                 config_path.as_deref().or(Some(default_config_path())),
                 "LEGATO_FS",
             )?;
+            apply_client_operational_defaults(&mut process_config);
             let report = match action {
                 CacheCommand::Status => cache_status_report(&process_config.mount)?,
                 CacheCommand::Repair => {
@@ -393,10 +415,11 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             Ok(())
         }
         Command::Doctor { config_path } => {
-            let process_config = load_config::<ClientProcessConfig>(
+            let mut process_config = load_config::<ClientProcessConfig>(
                 config_path.as_deref().or(Some(default_config_path())),
                 "LEGATO_FS",
             )?;
+            apply_client_operational_defaults(&mut process_config);
             let report = client_doctor_report(&process_config).await?;
             println!("{report}");
             Ok(())
@@ -501,8 +524,9 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             offset,
             size,
         } => {
-            let process_config =
+            let mut process_config =
                 load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
+            apply_client_operational_defaults(&mut process_config);
             let _state_lock = acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
             let mut service = FilesystemService::connect(
                 process_config.client.clone(),
@@ -563,6 +587,13 @@ async fn client_doctor_report(
         &Path::new(&process_config.mount.state_dir).join("segments"),
     )?;
     lines.push(format!("ok state_dir {}", process_config.mount.state_dir));
+
+    if let Some(log_dir) = &process_config.common.tracing.log_dir {
+        require_writable_directory("log_dir", Path::new(log_dir))?;
+        lines.push(format!("ok log_dir {log_dir}"));
+    } else {
+        lines.push(String::from("warn file_logging_disabled"));
+    }
 
     check_mount_prerequisite()?;
     lines.push(String::from("ok mount_runtime"));
@@ -1353,7 +1384,7 @@ fn install_client_bundle(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cert_dir = state_dir.join("certs");
     fs::create_dir_all(&cert_dir)?;
-    for child in ["catalog", "segments", "checkpoints"] {
+    for child in ["catalog", "segments", "checkpoints", "logs"] {
         fs::create_dir_all(state_dir.join(child))?;
     }
 
@@ -1498,13 +1529,14 @@ fn render_client_config(
     let ca_cert_path = config_literal_path(&state_dir_path.join("certs").join("server-ca.pem"));
     let client_cert_path = config_literal_path(&state_dir_path.join("certs").join("client.pem"));
     let client_key_path = config_literal_path(&state_dir_path.join("certs").join("client-key.pem"));
+    let log_dir = config_literal_path(&state_dir_path.join("logs"));
     let mount_point = config_literal_string(mount_point);
     let library_root = config_literal_string(library_root);
     let server_name = config_literal_string(server_name);
     let endpoint = config_literal_string(endpoint);
 
     format!(
-        "[common.tracing]\njson = false\nlevel = \"info\"\n\n\
+        "[common.tracing]\njson = false\nlevel = \"info\"\nlog_dir = \"{log_dir}\"\n\n\
          [common.metrics]\nprefix = \"legatofs\"\n\n\
          [client]\nendpoint = \"{endpoint}\"\n\n\
          [client.cache]\nmax_bytes = 1610612736000\n\n\
@@ -1823,12 +1855,14 @@ mod tests {
         let config =
             fs::read_to_string(state_dir.join("legatofs.toml")).expect("config should be readable");
         assert!(config.contains("endpoint = \"legato.lan:7823\""));
+        assert!(config.contains("log_dir = "));
         assert!(state_dir.join("certs").join("server-ca.pem").exists());
         assert!(state_dir.join("certs").join("client.pem").exists());
         assert!(state_dir.join("certs").join("client-key.pem").exists());
         assert!(state_dir.join("catalog").exists());
         assert!(state_dir.join("segments").exists());
         assert!(state_dir.join("checkpoints").exists());
+        assert!(state_dir.join("logs").exists());
     }
 
     #[test]

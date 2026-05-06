@@ -94,6 +94,14 @@ impl ClientBootstrapServices {
 
         let http_listener = TcpListener::bind(&config.bootstrap.bind_address).await?;
         let discovery_socket = UdpSocket::bind(&config.bootstrap.discovery_bind_address).await?;
+        tracing::info!(
+            http_bind_address = config.bootstrap.bind_address.as_str(),
+            discovery_bind_address = config.bootstrap.discovery_bind_address.as_str(),
+            advertised_endpoint = config.bootstrap.advertised_endpoint.as_deref(),
+            advertised_bootstrap_url = config.bootstrap.advertised_bootstrap_url.as_deref(),
+            server_name = config.bootstrap.server_name.as_deref(),
+            "client bootstrap services listening"
+        );
         let http_config = config.clone();
         let http_shutdown = shutdown.clone();
         let http_task = tokio::spawn(async move {
@@ -189,6 +197,14 @@ fn issue_bundle_response(
         resolve_server_name(config),
         payload.mount_point,
         payload.library_root.or_else(|| Some(String::from("/"))),
+    );
+    tracing::info!(
+        peer = %peer,
+        client_name = manifest.client_name.as_str(),
+        endpoint = manifest.endpoint.as_deref(),
+        server_name = manifest.server_name.as_deref(),
+        mount_point = manifest.mount_point.as_deref(),
+        "issued client bootstrap bundle"
     );
     Ok(issue_client_tls_bundle_payload(
         Path::new(&config.tls_dir),

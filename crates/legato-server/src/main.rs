@@ -7,7 +7,8 @@ use std::{
 
 use legato_client_cache::catalog::CatalogStore;
 use legato_foundation::{
-    CommonProcessConfig, ProcessTelemetry, ShutdownController, init_tracing, load_config,
+    CommonProcessConfig, MetricsConfig, ProcessTelemetry, ShutdownController, TracingConfig,
+    init_tracing, load_config,
 };
 use legato_server::{
     ClientBootstrapServices, ClientBundleManifest, LiveServer, ServerConfig, ServerRuntimeMetrics,
@@ -16,12 +17,52 @@ use legato_server::{
 };
 use serde::Deserialize;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ServerProcessConfig {
-    #[serde(default)]
+    #[serde(default = "default_server_common_config")]
     common: CommonProcessConfig,
     #[serde(default)]
     server: ServerConfig,
+}
+
+impl Default for ServerProcessConfig {
+    fn default() -> Self {
+        Self {
+            common: default_server_common_config(),
+            server: ServerConfig::default(),
+        }
+    }
+}
+
+fn default_server_common_config() -> CommonProcessConfig {
+    CommonProcessConfig {
+        tracing: TracingConfig {
+            json: true,
+            level: String::from("info"),
+            log_dir: Some(String::from("/var/lib/legato/logs")),
+        },
+        metrics: MetricsConfig {
+            bind_address: Some(String::from("0.0.0.0:9464")),
+            prefix: String::from("legato_server"),
+        },
+    }
+}
+
+fn apply_server_operational_defaults(process_config: &mut ServerProcessConfig) {
+    if process_config.common.tracing.log_dir.is_none() {
+        process_config.common.tracing.log_dir = Some(
+            Path::new(&process_config.server.state_dir)
+                .join("logs")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    if process_config.common.metrics.bind_address.is_none() {
+        process_config.common.metrics.bind_address = Some(String::from("0.0.0.0:9464"));
+    }
+    if process_config.common.metrics.prefix == "legato" {
+        process_config.common.metrics.prefix = String::from("legato_server");
+    }
 }
 
 #[tokio::main]
@@ -32,19 +73,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(Command::config_path)
         .map(Path::to_path_buf)
         .unwrap_or_else(default_config_path);
-    let process_config = load_config::<ServerProcessConfig>(Some(&config_path), "LEGATO_SERVER")
-        .unwrap_or_else(|_| ServerProcessConfig::default());
+    let mut process_config =
+        load_config::<ServerProcessConfig>(Some(&config_path), "LEGATO_SERVER")?;
+    apply_server_operational_defaults(&mut process_config);
 
     if let Some(command) = command {
         return run_command(command, &process_config);
     }
 
-    init_tracing("legato-server", &process_config.common.tracing)?;
+    let _tracing_guard = init_tracing("legato-server", &process_config.common.tracing)?;
     let shutdown = ShutdownController::new();
     let telemetry = ProcessTelemetry::new("legato-server", &process_config.common.metrics);
     telemetry.record_startup();
     telemetry.set_lifecycle_state("bootstrap", 1);
     let _metrics_exporter = telemetry.spawn_exporter(shutdown.token())?;
+    if process_config.common.metrics.bind_address.is_none() {
+        tracing::warn!("server metrics exporter is disabled");
+    }
     let server_metrics = ServerRuntimeMetrics::new(telemetry.clone());
     let _client_metrics_cleanup = server_metrics.spawn_client_metrics_cleanup(shutdown.token());
     ensure_server_tls_materials(
@@ -159,7 +204,7 @@ fn run_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Doctor { .. } => {
-            let report = server_doctor_report(&process_config.server)?;
+            let report = server_doctor_report(process_config)?;
             println!("{report}");
             Ok(())
         }
@@ -198,7 +243,10 @@ fn default_config_path() -> PathBuf {
     PathBuf::from("/etc/legato/server.toml")
 }
 
-fn server_doctor_report(config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+fn server_doctor_report(
+    process_config: &ServerProcessConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let config = &process_config.server;
     let mut lines = vec![String::from("legato-server doctor")];
 
     require_directory("library_root", Path::new(&config.library_root))?;
@@ -209,6 +257,20 @@ fn server_doctor_report(config: &ServerConfig) -> Result<String, Box<dyn std::er
 
     let bind_address = parse_bind_address(&config.bind_address)?;
     lines.push(format!("ok bind_address {bind_address}"));
+
+    if let Some(metrics_bind_address) = &process_config.common.metrics.bind_address {
+        let metrics_bind_address = parse_bind_address(metrics_bind_address)?;
+        lines.push(format!("ok metrics_bind_address {metrics_bind_address}"));
+    } else {
+        lines.push(String::from("warn metrics_disabled"));
+    }
+
+    if let Some(log_dir) = &process_config.common.tracing.log_dir {
+        require_writable_directory("log_dir", Path::new(log_dir))?;
+        lines.push(format!("ok log_dir {log_dir}"));
+    } else {
+        lines.push(String::from("warn file_logging_disabled"));
+    }
 
     ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)?;
     build_tls_server_config(&config.tls)?;
@@ -244,7 +306,7 @@ fn require_writable_directory(label: &str, path: &Path) -> Result<(), Box<dyn st
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Command, parse_command_impl, server_doctor_report};
+    use super::{Command, ServerProcessConfig, parse_command_impl, server_doctor_report};
     use legato_server::{ServerConfig, ServerTlsConfig};
     use tempfile::tempdir;
 
@@ -324,10 +386,16 @@ mod tests {
             bootstrap: Default::default(),
         };
 
-        let report = server_doctor_report(&config).expect("doctor should pass");
+        let report = server_doctor_report(&ServerProcessConfig {
+            common: Default::default(),
+            server: config,
+        })
+        .expect("doctor should pass");
 
         assert!(report.contains("ok library_root"));
         assert!(report.contains("ok state_dir"));
+        assert!(report.contains("warn metrics_disabled"));
+        assert!(report.contains("warn file_logging_disabled"));
         assert!(report.contains("ok tls_dir"));
         assert!(report.contains("ok canonical_store"));
     }

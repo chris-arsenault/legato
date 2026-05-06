@@ -264,9 +264,15 @@ impl Legato for LiveServer {
         &self,
         request: Request<AttachRequest>,
     ) -> Result<Response<AttachResponse>, Status> {
-        Ok(Response::new(self.shell.attach_response(
-            &request.into_inner().desired_capabilities,
-        )))
+        let desired_capabilities = request.into_inner().desired_capabilities;
+        let response = self.shell.attach_response(&desired_capabilities);
+        tracing::info!(
+            desired_capabilities = desired_capabilities.len(),
+            protocol_version = response.protocol_version,
+            server_name = response.server_name.as_str(),
+            "client attached"
+        );
+        Ok(Response::new(response))
     }
 
     async fn resolve(
@@ -364,6 +370,12 @@ impl Legato for LiveServer {
         let accepted_samples = self.metrics.as_ref().map_or(0, |metrics| {
             metrics.record_client_snapshot(&request.client_name, &samples)
         });
+        tracing::info!(
+            client_name = request.client_name.as_str(),
+            samples = samples.len(),
+            accepted_samples,
+            "client metrics report accepted"
+        );
         Ok(Response::new(ReportClientMetricsResponse {
             accepted_samples: accepted_samples as u32,
         }))
