@@ -141,6 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _prefetch_control =
             spawn_prefetch_control_server(&process_config.mount, Arc::clone(&service)).await?;
         telemetry.set_lifecycle_state("ready", 1);
+        tracing::info!(
+            server_name = server_name.as_str(),
+            mount_point = adapter.mount_point(),
+            platform = adapter.platform_name(),
+            library_root = process_config.mount.library_root.as_str(),
+            "client connected and mounting"
+        );
         println!(
             "legatofs connected to {} and mounting on {} for {}",
             server_name,
@@ -164,6 +171,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _prefetch_control =
             spawn_prefetch_control_server(&process_config.mount, Arc::clone(&service)).await?;
         telemetry.set_lifecycle_state("ready", 1);
+        tracing::info!(
+            server_name = server_name.as_str(),
+            mount_point = adapter.mount_point(),
+            platform = adapter.platform_name(),
+            library_root = process_config.mount.library_root.as_str(),
+            "client connected and mounting"
+        );
         println!(
             "legatofs connected to {} and mounting on {} for {}",
             server_name,
@@ -182,6 +196,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _ = service;
         telemetry.set_lifecycle_state("ready", 1);
+        tracing::info!(
+            server_name = server_name.as_str(),
+            "client connected on unsupported host"
+        );
         println!(
             "legatofs connected to {} and bootstrap ready for unsupported-host development",
             server_name
@@ -927,12 +945,18 @@ async fn spawn_prefetch_control_server(
     service: Arc<Mutex<FilesystemService>>,
 ) -> Result<PrefetchControlServer, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let local_addr = listener.local_addr()?;
     let endpoint = PrefetchControlEndpoint {
         host: String::from("127.0.0.1"),
-        port: listener.local_addr()?.port(),
+        port: local_addr.port(),
     };
     let endpoint_path = legato_prefetch::control_endpoint_path(Path::new(&mount.state_dir));
     write_control_endpoint(Path::new(&mount.state_dir), &endpoint)?;
+    tracing::info!(
+        endpoint = %local_addr,
+        endpoint_manifest = endpoint_path.to_string_lossy().as_ref(),
+        "prefetch control server listening"
+    );
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _peer)) = listener.accept().await else {
@@ -941,6 +965,10 @@ async fn spawn_prefetch_control_server(
             let service = Arc::clone(&service);
             tokio::spawn(async move {
                 if let Err(error) = handle_prefetch_control_connection(stream, service).await {
+                    tracing::warn!(
+                        error = %error,
+                        "local prefetch control request failed"
+                    );
                     eprintln!("legatofs local prefetch control request failed: {error}");
                 }
             });

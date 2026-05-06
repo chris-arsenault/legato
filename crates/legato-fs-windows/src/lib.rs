@@ -266,6 +266,11 @@ impl WindowsFilesystem {
         let started = Instant::now();
         let handle = service.open(path).await.map_err(map_error)?;
         if let Err(error) = prefetch_opened_project(service, &handle).await {
+            tracing::warn!(
+                path,
+                error = %error,
+                "project prefetch skipped"
+            );
             eprintln!("legato project prefetch skipped for {path}: {error}");
         }
         let result = Ok(WindowsOpenFile {

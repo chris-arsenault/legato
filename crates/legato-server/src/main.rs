@@ -103,9 +103,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_address = parse_bind_address(&process_config.server.bind_address)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
+    tracing::info!(
+        bind_address = %bind_address,
+        metrics_bind_address = process_config.common.metrics.bind_address.as_deref(),
+        bootstrap_bind_address = process_config.server.bootstrap.bind_address.as_str(),
+        discovery_bind_address = process_config.server.bootstrap.discovery_bind_address.as_str(),
+        state_dir = process_config.server.state_dir.as_str(),
+        tls_dir = process_config.server.tls_dir.as_str(),
+        "server runtime listening"
+    );
     let server = LiveServer::bootstrap_with_metrics(process_config.server, Some(server_metrics))?;
     let bound = server.bind(listener, Some(runtime_tls)).await?;
     telemetry.set_lifecycle_state("ready", 1);
+    tracing::info!("legato-server bootstrap ready");
     println!("legato-server bootstrap ready");
     tokio::signal::ctrl_c().await?;
     bound.shutdown().await
