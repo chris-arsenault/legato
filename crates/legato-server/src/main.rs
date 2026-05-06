@@ -316,7 +316,10 @@ fn require_writable_directory(label: &str, path: &Path) -> Result<(), Box<dyn st
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Command, ServerProcessConfig, parse_command_impl, server_doctor_report};
+    use super::{
+        Command, ServerProcessConfig, apply_server_operational_defaults, parse_command_impl,
+        server_doctor_report,
+    };
     use legato_server::{ServerConfig, ServerTlsConfig};
     use tempfile::tempdir;
 
@@ -375,6 +378,39 @@ mod tests {
             Some(Command::Doctor {
                 config_path: Some(PathBuf::from("/tmp/server.toml")),
             })
+        );
+    }
+
+    #[test]
+    fn process_config_accepts_partial_server_overlays() {
+        let mut config = toml::from_str::<ServerProcessConfig>(
+            r#"
+[common.tracing]
+log_dir = "/tmp/legato/logs"
+
+[common.metrics]
+bind_address = "0.0.0.0:9464"
+
+[server.bootstrap]
+advertised_endpoint = "192.168.66.3:7823"
+advertised_bootstrap_url = "http://192.168.66.3:7824"
+server_name = "legato.local.ahara.io"
+"#,
+        )
+        .expect("partial config should merge with defaults");
+        apply_server_operational_defaults(&mut config);
+
+        assert_eq!(config.server.bind_address, "0.0.0.0:7823");
+        assert_eq!(config.server.library_root, "/srv/libraries");
+        assert_eq!(config.server.state_dir, "/var/lib/legato");
+        assert_eq!(config.common.metrics.prefix, "legato_server");
+        assert_eq!(
+            config.server.bootstrap.advertised_endpoint.as_deref(),
+            Some("192.168.66.3:7823")
+        );
+        assert_eq!(
+            config.server.bootstrap.server_name.as_deref(),
+            Some("legato.local.ahara.io")
         );
     }
 

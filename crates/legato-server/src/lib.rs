@@ -59,6 +59,7 @@ pub enum ExtentFetchSource {
 
 /// Immutable bootstrap configuration for the server daemon.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 pub struct ServerConfig {
     /// TCP bind address for the gRPC listener.
     pub bind_address: String,

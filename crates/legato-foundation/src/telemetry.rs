@@ -18,6 +18,7 @@ use crate::{FoundationError, ShutdownToken};
 
 /// Tracing output configuration shared across Legato binaries.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct TracingConfig {
     /// Whether structured JSON output should be emitted.
     pub json: bool,
@@ -52,6 +53,7 @@ struct TracingFileSink {
 
 /// Metrics naming and bind conventions shared across binaries.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct MetricsConfig {
     /// Optional bind address for metrics exposition when a process serves metrics directly.
     pub bind_address: Option<String>,
