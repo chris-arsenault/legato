@@ -16,6 +16,7 @@ rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["time"] }
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+tracing = "0.1"
 
 [lints]
 workspace = true

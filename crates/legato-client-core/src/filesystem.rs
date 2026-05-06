@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use legato_client_cache::{
@@ -18,6 +18,8 @@ use legato_types::{FileId, FilesystemAttributes};
 use crate::{ClientConfig, ClientRuntimeMetrics, GrpcClientTransport, LocalControlPlane};
 
 const CLIENT_METRICS_REPORT_INTERVAL_NS: u64 = 5_000_000_000;
+const CHANGE_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
+const SLOW_OPERATION_WARN_AFTER: Duration = Duration::from_millis(250);
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -111,6 +113,7 @@ pub struct FilesystemService {
     store: ClientLegatoStore,
     metrics: Option<ClientRuntimeMetrics>,
     max_cache_bytes: u64,
+    last_change_sync_ns: u64,
     last_metrics_report_ns: u64,
     metrics_dirty: bool,
     next_handle: u64,
@@ -145,6 +148,7 @@ impl FilesystemService {
             store,
             metrics,
             max_cache_bytes,
+            last_change_sync_ns: 0,
             last_metrics_report_ns: 0,
             metrics_dirty: false,
             next_handle: 1,
@@ -191,10 +195,12 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
-        self.sync_changes().await?;
+        let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.control.resolve_path(path, now_ns) {
             self.report_metrics_if_due(false).await;
+            log_slow_operation("lookup", path, "cache", started.elapsed());
             return Ok(metadata_to_attributes(metadata));
         }
 
@@ -205,6 +211,7 @@ impl FilesystemService {
             .map_err(map_lookup_error(path))?;
         self.control.register_path(metadata.clone(), now_ns);
         self.report_metrics_if_due(false).await;
+        log_slow_operation("lookup", path, "remote", started.elapsed());
         Ok(metadata_to_attributes(metadata))
     }
 
@@ -213,10 +220,12 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
-        self.sync_changes().await?;
+        let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.control.list_dir(path, now_ns) {
             self.report_metrics_if_due(false).await;
+            log_slow_operation("read_dir", path, "cache", started.elapsed());
             return Ok(entries);
         }
 
@@ -227,6 +236,7 @@ impl FilesystemService {
             .map_err(map_lookup_error(path))?;
         self.control.register_dir(path, entries.clone(), now_ns);
         self.report_metrics_if_due(false).await;
+        log_slow_operation("read_dir", path, "remote", started.elapsed());
         Ok(entries)
     }
 
@@ -235,7 +245,8 @@ impl FilesystemService {
         &mut self,
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
-        self.sync_changes().await?;
+        let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let inode = self
             .transport
             .resolve(path.to_owned())
@@ -249,6 +260,7 @@ impl FilesystemService {
         self.open_handles
             .insert(handle.local_handle, handle.clone());
         self.report_metrics_if_due(false).await;
+        log_slow_operation("open", path, "remote", started.elapsed());
         Ok(handle)
     }
 
@@ -270,7 +282,7 @@ impl FilesystemService {
         size: u32,
     ) -> Result<Vec<u8>, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes().await?;
+        self.sync_changes_if_due(false).await?;
         let snapshot = self
             .open_handles
             .get(&local_handle)
@@ -327,6 +339,16 @@ impl FilesystemService {
             self.metrics_dirty = true;
         }
         self.report_metrics_if_due(false).await;
+        log_slow_read(
+            snapshot.path.as_str(),
+            offset,
+            size,
+            cache_hits,
+            cache_misses,
+            local_bytes,
+            remote_bytes,
+            started.elapsed(),
+        );
         Ok(bytes)
     }
 
@@ -374,16 +396,24 @@ impl FilesystemService {
         self.store.subscription_cursor()
     }
 
-    async fn sync_changes(&mut self) -> Result<(), FilesystemServiceError> {
+    async fn sync_changes_if_due(&mut self, force: bool) -> Result<(), FilesystemServiceError> {
+        let now_ns = now_monotonic_ns();
+        if !force && now_ns.saturating_sub(self.last_change_sync_ns) < CHANGE_SYNC_INTERVAL_NS {
+            return Ok(());
+        }
+        self.last_change_sync_ns = now_ns;
+        let started = Instant::now();
         match self
             .transport
             .change_records_since(self.store.subscription_cursor())
             .await
         {
             Ok(records) => {
+                let record_count = records.len();
                 for record in records {
                     self.apply_change_record(&record)?;
                 }
+                log_slow_change_sync(record_count, started.elapsed());
                 Ok(())
             }
             Err(error) if should_retry_after_reconnect(&error) => {
@@ -400,6 +430,7 @@ impl FilesystemService {
                 {
                     self.apply_change_record(&record)?;
                 }
+                log_slow_change_sync(0, started.elapsed());
                 Ok(())
             }
             Err(error) => Err(FilesystemServiceError::Transport(error)),
@@ -435,7 +466,7 @@ impl FilesystemService {
                     metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
                     self.metrics_dirty = true;
                 }
-                self.sync_changes().await?;
+                self.sync_changes_if_due(true).await?;
                 let refreshed = self
                     .open_handles
                     .get(&handle.local_handle)
@@ -643,6 +674,61 @@ fn map_lookup_error<'a>(
             FilesystemServiceError::NotFound(path.to_owned())
         }
         _ => FilesystemServiceError::Transport(error),
+    }
+}
+
+fn log_slow_operation(
+    operation: &'static str,
+    path: &str,
+    source: &'static str,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_OPERATION_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            source,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow client filesystem operation"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_slow_read(
+    path: &str,
+    offset: u64,
+    size: u32,
+    cache_hits: u64,
+    cache_misses: u64,
+    local_bytes: u64,
+    remote_bytes: u64,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_OPERATION_WARN_AFTER {
+        tracing::warn!(
+            operation = "read",
+            path,
+            offset,
+            size,
+            cache_hits,
+            cache_misses,
+            local_bytes,
+            remote_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow client filesystem operation"
+        );
+    }
+}
+
+fn log_slow_change_sync(records: usize, elapsed: Duration) {
+    if elapsed >= SLOW_OPERATION_WARN_AFTER {
+        tracing::warn!(
+            operation = "sync_changes",
+            records,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow client filesystem operation"
+        );
     }
 }
 

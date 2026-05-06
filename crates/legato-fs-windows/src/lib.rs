@@ -6,6 +6,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
@@ -40,6 +41,7 @@ const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 const WINDOWS_TICKS_PER_SECOND: u64 = 10_000_000;
 #[cfg(target_os = "windows")]
 const WINDOWS_UNIX_EPOCH_OFFSET_SECONDS: u64 = 11_644_473_600;
+const SLOW_CALLBACK_WARN_AFTER: Duration = Duration::from_millis(250);
 
 /// Adapter wrapper for the Windows filesystem surface.
 #[derive(Debug)]
@@ -214,11 +216,14 @@ impl WindowsFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<WindowsAttributes, PlatformErrorCode> {
-        service
+        let started = Instant::now();
+        let result = service
             .lookup(path)
             .await
             .map(|attributes| self.translate_attributes(&attributes))
-            .map_err(map_error)
+            .map_err(map_error);
+        log_slow_callback("adapter_lookup", path, started.elapsed());
+        result
     }
 
     /// Enumerates one directory through the shared filesystem service.
@@ -227,11 +232,29 @@ impl WindowsFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<Vec<WindowsDirectoryEntry>, PlatformErrorCode> {
-        service
+        let started = Instant::now();
+        let result = service
             .read_dir(path)
             .await
-            .map(|entries| entries.into_iter().map(translate_directory_entry).collect())
-            .map_err(map_error)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(translate_directory_entry)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(map_error);
+        match &result {
+            Ok(entries) => {
+                log_slow_callback_with_count(
+                    "adapter_read_dir",
+                    path,
+                    entries.len(),
+                    started.elapsed(),
+                );
+            }
+            Err(_) => log_slow_callback("adapter_read_dir", path, started.elapsed()),
+        }
+        result
     }
 
     /// Opens one file through the shared filesystem service.
@@ -240,14 +263,17 @@ impl WindowsFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<WindowsOpenFile, PlatformErrorCode> {
+        let started = Instant::now();
         let handle = service.open(path).await.map_err(map_error)?;
         if let Err(error) = prefetch_opened_project(service, &handle).await {
             eprintln!("legato project prefetch skipped for {path}: {error}");
         }
-        Ok(WindowsOpenFile {
+        let result = Ok(WindowsOpenFile {
             handle: handle.local_handle,
             attributes: self.translate_attributes(&attributes_from_open_handle(&handle)),
-        })
+        });
+        log_slow_callback("adapter_open", path, started.elapsed());
+        result
     }
 
     /// Reads one byte range from a previously opened file.
@@ -258,7 +284,19 @@ impl WindowsFilesystem {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, PlatformErrorCode> {
-        service.read(handle, offset, size).await.map_err(map_error)
+        let started = Instant::now();
+        let result = service.read(handle, offset, size).await.map_err(map_error);
+        if let Ok(bytes) = &result {
+            log_slow_read_callback(
+                "adapter_read",
+                handle,
+                offset,
+                size,
+                bytes.len(),
+                started.elapsed(),
+            );
+        }
+        result
     }
 
     /// Releases one open file handle.
@@ -408,8 +446,10 @@ impl FileSystemContext for WindowsMountService {
         _security_descriptor: Option<&mut [c_void]>,
         _reparse_point_resolver: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        let started = Instant::now();
         let path = self.winfsp_path(file_name);
         let attributes = self.lookup_attributes(&path)?;
+        log_slow_callback("winfsp_get_security_by_name", &path, started.elapsed());
         Ok(FileSecurity {
             reparse: false,
             sz_security_descriptor: 0,
@@ -424,6 +464,7 @@ impl FileSystemContext for WindowsMountService {
         _granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let started = Instant::now();
         let path = self.winfsp_path(file_name);
         let attributes = self.lookup_attributes(&path)?;
         let local_handle = if attributes.directory {
@@ -432,12 +473,14 @@ impl FileSystemContext for WindowsMountService {
             Some(self.open_file(&path, file_info.as_mut())?)
         };
         fill_file_info(file_info.as_mut(), &attributes);
-        Ok(WinfspFileContext {
+        let context = WinfspFileContext {
             path,
             local_handle,
             attributes,
             directory_buffer: DirBuffer::new(),
-        })
+        };
+        log_slow_callback("winfsp_open", &context.path, started.elapsed());
+        Ok(context)
     }
 
     fn close(&self, context: Self::FileContext) {
@@ -473,13 +516,22 @@ impl FileSystemContext for WindowsMountService {
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let started = Instant::now();
         if !context.attributes.directory {
             return Err(FspError::IO(std::io::ErrorKind::NotADirectory));
         }
         if marker.is_none() {
             self.fill_directory_buffer(context)?;
         }
-        Ok(context.directory_buffer.read(marker, buffer))
+        let bytes = context.directory_buffer.read(marker, buffer);
+        log_slow_read_directory_callback(
+            "winfsp_read_directory",
+            &context.path,
+            buffer.len(),
+            bytes,
+            started.elapsed(),
+        );
+        Ok(bytes)
     }
 
     fn read(
@@ -488,12 +540,21 @@ impl FileSystemContext for WindowsMountService {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        let started = Instant::now();
         let handle = context
             .local_handle
             .ok_or(FspError::IO(std::io::ErrorKind::IsADirectory))?;
         let bytes = self.read_file(handle, offset, buffer.len() as u32)?;
         let bytes_read = bytes.len();
         buffer[..bytes_read].copy_from_slice(&bytes);
+        log_slow_read_callback(
+            "winfsp_read",
+            handle,
+            offset,
+            buffer.len() as u32,
+            bytes_read,
+            started.elapsed(),
+        );
         Ok(bytes_read as u32)
     }
 
@@ -524,7 +585,8 @@ impl WindowsMountService {
     }
 
     fn lookup_attributes(&self, path: &str) -> winfsp::Result<WindowsAttributes> {
-        self.runtime.block_on(async {
+        let started = Instant::now();
+        let result = self.runtime.block_on(async {
             self.service
                 .lock()
                 .await
@@ -532,11 +594,14 @@ impl WindowsMountService {
                 .await
                 .map(|attributes| WindowsFilesystem::new("").translate_attributes(&attributes))
                 .map_err(map_mount_error)
-        })
+        });
+        log_slow_callback("runtime_lookup", path, started.elapsed());
+        result
     }
 
     fn open_file(&self, path: &str, file_info: &mut FileInfo) -> winfsp::Result<u64> {
-        self.runtime.block_on(async {
+        let started = Instant::now();
+        let result = self.runtime.block_on(async {
             let handle = self
                 .service
                 .lock()
@@ -548,18 +613,32 @@ impl WindowsMountService {
                 .translate_attributes(&attributes_from_open_handle(&handle));
             fill_file_info(file_info, &attributes);
             Ok(handle.local_handle)
-        })
+        });
+        log_slow_callback("runtime_open", path, started.elapsed());
+        result
     }
 
     fn read_file(&self, handle: u64, offset: u64, size: u32) -> winfsp::Result<Vec<u8>> {
-        self.runtime.block_on(async {
+        let started = Instant::now();
+        let result = self.runtime.block_on(async {
             self.service
                 .lock()
                 .await
                 .read(handle, offset, size)
                 .await
                 .map_err(map_mount_error)
-        })
+        });
+        if let Ok(bytes) = &result {
+            log_slow_read_callback(
+                "runtime_read",
+                handle,
+                offset,
+                size,
+                bytes.len(),
+                started.elapsed(),
+            );
+        }
+        result
     }
 
     fn release_file(&self, handle: u64) -> winfsp::Result<()> {
@@ -574,6 +653,7 @@ impl WindowsMountService {
     }
 
     fn fill_directory_buffer(&self, context: &WinfspFileContext) -> winfsp::Result<()> {
+        let started = Instant::now();
         let entries = self.runtime.block_on(async {
             self.service
                 .lock()
@@ -587,12 +667,17 @@ impl WindowsMountService {
             .acquire(true, Some(entries.len().saturating_add(2) as u32))?;
         write_dir_entry(&lock, ".", &context.attributes)?;
         write_dir_entry(&lock, "..", &context.attributes)?;
+        let entry_count = entries.len();
         for entry in entries {
-            let mut attributes = self.lookup_attributes(&entry.path)?;
-            attributes.file_index = entry.file_id;
-            attributes.directory = entry.is_dir;
+            let attributes = attributes_from_directory_entry(&entry);
             write_dir_entry(&lock, &entry.name, &attributes)?;
         }
+        log_slow_callback_with_count(
+            "runtime_fill_directory_buffer",
+            &context.path,
+            entry_count,
+            started.elapsed(),
+        );
         Ok(())
     }
 }
@@ -668,6 +753,87 @@ fn translate_directory_entry(entry: DirectoryEntry) -> WindowsDirectoryEntry {
         file_index: entry.file_id,
         path: entry.path,
         directory: entry.is_dir,
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn attributes_from_directory_entry(entry: &DirectoryEntry) -> WindowsAttributes {
+    WindowsAttributes {
+        file_index: entry.file_id,
+        allocation_size: 0,
+        end_of_file: 0,
+        mtime_ns: 0,
+        directory: entry.is_dir,
+        read_only: true,
+    }
+}
+
+fn log_slow_callback(operation: &'static str, path: &str, elapsed: Duration) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow Windows filesystem callback"
+        );
+    }
+}
+
+fn log_slow_callback_with_count(
+    operation: &'static str,
+    path: &str,
+    entries: usize,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            entries,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow Windows filesystem callback"
+        );
+    }
+}
+
+fn log_slow_read_callback(
+    operation: &'static str,
+    handle: u64,
+    offset: u64,
+    requested_size: u32,
+    actual_size: usize,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            handle,
+            offset,
+            requested_size,
+            actual_size,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow Windows filesystem callback"
+        );
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn log_slow_read_directory_callback(
+    operation: &'static str,
+    path: &str,
+    buffer_size: usize,
+    bytes_read: u32,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            buffer_size,
+            bytes_read,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow Windows filesystem callback"
+        );
     }
 }
 

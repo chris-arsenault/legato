@@ -24,6 +24,8 @@ use legato_proto::{
     legato_client::LegatoClient,
 };
 
+const CHANGE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Session metadata returned after a successful attach.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientAttachSession {
@@ -410,7 +412,7 @@ impl GrpcClientTransport {
             .into_inner();
         let mut records = Vec::new();
         loop {
-            match timeout(Duration::from_secs(5), stream.message()).await {
+            match timeout(CHANGE_STREAM_IDLE_TIMEOUT, stream.message()).await {
                 Ok(Ok(Some(record))) => {
                     if ChangeKind::try_from(record.kind).unwrap_or(ChangeKind::Unspecified)
                         == ChangeKind::Checkpoint
@@ -421,7 +423,15 @@ impl GrpcClientTransport {
                 }
                 Ok(Ok(None)) => break,
                 Ok(Err(error)) => return Err(error.into()),
-                Err(_) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        since_sequence,
+                        records = records.len(),
+                        timeout_ms = CHANGE_STREAM_IDLE_TIMEOUT.as_millis() as u64,
+                        "change stream idle timeout before checkpoint"
+                    );
+                    break;
+                }
             }
         }
         Ok(records)

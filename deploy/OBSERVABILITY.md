@@ -79,4 +79,6 @@ Client logs are local host diagnostics:
 - macOS: `~/Library/Logs/Legato/`
 - Windows: `C:\ProgramData\Legato\logs\`
 
+The Windows client logs any mount callback or client metadata/read operation that takes longer than 250 ms. Slow lines include the operation name, path or handle, and elapsed milliseconds.
+
 You do not need client log shipping for the normal Kibana dashboard because client runtime metrics flow back through the server metrics endpoint.

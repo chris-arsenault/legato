@@ -35,6 +35,8 @@ use legato_proto::{
     SubscribeChangesRequest, SubscribeRequest,
     legato_server::{Legato, LegatoServer},
 };
+
+const SLOW_RPC_WARN_AFTER: Duration = Duration::from_millis(250);
 use legato_types::FileId;
 
 use crate::{
@@ -271,6 +273,7 @@ impl Legato for LiveServer {
         &self,
         request: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
+        let started = Instant::now();
         let path = logical_request_path(
             Path::new(&self.config.library_root),
             &request.into_inner().path,
@@ -284,6 +287,7 @@ impl Legato for LiveServer {
             .cloned()
             .ok_or_else(|| Status::not_found("path not found"))
             .map(inode_to_proto)?;
+        log_slow_rpc("resolve", &path, started.elapsed());
         Ok(Response::new(ResolveResponse { inode: Some(inode) }))
     }
 
@@ -291,7 +295,9 @@ impl Legato for LiveServer {
         &self,
         request: Request<FetchRequest>,
     ) -> Result<Response<Self::FetchStream>, Status> {
+        let rpc_started = Instant::now();
         let request = request.into_inner();
+        let requested_extents = request.extents.len();
         let catalog = self.catalog.lock().await;
         let mut records = Vec::with_capacity(request.extents.len());
         for extent in request.extents {
@@ -333,6 +339,7 @@ impl Legato for LiveServer {
             });
         }
         let stream = tokio_stream::iter(records.into_iter().map(Ok));
+        log_slow_rpc_with_count("fetch", "", requested_extents, rpc_started.elapsed());
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -419,6 +426,7 @@ impl Legato for LiveServer {
     }
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
+        let started = Instant::now();
         let path = logical_request_path(
             Path::new(&self.config.library_root),
             &request.into_inner().path,
@@ -434,6 +442,7 @@ impl Legato for LiveServer {
                 metadata: Some(catalog_inode_to_metadata(inode)),
             })
             .ok_or_else(|| Status::not_found("path not found"))?;
+        log_slow_rpc("stat", &path, started.elapsed());
         Ok(Response::new(response))
     }
 
@@ -441,6 +450,7 @@ impl Legato for LiveServer {
         &self,
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
+        let started = Instant::now();
         let path = logical_request_path(
             Path::new(&self.config.library_root),
             &request.into_inner().path,
@@ -463,6 +473,7 @@ impl Legato for LiveServer {
                     .collect(),
             })
             .ok_or_else(|| Status::not_found("directory not found"))?;
+        log_slow_rpc_with_count("list_dir", &path, response.entries.len(), started.elapsed());
         Ok(Response::new(response))
     }
 
@@ -470,6 +481,7 @@ impl Legato for LiveServer {
         &self,
         request: Request<ResolvePathRequest>,
     ) -> Result<Response<ResolvePathResponse>, Status> {
+        let started = Instant::now();
         let path = logical_request_path(
             Path::new(&self.config.library_root),
             &request.into_inner().path,
@@ -485,6 +497,7 @@ impl Legato for LiveServer {
                 metadata: Some(catalog_inode_to_metadata(inode)),
             })
             .ok_or_else(|| Status::not_found("path not found"))?;
+        log_slow_rpc("resolve_path", &path, started.elapsed());
         Ok(Response::new(response))
     }
 
@@ -573,6 +586,29 @@ fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, St
             .collect::<BTreeMap<_, _>>(),
         value: metric.value,
     })
+}
+
+fn log_slow_rpc(operation: &'static str, path: &str, elapsed: Duration) {
+    if elapsed >= SLOW_RPC_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow server rpc"
+        );
+    }
+}
+
+fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, elapsed: Duration) {
+    if elapsed >= SLOW_RPC_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow server rpc"
+        );
+    }
 }
 
 #[cfg(test)]

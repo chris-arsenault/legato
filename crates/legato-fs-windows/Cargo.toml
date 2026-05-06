@@ -12,6 +12,7 @@ legato-prefetch = { path = "../legato-prefetch" }
 legato-proto = { path = "../legato-proto" }
 legato-types = { path = "../legato-types" }
 tokio = { version = "1", features = ["rt", "sync"] }
+tracing = "0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winfsp = { version = "0.12.4", features = ["system", "windows-61"] }
