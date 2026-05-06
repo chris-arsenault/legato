@@ -24,6 +24,12 @@ http://<server>:7824/v1/client-bundles
 
 Installers first try UDP discovery. If discovery is blocked by the network, enter the bootstrap URL in the setup UI.
 
+For the default LAN deployment in this repository, enter:
+
+```text
+http://192.168.66.3:7824
+```
+
 ## macOS
 
 Install the package:

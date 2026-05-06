@@ -35,6 +35,8 @@ The canonical host-to-container mount mapping for that layout is:
 
 The compose stack runs `legato-server` as `${LEGATO_UID}:${LEGATO_GID}` so the process can read and write mounted datasets without relying on the image's baked-in default UID.
 
+The default compose port mappings bind the host side to `192.168.66.3` only. The listeners remain `0.0.0.0` inside the container so Docker can publish them on that specific LAN address.
+
 ## TLS And Client Bundles
 
 On first boot, `legato-server` generates its local CA and listener certificate under `/etc/legato/certs` if they do not already exist.
@@ -61,8 +63,8 @@ Manual bundle issuing remains available for recovery or offline installs:
 docker exec legato-server legato-server issue-client \
   --name studio-mac \
   --output-dir /tmp/studio-mac \
-  --endpoint legato.local.ahara.io:443 \
-  --server-name legato.local.ahara.io
+  --endpoint 192.168.66.3:7823 \
+  --server-name 192.168.66.3
 ```
 
 That writes:

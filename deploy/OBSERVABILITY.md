@@ -8,7 +8,7 @@ For Kibana/Elastic, the normal setup is one action: register a Prometheus scrape
 http://192.168.66.3:9464/metrics
 ```
 
-If your server is not named `legato.local.ahara.io`, use the server host or IP instead.
+If your server uses a different LAN address, use that host or IP instead.
 
 ## What Gets Scraped
 

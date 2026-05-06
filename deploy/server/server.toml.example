@@ -16,12 +16,12 @@ tls_dir = "/etc/legato/certs"
 cert_path = "/etc/legato/certs/server.pem"
 key_path = "/etc/legato/certs/server-key.pem"
 client_ca_path = "/etc/legato/certs/client-ca.pem"
-server_names = ["legato.local.ahara.io", "localhost", "legato-server"]
+server_names = ["192.168.66.3", "localhost", "legato-server"]
 
 [server.bootstrap]
 enabled = true
 bind_address = "0.0.0.0:7824"
 discovery_bind_address = "0.0.0.0:7825"
-advertised_endpoint = "legato.local.ahara.io:443"
+advertised_endpoint = "192.168.66.3:7823"
 advertised_bootstrap_url = "http://192.168.66.3:7824"
-server_name = "legato.local.ahara.io"
+server_name = "192.168.66.3"
