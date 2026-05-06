@@ -6,7 +6,7 @@ level = "info"
 prefix = "legatofs"
 
 [client]
-endpoint = "legato.local.ahara.io:7823"
+endpoint = "legato.local.ahara.io:443"
 
 [client.cache]
 max_bytes = 1610612736000

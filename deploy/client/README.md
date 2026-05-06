@@ -117,7 +117,7 @@ legatofs service start
 Re-run client setup against an explicit bootstrap URL:
 
 ```bash
-legatofs install --bootstrap-url http://legato.local.ahara.io:7824 --force
+legatofs install --bootstrap-url http://192.168.66.3:7824 --force
 legatofs service install --force
 legatofs service start
 ```

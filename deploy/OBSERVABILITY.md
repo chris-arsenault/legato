@@ -5,7 +5,7 @@ The default deployment exposes Prometheus metrics from `legato-server` on port `
 For Kibana/Elastic, the normal setup is one action: register a Prometheus scraper for the server endpoint.
 
 ```text
-http://legato.local.ahara.io:9464/metrics
+http://192.168.66.3:9464/metrics
 ```
 
 If your server is not named `legato.local.ahara.io`, use the server host or IP instead.
@@ -35,7 +35,7 @@ Use Elastic Agent's Prometheus integration.
 
 Configure:
 
-- Host: `http://legato.local.ahara.io:9464`
+- Host: `http://192.168.66.3:9464`
 - Metrics path: `/metrics`
 - Scrape interval: `15s` or `30s`
 
