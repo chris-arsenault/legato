@@ -35,6 +35,9 @@ Name: "{commonappdata}\Legato\catalog"
 Name: "{commonappdata}\Legato\segments"
 Name: "{commonappdata}\Legato\checkpoints"
 
+[UninstallDelete]
+Type: filesandordirs; Name: "{commonappdata}\Legato"
+
 [Icons]
 Name: "{group}\Legato Config"; Filename: "{commonappdata}\Legato\legatofs.toml"
 Name: "{group}\Register Legato Client"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\register-client.ps1"""
@@ -45,6 +48,22 @@ var
   BootstrapPage: TInputQueryWizardPage;
   ClientNamePage: TInputQueryWizardPage;
   MountPointPage: TInputQueryWizardPage;
+
+procedure RunCleanupCommand(FileName: string; Parameters: string);
+var
+  ResultCode: Integer;
+begin
+  Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CleanupLegatoRuntime;
+begin
+  RunCleanupCommand(ExpandConstant('{app}\legatofs.exe'), 'service stop');
+  RunCleanupCommand(ExpandConstant('{app}\legatofs.exe'), 'service uninstall');
+  RunCleanupCommand(ExpandConstant('{sys}\schtasks.exe'), '/End /TN LegatoFS');
+  RunCleanupCommand(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN LegatoFS /F');
+  RunCleanupCommand(ExpandConstant('{sys}\taskkill.exe'), '/IM legatofs.exe /F');
+end;
 
 procedure InitializeWizard;
 begin
@@ -132,5 +151,13 @@ begin
     begin
       RaiseException('Legato scheduled task start failed.');
     end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    CleanupLegatoRuntime;
   end;
 end;

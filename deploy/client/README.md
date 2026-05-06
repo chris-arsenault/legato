@@ -137,4 +137,6 @@ legatofs service stop
 legatofs service uninstall
 ```
 
-Delete the state directory only if you intentionally want the client to rebuild its local cache from the server.
+The Windows uninstaller stops the Legato task, removes the scheduled task, and deletes `C:\ProgramData\Legato`, including generated certs, config, cache, catalog, and logs. It does not uninstall WinFsp because WinFsp is a shared system runtime that other tools may use.
+
+Delete the state directory manually only if you are using the CLI service commands instead of the Windows uninstaller and intentionally want the client to rebuild its local cache from the server.
