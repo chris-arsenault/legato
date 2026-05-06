@@ -104,6 +104,8 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    CleanupLegatoRuntime;
+
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\ensure-winfsp.ps1') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     begin
       RaiseException('Failed to verify the WinFsp runtime.');

@@ -8,6 +8,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "windows")]
+use std::time::Instant;
+
 use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{ClientConfig, ClientRuntimeMetrics, FilesystemService};
 use legato_foundation::{
@@ -666,7 +669,7 @@ fn run_service_command(
     match action {
         ServiceCommand::Install => install_mount_agent_service(&config_path, force),
         ServiceCommand::Uninstall => uninstall_mount_agent_service(),
-        ServiceCommand::Start => start_mount_agent_service(),
+        ServiceCommand::Start => start_mount_agent_service(&config_path),
         ServiceCommand::Stop => stop_mount_agent_service(),
         ServiceCommand::Status => status_mount_agent_service(),
     }
@@ -709,8 +712,8 @@ fn install_mount_agent_service(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     require_readable_file("legatofs config", config_path)?;
-    let task = windows_task_command(config_path)?;
     fs::create_dir_all(windows_log_dir())?;
+    let task = windows_task_command(config_path)?;
     let mut command = ProcessCommand::new("schtasks");
     command.args([
         "/Create",
@@ -771,7 +774,7 @@ fn uninstall_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
+fn start_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let definition = macos_service_definition(&runtime_config_path())?;
     run_process(
         process_with_args(
@@ -802,17 +805,23 @@ fn start_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "windows")]
-fn start_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
+fn start_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     run_process(
         process_with_args("schtasks", ["/Run", "/TN", LEGATO_WINDOWS_TASK_NAME]),
         "start scheduled task",
     )?;
-    println!("started scheduled task {}", LEGATO_WINDOWS_TASK_NAME);
+    let mut process_config = load_config::<ClientProcessConfig>(Some(config_path), "LEGATO_FS")?;
+    apply_client_operational_defaults(&mut process_config);
+    wait_for_windows_mount_point(&process_config.mount.mount_point, Duration::from_secs(30))?;
+    println!(
+        "started scheduled task {} and mounted {}",
+        LEGATO_WINDOWS_TASK_NAME, process_config.mount.mount_point
+    );
     Ok(())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn start_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
+fn start_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Err("legatofs service start is only supported on macOS and Windows".into())
 }
 
@@ -1329,28 +1338,87 @@ fn macos_service_definition(
 #[cfg(target_os = "windows")]
 fn windows_task_command(config_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let executable = env::current_exe()?;
-    Ok(windows_task_command_for_executable(
-        &executable,
-        config_path,
-        &windows_log_dir(),
-    ))
+    let log_dir = windows_log_dir();
+    let wrapper_path = windows_task_wrapper_path(&log_dir);
+    fs::write(
+        &wrapper_path,
+        render_windows_task_wrapper(
+            &executable,
+            config_path,
+            &log_dir.join("legatofs.out.log"),
+            &log_dir.join("legatofs.err.log"),
+        ),
+    )?;
+    Ok(windows_task_command_for_wrapper(&wrapper_path))
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_task_command_for_executable(
+fn render_windows_task_wrapper(
     executable: &Path,
     config_path: &Path,
-    log_dir: &Path,
+    stdout_log: &Path,
+    stderr_log: &Path,
 ) -> String {
-    let stdout_log = log_dir.join("legatofs.out.log");
-    let stderr_log = log_dir.join("legatofs.err.log");
     format!(
-        "cmd.exe /C \"set LEGATO_FS_CONFIG={}&& \"{}\" >> \"{}\" 2>> \"{}\"\"",
-        config_path.display(),
-        executable.display(),
-        stdout_log.display(),
-        stderr_log.display()
+        "Set shell = CreateObject(\"WScript.Shell\")\r\n\
+         Set env = shell.Environment(\"PROCESS\")\r\n\
+         env(\"LEGATO_FS_CONFIG\") = \"{}\"\r\n\
+         quote = Chr(34)\r\n\
+         command = quote & \"{}\" & quote & \" >> \" & quote & \"{}\" & quote & \" 2>> \" & quote & \"{}\" & quote\r\n\
+         exitCode = shell.Run(\"%ComSpec% /D /S /C \" & quote & command & quote, 0, True)\r\n\
+         WScript.Quit exitCode\r\n",
+        vbs_escape(config_path.to_string_lossy().as_ref()),
+        vbs_escape(executable.to_string_lossy().as_ref()),
+        vbs_escape(stdout_log.to_string_lossy().as_ref()),
+        vbs_escape(stderr_log.to_string_lossy().as_ref())
     )
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_task_command_for_wrapper(wrapper_path: &Path) -> String {
+    format!("wscript.exe \"{}\"", wrapper_path.display())
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_task_wrapper_path(log_dir: &Path) -> PathBuf {
+    log_dir.join("run-legatofs.vbs")
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_mount_probe_path(mount_point: &str) -> PathBuf {
+    let mount_point = mount_point.trim();
+    if mount_point.len() == 2 && mount_point.ends_with(':') {
+        return PathBuf::from(format!("{mount_point}\\"));
+    }
+    PathBuf::from(mount_point)
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_windows_mount_point(
+    mount_point: &str,
+    timeout_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let probe_path = windows_mount_probe_path(mount_point);
+    loop {
+        if probe_path.exists() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout_duration {
+            return Err(format!(
+                "scheduled task started but mount point did not appear within {} seconds: {}",
+                timeout_duration.as_secs(),
+                probe_path.display()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn vbs_escape(value: &str) -> String {
+    value.replace('"', "\"\"")
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1609,8 +1677,9 @@ mod tests {
         default_config_path, default_library_root, default_mount_point, default_state_dir,
         endpoint_socket, install_client_bundle, load_bundle_manifest, mount_root_attributes,
         normalize_bootstrap_url, parse_command_impl, parse_http_response,
-        render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
-        spawn_prefetch_control_server, startup_context, windows_task_command_for_executable,
+        render_macos_launchd_plist, render_windows_task_wrapper, resolve_optional_install_value,
+        resolve_required_install_value, spawn_prefetch_control_server, startup_context,
+        windows_mount_probe_path, windows_task_command_for_wrapper, windows_task_wrapper_path,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
@@ -1996,17 +2065,38 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_command_runs_legatofs_with_config_and_logs() {
-        let command = windows_task_command_for_executable(
-            &PathBuf::from("C:\\Program Files\\Legato\\legatofs.exe"),
-            &PathBuf::from("C:\\ProgramData\\Legato\\legatofs.toml"),
-            &PathBuf::from("C:\\ProgramData\\Legato\\logs"),
+    fn windows_task_command_uses_hidden_wrapper_with_config_and_logs() {
+        let executable = PathBuf::from("C:\\Program Files\\Legato\\legatofs.exe");
+        let config = PathBuf::from("C:\\ProgramData\\Legato\\legatofs.toml");
+        let log_dir = PathBuf::from("C:\\ProgramData\\Legato\\logs");
+        let wrapper_path = windows_task_wrapper_path(&log_dir);
+        let command = windows_task_command_for_wrapper(&wrapper_path);
+        let wrapper = render_windows_task_wrapper(
+            &executable,
+            &config,
+            &log_dir.join("legatofs.out.log"),
+            &log_dir.join("legatofs.err.log"),
         );
 
-        assert!(command.contains("LEGATO_FS_CONFIG=C:\\ProgramData\\Legato\\legatofs.toml"));
-        assert!(command.contains("legatofs.exe"));
-        assert!(command.contains("legatofs.out.log"));
-        assert!(command.contains("legatofs.err.log"));
+        assert!(command.contains("wscript.exe"));
+        assert!(command.contains("run-legatofs.vbs"));
+        assert!(!command.contains("cmd.exe"));
+        assert!(wrapper.contains("LEGATO_FS_CONFIG"));
+        assert!(wrapper.contains("C:\\ProgramData\\Legato\\legatofs.toml"));
+        assert!(wrapper.contains("C:\\Program Files\\Legato\\legatofs.exe"));
+        assert!(wrapper.contains("legatofs.out.log"));
+        assert!(wrapper.contains("legatofs.err.log"));
+        assert!(wrapper.contains("shell.Run"));
+        assert!(wrapper.contains(", 0, True"));
+    }
+
+    #[test]
+    fn windows_mount_probe_path_normalizes_drive_letters() {
+        assert_eq!(windows_mount_probe_path("L:"), PathBuf::from("L:\\"));
+        assert_eq!(
+            windows_mount_probe_path("C:\\Legato"),
+            PathBuf::from("C:\\Legato")
+        );
     }
 
     #[test]
