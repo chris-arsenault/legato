@@ -64,7 +64,7 @@ docker exec legato-server legato-server issue-client \
   --name studio-mac \
   --output-dir /tmp/studio-mac \
   --endpoint 192.168.66.3:7823 \
-  --server-name 192.168.66.3
+  --server-name legato.local.ahara.io
 ```
 
 That writes:
@@ -139,7 +139,7 @@ Under `/etc/legato/certs`, the expected durable layout is:
 Client setup flow:
 
 1. Run the native client installer.
-2. Accept the default discovery/bootstrap settings, or enter `http://192.168.66.3:7824` if discovery is blocked.
+2. Accept the default discovery/bootstrap settings, or enter `http://192.168.66.3:7824/v1/client-bundles` if discovery is blocked.
 3. Choose the mount point or accept the platform default.
 4. Let setup register the client, install the service, and start the mount.
 5. Verify the mount root appears and resolves indexed paths.

@@ -63,6 +63,20 @@ fn apply_server_operational_defaults(process_config: &mut ServerProcessConfig) {
     if process_config.common.metrics.prefix == "legato" {
         process_config.common.metrics.prefix = String::from("legato_server");
     }
+    if let Some(server_name) = &process_config.server.bootstrap.server_name
+        && !process_config
+            .server
+            .tls
+            .server_names
+            .iter()
+            .any(|name| name == server_name)
+    {
+        process_config
+            .server
+            .tls
+            .server_names
+            .insert(0, server_name.clone());
+    }
 }
 
 #[tokio::main]
@@ -393,8 +407,11 @@ bind_address = "0.0.0.0:9464"
 
 [server.bootstrap]
 advertised_endpoint = "192.168.66.3:7823"
-advertised_bootstrap_url = "http://192.168.66.3:7824"
+advertised_bootstrap_url = "http://192.168.66.3:7824/v1/client-bundles"
 server_name = "legato.local.ahara.io"
+
+[server.tls]
+server_names = ["192.168.66.3"]
 "#,
         )
         .expect("partial config should merge with defaults");
@@ -410,6 +427,17 @@ server_name = "legato.local.ahara.io"
         );
         assert_eq!(
             config.server.bootstrap.server_name.as_deref(),
+            Some("legato.local.ahara.io")
+        );
+        assert!(
+            config
+                .server
+                .tls
+                .server_names
+                .contains(&String::from("legato.local.ahara.io"))
+        );
+        assert_eq!(
+            config.server.tls.server_names.first().map(String::as_str),
             Some("legato.local.ahara.io")
         );
     }

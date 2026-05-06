@@ -41,6 +41,7 @@ impl Default for ServerTlsConfig {
             key_path: String::from("/etc/legato/certs/server-key.pem"),
             client_ca_path: String::from("/etc/legato/certs/client-ca.pem"),
             server_names: vec![
+                String::from("legato.local.ahara.io"),
                 String::from("192.168.66.3"),
                 String::from("localhost"),
                 String::from("legato-server"),
@@ -63,7 +64,11 @@ impl ServerTlsConfig {
                 .join("client-ca.pem")
                 .to_string_lossy()
                 .into_owned(),
-            server_names: vec![String::from("192.168.66.3"), String::from("localhost")],
+            server_names: vec![
+                String::from("legato.local.ahara.io"),
+                String::from("192.168.66.3"),
+                String::from("localhost"),
+            ],
         }
     }
 }

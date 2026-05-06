@@ -27,7 +27,7 @@ Installers first try UDP discovery. If discovery is blocked by the network, ente
 For the default LAN deployment in this repository, enter:
 
 ```text
-http://192.168.66.3:7824
+http://192.168.66.3:7824/v1/client-bundles
 ```
 
 ## macOS
@@ -129,7 +129,7 @@ legatofs service start
 Re-run client setup against an explicit bootstrap URL:
 
 ```bash
-legatofs install --bootstrap-url http://192.168.66.3:7824 --force
+legatofs install --bootstrap-url http://192.168.66.3:7824/v1/client-bundles --force
 legatofs service install --force
 legatofs service start
 ```
