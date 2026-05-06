@@ -72,7 +72,7 @@ The installer prompts for:
 
 - bootstrap URL, optional because LAN discovery is the default
 - client name, defaulting to the computer name
-- mount point, defaulting to `L:\Legato`
+- mount point, defaulting to `L:`
 
 Windows mounts require the WinFsp MSI from `https://winfsp.dev/rel/`. The Legato installer validates the installed runtime and fixes the WinFsp registry compatibility key used by the client before starting the background task.
 
@@ -80,7 +80,7 @@ The installer registers the client, installs the scheduled task, and starts the 
 
 Default Windows runtime paths:
 
-- Mount point: `L:\Legato`
+- Mount point: `L:`
 - Config: `C:\ProgramData\Legato\legatofs.toml`
 - Logs: `C:\ProgramData\Legato\logs\`
 
@@ -89,7 +89,7 @@ Default Windows runtime paths:
 After install, verify that the mount exists:
 
 - macOS: open `/Volumes/Legato`
-- Windows: open `L:\Legato`
+- Windows: open `L:`
 
 If you need a command-line check:
 

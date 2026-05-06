@@ -73,7 +73,7 @@ begin
     'Enter the Windows mount point the client should expose.'
   );
   MountPointPage.Add('Mount point:', False);
-  MountPointPage.Values[0] := 'L:\Legato';
+  MountPointPage.Values[0] := 'L:';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

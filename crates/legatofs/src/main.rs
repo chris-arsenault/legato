@@ -989,7 +989,7 @@ fn default_mount_point() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        return String::from("L:\\Legato");
+        return String::from("L:");
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -1687,7 +1687,7 @@ mod tests {
             String::from("--client-name"),
             String::from("studio-win"),
             String::from("--mount-point"),
-            String::from("L:\\Legato"),
+            String::from("L:"),
         ])
         .expect("command should parse");
 
@@ -1699,7 +1699,7 @@ mod tests {
                 client_name: Some(String::from("studio-win")),
                 endpoint: None,
                 server_name: None,
-                mount_point: Some(String::from("L:\\Legato")),
+                mount_point: Some(String::from("L:")),
                 state_dir: PathBuf::from(default_state_dir()),
                 library_root: None,
                 force: false,

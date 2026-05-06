@@ -134,7 +134,7 @@ Under `/etc/legato/certs`, the expected durable layout is:
 - macOS default state dir: `/Library/Application Support/Legato`
 - Windows default state dir: `C:\ProgramData\Legato`
 - macOS default mount point: `/Volumes/Legato`
-- Windows default mount point: `L:\Legato`
+- Windows default mount point: `L:`
 
 Client setup flow:
 

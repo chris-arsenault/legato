@@ -126,6 +126,8 @@ pub enum MountPointReadiness {
 /// Clear local mount point conflicts surfaced before WinFSP starts.
 #[derive(Debug)]
 pub enum MountPointError {
+    /// The configured drive-letter mount point is already assigned.
+    DriveLetterInUse(PathBuf),
     /// The configured mount point exists but is not a directory.
     NotDirectory(PathBuf),
     /// The configured mount point is a non-empty directory and may already be mounted or busy.
@@ -137,6 +139,11 @@ pub enum MountPointError {
 impl fmt::Display for MountPointError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DriveLetterInUse(path) => write!(
+                formatter,
+                "drive-letter mount point is already in use: {}",
+                path.display()
+            ),
             Self::NotDirectory(path) => {
                 write!(
                     formatter,
@@ -312,7 +319,7 @@ pub async fn mount(
     mount_point: impl AsRef<Path>,
     library_root: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mount_point = mount_point.as_ref().to_path_buf();
+    let mount_point = normalize_mount_point(mount_point.as_ref());
     prepare_mount_point(&mount_point)?;
     let _winfsp = winfsp::winfsp_init()?;
     let mut volume_params = VolumeParams::new();
@@ -338,8 +345,16 @@ pub async fn mount(
     Ok(())
 }
 
-/// Ensures the mount point is a usable empty directory before mounting.
+/// Ensures the mount point is a free drive letter or usable empty directory before mounting.
 pub fn prepare_mount_point(path: &Path) -> Result<MountPointReadiness, MountPointError> {
+    if let Some(letter) = drive_letter_mount_point(path) {
+        if drive_letter_in_use(letter) {
+            return Err(MountPointError::DriveLetterInUse(normalize_mount_point(
+                path,
+            )));
+        }
+        return Ok(MountPointReadiness::Ready);
+    }
     if !path.exists() {
         std::fs::create_dir_all(path)?;
         return Ok(MountPointReadiness::Created);
@@ -351,6 +366,36 @@ pub fn prepare_mount_point(path: &Path) -> Result<MountPointReadiness, MountPoin
         return Err(MountPointError::BusyDirectory(path.to_path_buf()));
     }
     Ok(MountPointReadiness::Ready)
+}
+
+fn normalize_mount_point(path: &Path) -> PathBuf {
+    drive_letter_mount_point(path)
+        .map(|letter| PathBuf::from(format!("{letter}:")))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn drive_letter_mount_point(path: &Path) -> Option<char> {
+    let raw = path.as_os_str().to_string_lossy();
+    let value = raw.trim();
+    let bytes = value.as_bytes();
+    let valid = match bytes {
+        [letter, b':'] => letter.is_ascii_alphabetic(),
+        [letter, b':', b'\\' | b'/'] => letter.is_ascii_alphabetic(),
+        _ => false,
+    };
+    valid.then(|| (bytes[0] as char).to_ascii_uppercase())
+}
+
+fn drive_letter_in_use(letter: char) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        Path::new(&format!("{letter}:\\")).exists()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = letter;
+        false
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -661,7 +706,10 @@ fn filetime_from_unix_ns(nanoseconds: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
     use legato_server::{
@@ -673,8 +721,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        MountPointError, MountPointReadiness, WindowsFilesystem, map_virtual_path,
-        prepare_mount_point,
+        MountPointError, MountPointReadiness, WindowsFilesystem, drive_letter_mount_point,
+        map_virtual_path, normalize_mount_point, prepare_mount_point,
     };
 
     fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
@@ -692,14 +740,14 @@ mod tests {
 
     #[test]
     fn adapter_is_constructible_on_non_windows_hosts() {
-        let adapter = WindowsFilesystem::new("L:\\Legato");
+        let adapter = WindowsFilesystem::new("L:");
         assert_eq!(adapter.platform_name(), "windows");
-        assert_eq!(adapter.mount_point(), "L:\\Legato");
+        assert_eq!(adapter.mount_point(), "L:");
     }
 
     #[test]
     fn read_only_semantics_map_to_windows_error_codes() {
-        let adapter = WindowsFilesystem::new("L:\\Legato");
+        let adapter = WindowsFilesystem::new("L:");
         let code = adapter.error_code(
             FilesystemOperation::Rename,
             legato_types::FilesystemError::ReadOnly,
@@ -710,7 +758,7 @@ mod tests {
 
     #[test]
     fn attributes_translate_into_windows_shape() {
-        let adapter = WindowsFilesystem::new("L:\\Legato");
+        let adapter = WindowsFilesystem::new("L:");
         let attrs = adapter.translate_attributes(&FilesystemAttributes {
             file_id: FileId(7),
             path: "/Kontakt/piano.nki".into(),
@@ -764,6 +812,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn drive_letter_mount_points_are_normalized() {
+        assert_eq!(normalize_mount_point(Path::new("l:")), PathBuf::from("L:"));
+        assert_eq!(
+            normalize_mount_point(Path::new("L:\\")),
+            PathBuf::from("L:")
+        );
+        assert_eq!(normalize_mount_point(Path::new("L:/")), PathBuf::from("L:"));
+        assert_eq!(drive_letter_mount_point(Path::new("Legato")), None);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn drive_letter_preflight_does_not_create_local_directory() {
+        assert_eq!(
+            prepare_mount_point(Path::new("L:")).expect("drive letter should be accepted"),
+            MountPointReadiness::Ready
+        );
+        assert!(
+            !Path::new("L:").exists(),
+            "drive-letter mount preflight must not create a local directory"
+        );
+    }
+
     #[tokio::test]
     async fn windows_adapter_serves_real_lookup_readdir_and_read() {
         let fixture = tempdir().expect("tempdir should be created");
@@ -815,7 +887,7 @@ mod tests {
         )
         .await
         .expect("service should connect");
-        let adapter = WindowsFilesystem::new("L:\\Legato");
+        let adapter = WindowsFilesystem::new("L:");
 
         let attrs = adapter
             .lookup(&mut service, "/Strings/long.ncw")
