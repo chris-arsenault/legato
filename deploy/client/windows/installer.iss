@@ -49,6 +49,7 @@ var
   BootstrapPage: TInputQueryWizardPage;
   ClientNamePage: TInputQueryWizardPage;
   MountPointPage: TInputQueryWizardPage;
+  ExistingClientConfig: Boolean;
 
 procedure RunCleanupCommand(FileName: string; Parameters: string);
 var
@@ -57,17 +58,33 @@ begin
   Exec(FileName, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+function ClientConfigPath: string;
+begin
+  Result := ExpandConstant('{commonappdata}\Legato\legatofs.toml');
+end;
+
+function HasExistingClientConfig: Boolean;
+begin
+  Result := FileExists(ClientConfigPath());
+end;
+
+procedure StopLegatoRuntime;
+begin
+  RunCleanupCommand(ExpandConstant('{sys}\schtasks.exe'), '/End /TN LegatoFS');
+  RunCleanupCommand(ExpandConstant('{sys}\taskkill.exe'), '/IM legatofs.exe /F');
+end;
+
 procedure CleanupLegatoRuntime;
 begin
-  RunCleanupCommand(ExpandConstant('{app}\legatofs.exe'), 'service stop');
+  StopLegatoRuntime;
   RunCleanupCommand(ExpandConstant('{app}\legatofs.exe'), 'service uninstall');
-  RunCleanupCommand(ExpandConstant('{sys}\schtasks.exe'), '/End /TN LegatoFS');
   RunCleanupCommand(ExpandConstant('{sys}\schtasks.exe'), '/Delete /TN LegatoFS /F');
-  RunCleanupCommand(ExpandConstant('{sys}\taskkill.exe'), '/IM legatofs.exe /F');
 end;
 
 procedure InitializeWizard;
 begin
+  ExistingClientConfig := HasExistingClientConfig();
+
   BootstrapPage := CreateInputQueryPage(
     wpSelectDir,
     'Legato Server',
@@ -96,16 +113,31 @@ begin
   MountPointPage.Values[0] := 'L:';
 end;
 
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if ExistingClientConfig then
+  begin
+    Result :=
+      (PageID = BootstrapPage.ID) or
+      (PageID = ClientNamePage.ID) or
+      (PageID = MountPointPage.ID);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   BootstrapUrl: string;
   InstallArgs: string;
   ResultCode: Integer;
 begin
+  if CurStep = ssInstall then
+  begin
+    StopLegatoRuntime;
+  end;
+
   if CurStep = ssPostInstall then
   begin
-    CleanupLegatoRuntime;
-
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\ensure-winfsp.ps1') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     begin
       RaiseException('Failed to verify the WinFsp runtime.');
@@ -115,26 +147,29 @@ begin
       RaiseException('WinFsp runtime was not detected. Install WinFsp from https://winfsp.dev/rel/ and rerun this installer.');
     end;
 
-    BootstrapUrl := Trim(BootstrapPage.Values[0]);
+    if not HasExistingClientConfig() then
+    begin
+      BootstrapUrl := Trim(BootstrapPage.Values[0]);
 
-    InstallArgs :=
-      'install ' +
-      '--client-name "' + ClientNamePage.Values[0] + '" ' +
-      '--mount-point "' + MountPointPage.Values[0] + '" ' +
-      '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
-      '--library-root "/" ' +
-      '--force';
-    if BootstrapUrl <> '' then
-    begin
-      InstallArgs := InstallArgs + ' --bootstrap-url "' + BootstrapUrl + '"';
-    end;
-    if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    begin
-      RaiseException('Failed to run Legato client setup.');
-    end;
-    if ResultCode <> 0 then
-    begin
-      RaiseException('Legato client setup failed. Confirm the server bootstrap endpoint is reachable, then rerun this installer.');
+      InstallArgs :=
+        'install ' +
+        '--client-name "' + ClientNamePage.Values[0] + '" ' +
+        '--mount-point "' + MountPointPage.Values[0] + '" ' +
+        '--state-dir "' + ExpandConstant('{commonappdata}\Legato') + '" ' +
+        '--library-root "/" ' +
+        '--force';
+      if BootstrapUrl <> '' then
+      begin
+        InstallArgs := InstallArgs + ' --bootstrap-url "' + BootstrapUrl + '"';
+      end;
+      if not Exec(ExpandConstant('{app}\legatofs.exe'), InstallArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      begin
+        RaiseException('Failed to run Legato client setup.');
+      end;
+      if ResultCode <> 0 then
+      begin
+        RaiseException('Legato client setup failed. Confirm the server bootstrap endpoint is reachable, then rerun this installer.');
+      end;
     end;
 
     if not Exec(ExpandConstant('{app}\legatofs.exe'), 'service install --force', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then

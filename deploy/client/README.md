@@ -104,7 +104,9 @@ legatofs doctor
 
 ## Upgrade
 
-Install the newer client package over the old one. The installer preserves the client cache, certificates, and generated config unless setup is explicitly rerun with `--force`.
+Install the newer client package over the old one. On Windows, the installer detects an existing `C:\ProgramData\Legato\legatofs.toml`, skips bootstrap/client-name/mount-point setup, preserves the local state, stops the running mount task, updates the installed binaries, reinstalls the scheduled task, and starts the mount again.
+
+The same path also acts as repair for a broken or missing scheduled task when the generated config still exists.
 
 Preserved state:
 
