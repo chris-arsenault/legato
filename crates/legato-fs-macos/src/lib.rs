@@ -1,11 +1,12 @@
 //! macOS-specific adapter wrappers over the shared Legato filesystem service.
 
 #[cfg(target_os = "macos")]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use legato_client_core::{FilesystemOpenHandle, FilesystemService, FilesystemServiceError};
@@ -16,6 +17,8 @@ use legato_types::{
     FilesystemSemantics, PlatformErrorCode, platform_error_code,
 };
 use tokio::sync::Mutex;
+
+const SLOW_CALLBACK_WARN_AFTER: Duration = Duration::from_millis(250);
 
 #[cfg(target_os = "macos")]
 use unifuse::{
@@ -171,11 +174,14 @@ impl MacosFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<MacosAttributes, PlatformErrorCode> {
-        service
+        let started = Instant::now();
+        let result = service
             .lookup(path)
             .await
             .map(|attributes| self.translate_attributes(&attributes))
-            .map_err(map_error)
+            .map_err(map_error);
+        log_slow_callback("adapter_lookup", path, started.elapsed());
+        result
     }
 
     /// Enumerates one directory through the shared filesystem service.
@@ -184,11 +190,29 @@ impl MacosFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<Vec<MacosDirectoryEntry>, PlatformErrorCode> {
-        service
+        let started = Instant::now();
+        let result = service
             .read_dir(path)
             .await
-            .map(|entries| entries.into_iter().map(translate_directory_entry).collect())
-            .map_err(map_error)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(translate_directory_entry)
+                    .collect::<Vec<_>>()
+            })
+            .map_err(map_error);
+        match &result {
+            Ok(entries) => {
+                log_slow_callback_with_count(
+                    "adapter_read_dir",
+                    path,
+                    entries.len(),
+                    started.elapsed(),
+                );
+            }
+            Err(_) => log_slow_callback("adapter_read_dir", path, started.elapsed()),
+        }
+        result
     }
 
     /// Opens one file through the shared filesystem service.
@@ -197,14 +221,22 @@ impl MacosFilesystem {
         service: &mut FilesystemService,
         path: &str,
     ) -> Result<MacosOpenFile, PlatformErrorCode> {
+        let started = Instant::now();
         let handle = service.open(path).await.map_err(map_error)?;
         if let Err(error) = prefetch_opened_project(service, &handle).await {
+            tracing::warn!(
+                path,
+                error = %error,
+                "project prefetch skipped"
+            );
             eprintln!("legato project prefetch skipped for {path}: {error}");
         }
-        Ok(MacosOpenFile {
+        let result = Ok(MacosOpenFile {
             handle: handle.local_handle,
             attributes: self.translate_attributes(&attributes_from_open_handle(&handle)),
-        })
+        });
+        log_slow_callback("adapter_open", path, started.elapsed());
+        result
     }
 
     /// Reads one byte range from a previously opened file.
@@ -215,7 +247,19 @@ impl MacosFilesystem {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, PlatformErrorCode> {
-        service.read(handle, offset, size).await.map_err(map_error)
+        let started = Instant::now();
+        let result = service.read(handle, offset, size).await.map_err(map_error);
+        if let Ok(bytes) = &result {
+            log_slow_read_callback(
+                "adapter_read",
+                handle,
+                offset,
+                size,
+                bytes.len(),
+                started.elapsed(),
+            );
+        }
+        result
     }
 
     /// Releases one open file handle.
@@ -315,14 +359,18 @@ fn unmount_existing_mount(path: &Path) -> Result<(), std::io::Error> {
 #[cfg(target_os = "macos")]
 impl UniFuseFilesystem for MacosMountService {
     async fn getattr(&self, path: &Path) -> Result<MountFileAttr, MountFsError> {
-        let attributes = self
+        let started = Instant::now();
+        let path = self.canonical_path(path);
+        let result = self
             .service
             .lock()
             .await
-            .lookup(&self.canonical_path(path))
+            .lookup(&path)
             .await
-            .map_err(map_mount_error)?;
-        Ok(attributes_to_mount_attr(&attributes))
+            .map(|attributes| attributes_to_mount_attr(&attributes))
+            .map_err(map_mount_error);
+        log_slow_callback("macos_getattr", &path, started.elapsed());
+        result
     }
 
     async fn lookup(
@@ -343,14 +391,18 @@ impl UniFuseFilesystem for MacosMountService {
             return Err(MountFsError::NotSupported);
         }
 
-        let handle = self
+        let started = Instant::now();
+        let path = self.canonical_path(path);
+        let result = self
             .service
             .lock()
             .await
-            .open(&self.canonical_path(path))
+            .open(&path)
             .await
-            .map_err(map_mount_error)?;
-        Ok(MountFileHandle(handle.local_handle))
+            .map(|handle| MountFileHandle(handle.local_handle))
+            .map_err(map_mount_error);
+        log_slow_callback("macos_open", &path, started.elapsed());
+        result
     }
 
     async fn read(
@@ -360,38 +412,78 @@ impl UniFuseFilesystem for MacosMountService {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>, MountFsError> {
-        self.service
+        let started = Instant::now();
+        let result = self
+            .service
             .lock()
             .await
             .read(fh.0, offset, size)
             .await
-            .map_err(map_mount_error)
+            .map_err(map_mount_error);
+        if let Ok(bytes) = &result {
+            log_slow_read_callback(
+                "macos_read",
+                fh.0,
+                offset,
+                size,
+                bytes.len(),
+                started.elapsed(),
+            );
+        }
+        result
     }
 
     async fn release(&self, _path: &Path, fh: MountFileHandle) -> Result<(), MountFsError> {
-        self.service
+        let started = Instant::now();
+        let result = self
+            .service
             .lock()
             .await
             .release(fh.0)
             .await
-            .map_err(map_mount_error)
+            .map_err(map_mount_error);
+        if started.elapsed() >= SLOW_CALLBACK_WARN_AFTER {
+            tracing::warn!(
+                operation = "macos_release",
+                handle = fh.0,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "slow macOS filesystem callback"
+            );
+        }
+        result
     }
 
     async fn readdir(&self, path: &Path) -> Result<Vec<MountDirEntry>, MountFsError> {
-        let entries = self
+        let started = Instant::now();
+        let path = self.canonical_path(path);
+        let result = self
             .service
             .lock()
             .await
-            .read_dir(&self.canonical_path(path))
+            .read_dir(&path)
             .await
-            .map_err(map_mount_error)?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| MountDirEntry {
-                name: entry.name,
-                kind: entry_kind(entry.is_dir),
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| MountDirEntry {
+                        name: entry.name,
+                        kind: entry_kind(entry.is_dir),
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect())
+            .map_err(map_mount_error);
+        match &result {
+            Ok(entries) => {
+                log_slow_callback_with_count(
+                    "macos_readdir",
+                    &path,
+                    entries.len(),
+                    started.elapsed(),
+                );
+            }
+            Err(_) => log_slow_callback("macos_readdir", &path, started.elapsed()),
+        }
+        result
     }
 
     async fn statfs(&self, _path: &Path) -> Result<StatFs, MountFsError> {
@@ -473,6 +565,55 @@ fn translate_directory_entry(entry: DirectoryEntry) -> MacosDirectoryEntry {
     }
 }
 
+fn log_slow_callback(operation: &'static str, path: &str, elapsed: Duration) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow macOS filesystem callback"
+        );
+    }
+}
+
+fn log_slow_callback_with_count(
+    operation: &'static str,
+    path: &str,
+    entries: usize,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            entries,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow macOS filesystem callback"
+        );
+    }
+}
+
+fn log_slow_read_callback(
+    operation: &'static str,
+    handle: u64,
+    offset: u64,
+    requested_size: u32,
+    actual_size: usize,
+    elapsed: Duration,
+) {
+    if elapsed >= SLOW_CALLBACK_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            handle,
+            offset,
+            requested_size,
+            actual_size,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow macOS filesystem callback"
+        );
+    }
+}
+
 fn attributes_from_open_handle(handle: &FilesystemOpenHandle) -> FilesystemAttributes {
     FilesystemAttributes {
         file_id: handle.file_id,
@@ -510,6 +651,9 @@ mod tests {
 
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
+    use legato_proto::{
+        DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout, InodeMetadata, TransferClass,
+    };
     use legato_server::{
         LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
         issue_client_tls_bundle, load_runtime_tls,
@@ -534,6 +678,18 @@ mod tests {
             },
             ..ClientConfig::default()
         }
+    }
+
+    fn unavailable_client_config(root: &Path, client_name: &str) -> ClientConfig {
+        let tls_dir = root.join(format!("tls-{client_name}"));
+        let bundle_dir = root.join(format!("bundle-{client_name}"));
+        let mut server_tls = ServerTlsConfig::local_dev(&tls_dir);
+        server_tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(&tls_dir, &server_tls)
+            .expect("tls materials should be created");
+        issue_client_tls_bundle(&tls_dir, &server_tls, client_name, &bundle_dir)
+            .expect("client bundle should be issued");
+        local_client_config(String::from("127.0.0.1:1"), &bundle_dir, "localhost")
     }
 
     #[test]
@@ -691,6 +847,138 @@ mod tests {
             .await
             .expect("release should succeed");
         bound.shutdown().await.expect("server should shut down");
+    }
+
+    #[tokio::test]
+    async fn macos_adapter_serves_local_store_when_remote_is_unavailable() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let client_state = fixture.path().join("client-state");
+        let mut store = ClientLegatoStore::open(&client_state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 1,
+                path: String::from("/"),
+                size: 0,
+                mtime_ns: 1,
+                is_dir: true,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: Vec::new(),
+            })
+            .expect("root inode should record");
+        store
+            .record_directory(
+                "/",
+                FileId(1),
+                vec![DirectoryEntry {
+                    name: String::from("cached.wav"),
+                    path: String::from("/cached.wav"),
+                    is_dir: false,
+                    file_id: 7,
+                }],
+            )
+            .expect("directory should record");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 7,
+                path: String::from("/cached.wav"),
+                size: 6,
+                mtime_ns: 2,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: vec![ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 6,
+                        extent_hash: Vec::new(),
+                    }],
+                }),
+                inode_generation: 1,
+                content_hash: b"cached".to_vec(),
+            })
+            .expect("file inode should record");
+        store
+            .put_extent(&ExtentRecord {
+                file_id: 7,
+                extent_index: 0,
+                file_offset: 0,
+                data: b"cached".to_vec(),
+                extent_hash: Vec::new(),
+                transfer_class: TransferClass::Unitary as i32,
+            })
+            .expect("extent should store");
+        store.checkpoint().expect("checkpoint should write");
+        drop(store);
+
+        let mut service = FilesystemService::connect(
+            unavailable_client_config(fixture.path(), "offline-mac"),
+            "offline-mac",
+            &client_state,
+        )
+        .await
+        .expect("service should mount from local store");
+        let adapter = MacosFilesystem::new("/Volumes/Legato");
+
+        let root = adapter
+            .lookup(&mut service, "/")
+            .await
+            .expect("root should resolve");
+        let entries = adapter
+            .read_dir(&mut service, "/")
+            .await
+            .expect("root should list");
+        let attrs = adapter
+            .lookup(&mut service, "/cached.wav")
+            .await
+            .expect("cached file should resolve");
+        let open = adapter
+            .open(&mut service, "/cached.wav")
+            .await
+            .expect("cached file should open");
+        let bytes = adapter
+            .read(&mut service, open.handle, 0, 6)
+            .await
+            .expect("resident bytes should read");
+
+        assert!(root.directory);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/cached.wav");
+        assert_eq!(attrs.size, 6);
+        assert_eq!(bytes, b"cached");
+
+        adapter
+            .release(&mut service, open.handle)
+            .await
+            .expect("release should succeed");
+    }
+
+    #[tokio::test]
+    async fn macos_adapter_exposes_empty_root_without_catalog_or_remote() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let mut service = FilesystemService::connect(
+            unavailable_client_config(fixture.path(), "empty-offline-mac"),
+            "empty-offline-mac",
+            fixture.path().join("empty-client-state").as_path(),
+        )
+        .await
+        .expect("service should mount without a populated catalog");
+        let adapter = MacosFilesystem::new("/Volumes/Legato");
+
+        let root = adapter
+            .lookup(&mut service, "/")
+            .await
+            .expect("root should resolve");
+        let entries = adapter
+            .read_dir(&mut service, "/")
+            .await
+            .expect("root should list");
+
+        assert!(root.directory);
+        assert!(entries.is_empty());
     }
 
     #[tokio::test]

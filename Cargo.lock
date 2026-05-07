@@ -1053,6 +1053,7 @@ dependencies = [
  "legato-types",
  "tempfile",
  "tokio",
+ "tracing",
  "unifuse",
 ]
 
