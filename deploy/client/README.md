@@ -84,7 +84,7 @@ Default Windows runtime paths:
 - Config: `C:\ProgramData\Legato\legatofs.toml`
 - Logs: `C:\ProgramData\Legato\logs\`
 
-The main client tracing file is `C:\ProgramData\Legato\logs\legatofs.log`. The Windows scheduled task runs `legatofs.exe --config C:\ProgramData\Legato\legatofs.toml` directly, with no generated VBS or `cmd.exe` launcher.
+The main client tracing file is `C:\ProgramData\Legato\logs\legatofs.log`. The Windows scheduled task runs the native `legatofs.exe service launch --config C:\ProgramData\Legato\legatofs.toml` action, which starts the normal `legatofs.exe --config ...` runtime detached from the task console. There is no generated VBS or `cmd.exe` launcher.
 
 The Windows client writes slow-operation warnings to the log when a mount callback or client metadata/read operation takes longer than 250 ms.
 
