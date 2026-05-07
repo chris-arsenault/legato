@@ -10,7 +10,7 @@ use std::{
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::time::Instant;
 
 use legato_client_cache::client_store::ClientLegatoStore;
@@ -127,17 +127,17 @@ async fn run_mount_runtime(config_path: Option<&Path>) -> Result<(), Box<dyn std
         tracing::info!("local client metrics exporter is disabled; metrics report through server");
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         loop {
             match run_mount_once(&process_config, &telemetry).await {
                 Ok(()) => {
-                    tracing::warn!("windows mount runtime exited; restarting in 5s");
+                    tracing::warn!("mount runtime exited; restarting in 5s");
                 }
                 Err(error) => {
                     tracing::error!(
                         error = %error,
-                        "windows mount runtime failed; restarting in 5s"
+                        "mount runtime failed; restarting in 5s"
                     );
                 }
             }
@@ -145,7 +145,7 @@ async fn run_mount_runtime(config_path: Option<&Path>) -> Result<(), Box<dyn std
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     run_mount_once(&process_config, &telemetry).await
 }
 
@@ -550,7 +550,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             action,
             config_path,
             force,
-        } => run_service_command(action, config_path, force),
+        } => run_service_command(action, config_path, force).await,
         Command::Install {
             bundle_dir,
             bootstrap_url,
@@ -761,7 +761,7 @@ fn cache_repair_report(
     ))
 }
 
-fn run_service_command(
+async fn run_service_command(
     action: ServiceCommand,
     config_path: Option<PathBuf>,
     force: bool,
@@ -769,7 +769,7 @@ fn run_service_command(
     let config_path = config_path.unwrap_or_else(runtime_config_path);
     match action {
         ServiceCommand::Install => install_mount_agent_service(&config_path, force),
-        ServiceCommand::Launch => launch_mount_agent_service(&config_path),
+        ServiceCommand::Launch => launch_mount_agent_service(&config_path).await,
         ServiceCommand::Uninstall => uninstall_mount_agent_service(),
         ServiceCommand::Start => start_mount_agent_service(&config_path),
         ServiceCommand::Stop => stop_mount_agent_service(),
@@ -777,16 +777,22 @@ fn run_service_command(
     }
 }
 
+#[cfg(target_os = "macos")]
+async fn launch_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    require_readable_file("legatofs config", config_path)?;
+    run_mount_runtime(Some(config_path)).await
+}
+
 #[cfg(target_os = "windows")]
-fn launch_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+async fn launch_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     require_readable_file("legatofs config", config_path)?;
     spawn_detached_windows_runtime(config_path)?;
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn launch_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    Err("legatofs service launch is only supported on Windows".into())
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+async fn launch_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    Err("legatofs service launch is only supported on macOS and Windows".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -803,6 +809,9 @@ fn install_mount_agent_service(
             definition.plist_path.display()
         )
         .into());
+    }
+    if definition.plist_path.exists() && force {
+        let _ = stop_mount_agent_service();
     }
     fs::create_dir_all(
         definition
@@ -890,8 +899,8 @@ fn uninstall_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let definition = macos_service_definition(&runtime_config_path())?;
+fn start_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let definition = macos_service_definition(config_path)?;
     run_process(
         process_with_args(
             "launchctl",
@@ -916,7 +925,12 @@ fn start_mount_agent_service(_config_path: &Path) -> Result<(), Box<dyn std::err
             "kickstart launchd agent",
         )
     })?;
-    println!("started launchd agent {}", LEGATO_SERVICE_LABEL);
+    wait_for_runtime_owner(config_path, Duration::from_secs(30), "launchd agent")?;
+    println!(
+        "started launchd agent {} and runtime owns {}",
+        LEGATO_SERVICE_LABEL,
+        runtime_state_dir(config_path)?.display()
+    );
     Ok(())
 }
 
@@ -926,7 +940,7 @@ fn start_mount_agent_service(config_path: &Path) -> Result<(), Box<dyn std::erro
         process_with_args("schtasks", ["/Run", "/TN", LEGATO_WINDOWS_TASK_NAME]),
         "start scheduled task",
     )?;
-    wait_for_windows_runtime_owner(config_path, Duration::from_secs(30))?;
+    wait_for_runtime_owner(config_path, Duration::from_secs(30), "scheduled task")?;
     println!(
         "started scheduled task {} and runtime owns {}",
         LEGATO_WINDOWS_TASK_NAME,
@@ -982,7 +996,7 @@ fn stop_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
 fn status_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
     let definition = macos_service_definition(&runtime_config_path())?;
     println!(
-        "legatofs service\nlabel {}\nplist {}\nlogs {}",
+        "legatofs service\nlabel {}\nmode launchd runtime launcher\nplist {}\nlogs {}",
         LEGATO_SERVICE_LABEL,
         definition.plist_path.display(),
         definition.log_dir.display()
@@ -1420,9 +1434,13 @@ fn render_macos_launchd_plist(
          <dict>\n\
            <key>Label</key><string>{}</string>\n\
            <key>ProgramArguments</key>\n\
-           <array><string>{}</string></array>\n\
-           <key>EnvironmentVariables</key>\n\
-           <dict><key>LEGATO_FS_CONFIG</key><string>{}</string></dict>\n\
+           <array>\n\
+             <string>{}</string>\n\
+             <string>service</string>\n\
+             <string>launch</string>\n\
+             <string>--config</string>\n\
+             <string>{}</string>\n\
+           </array>\n\
            <key>RunAtLoad</key><true/>\n\
            <key>KeepAlive</key><true/>\n\
            <key>StandardOutPath</key><string>{}</string>\n\
@@ -1502,20 +1520,21 @@ fn spawn_detached_windows_runtime(config_path: &Path) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn wait_for_windows_runtime_owner(
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn wait_for_runtime_owner(
     config_path: &Path,
     timeout_duration: Duration,
+    supervisor_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let state_dir = runtime_state_dir(config_path)?;
     loop {
-        if windows_state_lock_is_owned(&state_dir)? {
+        if state_lock_is_owned(&state_dir)? {
             return Ok(());
         }
         if started.elapsed() >= timeout_duration {
             return Err(format!(
-                "scheduled task started but no legatofs runtime owned {} within {} seconds",
+                "{supervisor_name} started but no legatofs runtime owned {} within {} seconds",
                 state_dir.display(),
                 timeout_duration.as_secs(),
             )
@@ -1525,15 +1544,15 @@ fn wait_for_windows_runtime_owner(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn runtime_state_dir(config_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut process_config = load_config::<ClientProcessConfig>(Some(config_path), "LEGATO_FS")?;
     apply_client_operational_defaults(&mut process_config);
     Ok(PathBuf::from(process_config.mount.state_dir))
 }
 
-#[cfg(target_os = "windows")]
-fn windows_state_lock_is_owned(state_dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn state_lock_is_owned(state_dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     fs::create_dir_all(state_dir)?;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -2214,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn launchd_plist_runs_legatofs_with_config_and_logs() {
+    fn launchd_plist_runs_native_launcher_with_config_and_logs() {
         let plist = render_macos_launchd_plist(
             &PathBuf::from("/Applications/Legato/legatofs"),
             &PathBuf::from("/Library/Application Support/Legato/legatofs.toml"),
@@ -2223,9 +2242,14 @@ mod tests {
         );
 
         assert!(plist.contains("com.legato.legatofs"));
-        assert!(plist.contains("LEGATO_FS_CONFIG"));
+        assert!(plist.contains("/Applications/Legato/legatofs"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>launch</string>"));
+        assert!(plist.contains("<string>--config</string>"));
+        assert!(plist.contains("/Library/Application Support/Legato/legatofs.toml"));
         assert!(plist.contains("KeepAlive"));
         assert!(plist.contains("legatofs.err.log"));
+        assert!(!plist.contains("LEGATO_FS_CONFIG"));
     }
 
     #[test]

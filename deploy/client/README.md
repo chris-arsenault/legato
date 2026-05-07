@@ -38,7 +38,7 @@ Install the package:
 sudo installer -pkg legatofs-0.8-macos.pkg -target /
 ```
 
-The package attempts LAN discovery, registers the client, installs the launchd agent for the logged-in user, and starts the client with the default mount point.
+The package attempts LAN discovery, registers the client, installs the launchd agent for the logged-in user, and starts the client with the default mount point. The launchd agent runs the native `legatofs service launch --config /Library/Application Support/Legato/legatofs.toml` action, which hosts the normal mount runtime under launchd.
 
 If you need to override discovery or the mount point after installation, run the setup helper:
 
