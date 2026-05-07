@@ -412,9 +412,9 @@ fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
         FilesystemServiceError::NotFound(_) => FilesystemError::NotFound,
         FilesystemServiceError::UnknownHandle(_) => FilesystemError::StaleHandle,
         FilesystemServiceError::InvalidRead { .. } => FilesystemError::InvalidInput,
-        FilesystemServiceError::Transport(_) | FilesystemServiceError::Store(_) => {
-            FilesystemError::Transient
-        }
+        FilesystemServiceError::Unavailable(_)
+        | FilesystemServiceError::Transport(_)
+        | FilesystemServiceError::Store(_) => FilesystemError::Transient,
     };
     platform_error_code(ClientPlatform::Macos, kind)
 }
@@ -429,6 +429,7 @@ fn map_mount_error(error: FilesystemServiceError) -> MountFsError {
         FilesystemServiceError::InvalidRead { .. } => {
             MountFsError::Other(String::from("invalid read"))
         }
+        FilesystemServiceError::Unavailable(error) => MountFsError::Other(error),
         FilesystemServiceError::Transport(error) => MountFsError::Other(error.to_string()),
         FilesystemServiceError::Store(error) => MountFsError::Other(error.to_string()),
     }

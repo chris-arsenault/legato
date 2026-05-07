@@ -20,6 +20,7 @@ use crate::{ClientConfig, ClientRuntimeMetrics, GrpcClientTransport, LocalContro
 const CLIENT_METRICS_REPORT_INTERVAL_NS: u64 = 5_000_000_000;
 const CHANGE_SYNC_INTERVAL_NS: u64 = 1_000_000_000;
 const SLOW_OPERATION_WARN_AFTER: Duration = Duration::from_millis(250);
+const ROOT_FILE_ID: u64 = 1;
 
 /// Returns a coarse monotonic wall-clock timestamp for cache bookkeeping.
 #[must_use]
@@ -59,6 +60,8 @@ pub enum FilesystemServiceError {
     Store(CatalogStoreError),
     /// The requested path or directory entry did not exist.
     NotFound(String),
+    /// The requested operation needs the server, but no remote transport is currently usable.
+    Unavailable(String),
     /// The requested local handle was not open.
     UnknownHandle(u64),
     /// The requested read parameters were not valid for the open file.
@@ -78,6 +81,9 @@ impl std::fmt::Display for FilesystemServiceError {
             Self::Transport(error) => write!(formatter, "filesystem transport failed: {error}"),
             Self::Store(error) => write!(formatter, "filesystem store access failed: {error}"),
             Self::NotFound(path) => write!(formatter, "filesystem path was not found: {path}"),
+            Self::Unavailable(reason) => {
+                write!(formatter, "filesystem remote is unavailable: {reason}")
+            }
             Self::UnknownHandle(handle) => write!(formatter, "unknown local file handle {handle}"),
             Self::InvalidRead {
                 local_handle,
@@ -108,11 +114,16 @@ impl From<CatalogStoreError> for FilesystemServiceError {
 /// Shared read-only filesystem service used by the platform adapters.
 #[derive(Debug)]
 pub struct FilesystemService {
-    transport: GrpcClientTransport,
+    config: ClientConfig,
+    client_name: String,
+    server_name: String,
+    transport: Option<GrpcClientTransport>,
     control: LocalControlPlane,
     store: ClientLegatoStore,
     metrics: Option<ClientRuntimeMetrics>,
     max_cache_bytes: u64,
+    transport_attempts: u32,
+    next_transport_attempt_ns: u64,
     last_change_sync_ns: u64,
     last_metrics_report_ns: u64,
     metrics_dirty: bool,
@@ -137,17 +148,23 @@ impl FilesystemService {
         state_dir: &Path,
         metrics: Option<ClientRuntimeMetrics>,
     ) -> Result<Self, FilesystemServiceError> {
+        let client_name = client_name.into();
         let max_cache_bytes = config.cache.max_bytes;
+        let server_name = config.tls.server_name.clone();
         let store = ClientLegatoStore::open(state_dir, now_monotonic_ns())?;
-        let transport = GrpcClientTransport::connect(config, client_name).await?;
         let control = LocalControlPlane::new(MetadataCache::new(MetadataCachePolicy::default()));
 
         let service = Self {
-            transport,
+            config,
+            client_name,
+            server_name,
+            transport: None,
             control,
             store,
             metrics,
             max_cache_bytes,
+            transport_attempts: 0,
+            next_transport_attempt_ns: 0,
             last_change_sync_ns: 0,
             last_metrics_report_ns: 0,
             metrics_dirty: false,
@@ -155,6 +172,13 @@ impl FilesystemService {
             open_handles: HashMap::new(),
         };
         let mut service = service;
+        if let Err(error) = service.connect_transport_now().await {
+            tracing::warn!(
+                error = %error,
+                state_dir = %state_dir.display(),
+                "client remote transport unavailable; mounting from local store"
+            );
+        }
         if let Some(metrics) = &service.metrics {
             metrics.record_residency(
                 service.store.resident_bytes(),
@@ -169,13 +193,13 @@ impl FilesystemService {
     /// Returns attach session metadata for the current connection.
     #[must_use]
     pub fn server_name(&self) -> &str {
-        &self.transport.attach_session().server_name
+        &self.server_name
     }
 
     /// Returns whether the service currently has an active invalidation subscription.
     #[must_use]
     pub fn has_active_subscription(&self) -> bool {
-        true
+        self.transport.is_some()
     }
 
     /// Returns the attached runtime metrics recorder when one is configured.
@@ -196,19 +220,32 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
-        if let Some(metadata) = self.control.resolve_path(path, now_ns) {
+        if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
             self.report_metrics_if_due(false).await;
             log_slow_operation("lookup", path, "cache", started.elapsed());
             return Ok(metadata_to_attributes(metadata));
         }
+        if path == "/" {
+            let metadata = synthetic_root_metadata();
+            self.control.register_path(metadata.clone(), now_ns);
+            self.report_metrics_if_due(false).await;
+            log_slow_operation("lookup", path, "synthetic", started.elapsed());
+            return Ok(metadata_to_attributes(metadata));
+        }
+
+        self.sync_changes_if_due(false).await?;
+        if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
+            self.report_metrics_if_due(false).await;
+            log_slow_operation("lookup", path, "store", started.elapsed());
+            return Ok(metadata_to_attributes(metadata));
+        }
 
         let metadata = self
-            .transport
-            .stat(path.to_owned())
+            .remote_stat(path)
             .await
             .map_err(map_lookup_error(path))?;
+        self.store.record_metadata(metadata.clone())?;
         self.control.register_path(metadata.clone(), now_ns);
         self.report_metrics_if_due(false).await;
         log_slow_operation("lookup", path, "remote", started.elapsed());
@@ -221,19 +258,45 @@ impl FilesystemService {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
-        if let Some(entries) = self.control.list_dir(path, now_ns) {
+        if let Some(entries) = self.lookup_local_directory(path, now_ns) {
             self.report_metrics_if_due(false).await;
             log_slow_operation("read_dir", path, "cache", started.elapsed());
             return Ok(entries);
         }
 
-        let entries = self
-            .transport
-            .list_dir(path.to_owned())
-            .await
-            .map_err(map_lookup_error(path))?;
+        self.sync_changes_if_due(false).await?;
+        if let Some(entries) = self.lookup_local_directory(path, now_ns) {
+            self.report_metrics_if_due(false).await;
+            log_slow_operation("read_dir", path, "store", started.elapsed());
+            return Ok(entries);
+        }
+
+        let directory_metadata = match self.directory_metadata(path, now_ns).await {
+            Ok(metadata) => metadata,
+            Err(error) if path == "/" && is_remote_unavailable(&error) => {
+                self.report_metrics_if_due(false).await;
+                log_slow_operation("read_dir", path, "offline-empty", started.elapsed());
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(map_lookup_error(path)(error)),
+        };
+        if !directory_metadata.is_dir {
+            return Err(FilesystemServiceError::NotFound(path.to_owned()));
+        }
+        let entries = match self.remote_list_dir(path).await {
+            Ok(entries) => entries,
+            Err(error) if path == "/" && is_remote_unavailable(&error) => {
+                self.report_metrics_if_due(false).await;
+                log_slow_operation("read_dir", path, "offline-empty", started.elapsed());
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(map_lookup_error(path)(error)),
+        };
+        self.store.record_metadata(directory_metadata.clone())?;
+        self.store
+            .record_directory(path, FileId(directory_metadata.file_id), entries.clone())?;
+        self.control.register_path(directory_metadata, now_ns);
         self.control.register_dir(path, entries.clone(), now_ns);
         self.report_metrics_if_due(false).await;
         log_slow_operation("read_dir", path, "remote", started.elapsed());
@@ -246,15 +309,39 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
         let started = Instant::now();
+        let now_ns = now_monotonic_ns();
+        if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
+            self.control.register_resolved_path(inode.clone(), now_ns);
+            let handle = inode_to_open_handle(self.next_handle, inode);
+            self.next_handle += 1;
+            self.open_handles
+                .insert(handle.local_handle, handle.clone());
+            self.report_metrics_if_due(false).await;
+            log_slow_operation("open", path, "store", started.elapsed());
+            return Ok(handle);
+        }
+
         self.sync_changes_if_due(false).await?;
+        if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
+            self.control.register_resolved_path(inode.clone(), now_ns);
+            let handle = inode_to_open_handle(self.next_handle, inode);
+            self.next_handle += 1;
+            self.open_handles
+                .insert(handle.local_handle, handle.clone());
+            self.report_metrics_if_due(false).await;
+            log_slow_operation("open", path, "store", started.elapsed());
+            return Ok(handle);
+        }
+
         let inode = self
-            .transport
-            .resolve(path.to_owned())
+            .remote_resolve(path)
             .await
             .map_err(map_lookup_error(path))?;
+        if inode.is_dir {
+            return Err(FilesystemServiceError::NotFound(path.to_owned()));
+        }
         self.store.record_inode(inode.clone())?;
-        self.control
-            .register_resolved_path(inode.clone(), now_monotonic_ns());
+        self.control.register_resolved_path(inode.clone(), now_ns);
         let handle = inode_to_open_handle(self.next_handle, inode);
         self.next_handle += 1;
         self.open_handles
@@ -396,6 +483,266 @@ impl FilesystemService {
         self.store.subscription_cursor()
     }
 
+    /// Opportunistically refreshes local catalog state from the server.
+    pub async fn refresh_remote_state(&mut self) -> Result<(), FilesystemServiceError> {
+        self.sync_changes_if_due(true).await
+    }
+
+    fn lookup_local_metadata(&mut self, path: &str, now_ns: u64) -> Option<FileMetadata> {
+        if let Some(metadata) = self.control.resolve_path(path, now_ns) {
+            return Some(metadata);
+        }
+        let inode = self.store.resolve_path(path)?;
+        self.control.register_resolved_path(inode.clone(), now_ns);
+        Some(inode_to_file_metadata(&inode))
+    }
+
+    fn lookup_local_directory(&mut self, path: &str, now_ns: u64) -> Option<Vec<DirectoryEntry>> {
+        if let Some(entries) = self.control.list_dir(path, now_ns) {
+            return Some(entries);
+        }
+        let entries = self.store.list_directory(path)?;
+        self.control.register_dir(path, entries.clone(), now_ns);
+        Some(entries)
+    }
+
+    async fn directory_metadata(
+        &mut self,
+        path: &str,
+        now_ns: u64,
+    ) -> Result<FileMetadata, FilesystemServiceError> {
+        if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
+            return Ok(metadata);
+        }
+        if path == "/" {
+            return Ok(synthetic_root_metadata());
+        }
+        self.remote_stat(path).await
+    }
+
+    async fn remote_stat(&mut self, path: &str) -> Result<FileMetadata, FilesystemServiceError> {
+        self.ensure_transport_available().await?;
+        let result = self
+            .transport
+            .as_mut()
+            .expect("transport should be available")
+            .stat(path.to_owned())
+            .await;
+        match result {
+            Ok(metadata) => Ok(metadata),
+            Err(error) if should_retry_after_reconnect(&error) => {
+                self.reconnect_transport_now()
+                    .await
+                    .map_err(FilesystemServiceError::Transport)?;
+                self.transport
+                    .as_mut()
+                    .expect("transport should be available")
+                    .stat(path.to_owned())
+                    .await
+                    .map_err(|error| self.handle_remote_error(error))
+            }
+            Err(error) => Err(self.handle_remote_error(error)),
+        }
+    }
+
+    async fn remote_list_dir(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
+        self.ensure_transport_available().await?;
+        let result = self
+            .transport
+            .as_mut()
+            .expect("transport should be available")
+            .list_dir(path.to_owned())
+            .await;
+        match result {
+            Ok(entries) => Ok(entries),
+            Err(error) if should_retry_after_reconnect(&error) => {
+                self.reconnect_transport_now()
+                    .await
+                    .map_err(FilesystemServiceError::Transport)?;
+                self.transport
+                    .as_mut()
+                    .expect("transport should be available")
+                    .list_dir(path.to_owned())
+                    .await
+                    .map_err(|error| self.handle_remote_error(error))
+            }
+            Err(error) => Err(self.handle_remote_error(error)),
+        }
+    }
+
+    async fn remote_resolve(
+        &mut self,
+        path: &str,
+    ) -> Result<InodeMetadata, FilesystemServiceError> {
+        self.ensure_transport_available().await?;
+        let result = self
+            .transport
+            .as_mut()
+            .expect("transport should be available")
+            .resolve(path.to_owned())
+            .await;
+        match result {
+            Ok(inode) => Ok(inode),
+            Err(error) if should_retry_after_reconnect(&error) => {
+                self.reconnect_transport_now()
+                    .await
+                    .map_err(FilesystemServiceError::Transport)?;
+                self.transport
+                    .as_mut()
+                    .expect("transport should be available")
+                    .resolve(path.to_owned())
+                    .await
+                    .map_err(|error| self.handle_remote_error(error))
+            }
+            Err(error) => Err(self.handle_remote_error(error)),
+        }
+    }
+
+    async fn remote_fetch_extents(
+        &mut self,
+        extents: Vec<ExtentRef>,
+    ) -> Result<Vec<legato_proto::ExtentRecord>, FilesystemServiceError> {
+        self.ensure_transport_available().await?;
+        let result = self
+            .transport
+            .as_mut()
+            .expect("transport should be available")
+            .fetch_extents(extents.clone())
+            .await;
+        match result {
+            Ok(records) => Ok(records),
+            Err(error) if should_retry_after_reconnect(&error) => {
+                self.reconnect_transport_now()
+                    .await
+                    .map_err(FilesystemServiceError::Transport)?;
+                self.transport
+                    .as_mut()
+                    .expect("transport should be available")
+                    .fetch_extents(extents)
+                    .await
+                    .map_err(|error| self.handle_remote_error(error))
+            }
+            Err(error) => Err(self.handle_remote_error(error)),
+        }
+    }
+
+    async fn remote_change_records_since(
+        &mut self,
+        cursor: u64,
+    ) -> Result<Vec<ChangeRecord>, FilesystemServiceError> {
+        self.ensure_transport_available().await?;
+        let result = self
+            .transport
+            .as_mut()
+            .expect("transport should be available")
+            .change_records_since(cursor)
+            .await;
+        match result {
+            Ok(records) => Ok(records),
+            Err(error) if should_retry_after_reconnect(&error) => {
+                self.reconnect_transport_now()
+                    .await
+                    .map_err(FilesystemServiceError::Transport)?;
+                self.transport
+                    .as_mut()
+                    .expect("transport should be available")
+                    .change_records_since(cursor)
+                    .await
+                    .map_err(|error| self.handle_remote_error(error))
+            }
+            Err(error) => Err(self.handle_remote_error(error)),
+        }
+    }
+
+    async fn ensure_transport_available(&mut self) -> Result<(), FilesystemServiceError> {
+        if self.transport.is_some() {
+            return Ok(());
+        }
+        let now_ns = now_monotonic_ns();
+        if now_ns < self.next_transport_attempt_ns {
+            return Err(FilesystemServiceError::Unavailable(format!(
+                "retry backoff active for {} ms",
+                self.next_transport_attempt_ns.saturating_sub(now_ns) / 1_000_000
+            )));
+        }
+        self.connect_transport_now()
+            .await
+            .map_err(FilesystemServiceError::Transport)
+    }
+
+    async fn connect_transport_now(&mut self) -> Result<(), crate::ClientTransportError> {
+        match GrpcClientTransport::connect(self.config.clone(), self.client_name.clone()).await {
+            Ok(transport) => {
+                self.server_name = transport.attach_session().server_name.clone();
+                self.transport = Some(transport);
+                self.transport_attempts = 0;
+                self.next_transport_attempt_ns = 0;
+                tracing::info!(
+                    server_name = self.server_name.as_str(),
+                    "client remote transport connected"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.record_transport_failure(&error);
+                Err(error)
+            }
+        }
+    }
+
+    async fn reconnect_transport_now(&mut self) -> Result<(), crate::ClientTransportError> {
+        let result = if let Some(transport) = self.transport.as_mut() {
+            transport.reconnect().await.map(|_| ())
+        } else {
+            return self.connect_transport_now().await;
+        };
+        match result {
+            Ok(()) => {
+                if let Some(transport) = self.transport.as_ref() {
+                    self.server_name = transport.attach_session().server_name.clone();
+                }
+                self.transport_attempts = 0;
+                self.next_transport_attempt_ns = 0;
+                tracing::info!(
+                    server_name = self.server_name.as_str(),
+                    "client remote transport reconnected"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.record_transport_failure(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn handle_remote_error(
+        &mut self,
+        error: crate::ClientTransportError,
+    ) -> FilesystemServiceError {
+        if should_retry_after_reconnect(&error) {
+            self.record_transport_failure(&error);
+        }
+        FilesystemServiceError::Transport(error)
+    }
+
+    fn record_transport_failure(&mut self, error: &crate::ClientTransportError) {
+        self.transport = None;
+        self.transport_attempts = self.transport_attempts.saturating_add(1);
+        let delay_ms = retry_delay_ms(&self.config.retry, self.transport_attempts);
+        self.next_transport_attempt_ns =
+            now_monotonic_ns().saturating_add(delay_ms.saturating_mul(1_000_000));
+        tracing::warn!(
+            error = %error,
+            attempts = self.transport_attempts,
+            retry_delay_ms = delay_ms,
+            "client remote transport unavailable"
+        );
+    }
+
     async fn sync_changes_if_due(&mut self, force: bool) -> Result<(), FilesystemServiceError> {
         let now_ns = now_monotonic_ns();
         if !force && now_ns.saturating_sub(self.last_change_sync_ns) < CHANGE_SYNC_INTERVAL_NS {
@@ -404,8 +751,7 @@ impl FilesystemService {
         self.last_change_sync_ns = now_ns;
         let started = Instant::now();
         match self
-            .transport
-            .change_records_since(self.store.subscription_cursor())
+            .remote_change_records_since(self.store.subscription_cursor())
             .await
         {
             Ok(records) => {
@@ -416,24 +762,13 @@ impl FilesystemService {
                 log_slow_change_sync(record_count, started.elapsed());
                 Ok(())
             }
-            Err(error) if should_retry_after_reconnect(&error) => {
-                let reconnect_started = Instant::now();
-                self.transport.reconnect().await?;
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
-                    self.metrics_dirty = true;
-                }
-                for record in self
-                    .transport
-                    .change_records_since(self.store.subscription_cursor())
-                    .await?
-                {
-                    self.apply_change_record(&record)?;
-                }
-                log_slow_change_sync(0, started.elapsed());
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "client change sync skipped; local catalog remains active"
+                );
                 Ok(())
             }
-            Err(error) => Err(FilesystemServiceError::Transport(error)),
         }
     }
 
@@ -454,40 +789,12 @@ impl FilesystemService {
                 extent_hash: extent.extent_hash.clone(),
             })
             .collect::<Vec<_>>();
-        match self.transport.fetch_extents(request_extents).await {
+        match self.remote_fetch_extents(request_extents).await {
             Ok(extents) => {
                 self.store_extents(&extents, now_ns)?;
                 Ok(())
             }
-            Err(error) if should_retry_after_reconnect(&error) => {
-                let reconnect_started = Instant::now();
-                self.transport.reconnect().await?;
-                if let Some(metrics) = &self.metrics {
-                    metrics.record_reconnect(reconnect_started.elapsed().as_nanos() as u64);
-                    self.metrics_dirty = true;
-                }
-                self.sync_changes_if_due(true).await?;
-                let refreshed = self
-                    .open_handles
-                    .get(&handle.local_handle)
-                    .cloned()
-                    .ok_or(FilesystemServiceError::UnknownHandle(handle.local_handle))?;
-                let retry_extents = missing_extents
-                    .iter()
-                    .map(|extent| ExtentRef {
-                        file_id: refreshed.file_id.0,
-                        extent_index: extent.extent_index,
-                        file_offset: extent.file_offset,
-                        length: extent.length,
-                        inode_generation: refreshed.inode_generation,
-                        extent_hash: extent.extent_hash.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let extents = self.transport.fetch_extents(retry_extents).await?;
-                self.store_extents(&extents, now_ns)?;
-                Ok(())
-            }
-            Err(error) => Err(FilesystemServiceError::Transport(error)),
+            Err(error) => Err(error),
         }
     }
 
@@ -537,12 +844,20 @@ impl FilesystemService {
         {
             return;
         }
-        match self.transport.report_metrics(&snapshot).await {
+        let result = if let Some(transport) = self.transport.as_mut() {
+            transport.report_metrics(&snapshot).await
+        } else {
+            return;
+        };
+        match result {
             Ok(()) => {
                 self.last_metrics_report_ns = now_ns;
                 self.metrics_dirty = false;
             }
             Err(error) => {
+                if should_retry_after_reconnect(&error) {
+                    self.record_transport_failure(&error);
+                }
                 tracing::warn!(
                     error = %error,
                     samples = snapshot.len(),
@@ -628,7 +943,10 @@ fn assemble_read(
 
     for descriptor in read_plan(handle, offset, size) {
         let Some(extent) = store.get_extent(handle.file_id, descriptor.extent_index)? else {
-            return Err(FilesystemServiceError::NotFound(handle.path.clone()));
+            return Err(FilesystemServiceError::Unavailable(format!(
+                "extent {} for {} is not resident",
+                descriptor.extent_index, handle.path
+            )));
         };
         store.touch_extent(handle.file_id, descriptor.extent_index, now_ns)?;
         let extent_end = extent.file_offset.saturating_add(extent.data.len() as u64);
@@ -657,6 +975,28 @@ fn metadata_to_attributes(metadata: FileMetadata) -> FilesystemAttributes {
     }
 }
 
+fn inode_to_file_metadata(inode: &InodeMetadata) -> FileMetadata {
+    FileMetadata {
+        file_id: inode.file_id,
+        path: inode.path.clone(),
+        size: inode.size,
+        mtime_ns: inode.mtime_ns,
+        content_hash: inode.content_hash.clone(),
+        is_dir: inode.is_dir,
+    }
+}
+
+fn synthetic_root_metadata() -> FileMetadata {
+    FileMetadata {
+        file_id: ROOT_FILE_ID,
+        path: String::from("/"),
+        size: 0,
+        mtime_ns: 0,
+        content_hash: Vec::new(),
+        is_dir: true,
+    }
+}
+
 fn inode_to_open_handle(local_handle: u64, inode: InodeMetadata) -> FilesystemOpenHandle {
     let transfer_class = inode
         .layout
@@ -677,13 +1017,36 @@ fn inode_to_open_handle(local_handle: u64, inode: InodeMetadata) -> FilesystemOp
 
 fn map_lookup_error<'a>(
     path: &'a str,
-) -> impl FnOnce(crate::ClientTransportError) -> FilesystemServiceError + 'a {
+) -> impl FnOnce(FilesystemServiceError) -> FilesystemServiceError + 'a {
     move |error| match &error {
-        crate::ClientTransportError::Rpc(status) if status.code() == tonic::Code::NotFound => {
+        FilesystemServiceError::Transport(crate::ClientTransportError::Rpc(status))
+            if status.code() == tonic::Code::NotFound =>
+        {
             FilesystemServiceError::NotFound(path.to_owned())
         }
-        _ => FilesystemServiceError::Transport(error),
+        _ => error,
     }
+}
+
+fn is_remote_unavailable(error: &FilesystemServiceError) -> bool {
+    match error {
+        FilesystemServiceError::Unavailable(_) => true,
+        FilesystemServiceError::Transport(error) => should_retry_after_reconnect(error),
+        _ => false,
+    }
+}
+
+fn retry_delay_ms(policy: &crate::RetryPolicy, attempts: u32) -> u64 {
+    if policy.initial_delay_ms == 0 {
+        return 0;
+    }
+    let max_delay_ms = policy.max_delay_ms.max(policy.initial_delay_ms);
+    let multiplier = u64::from(policy.multiplier.max(1));
+    let mut delay = policy.initial_delay_ms;
+    for _ in 1..attempts {
+        delay = delay.saturating_mul(multiplier).min(max_delay_ms);
+    }
+    delay
 }
 
 fn log_slow_operation(
@@ -773,7 +1136,11 @@ fn overlap_len(
 mod tests {
     use std::{fs, path::Path};
 
-    use legato_proto::{ExtentDescriptor, FileLayout, InodeMetadata, TransferClass};
+    use legato_client_cache::client_store::ClientLegatoStore;
+    use legato_proto::{
+        DirectoryEntry, ExtentDescriptor, ExtentRecord, FileLayout, InodeMetadata, TransferClass,
+    };
+    use legato_types::FileId;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
 
@@ -803,6 +1170,18 @@ mod tests {
             },
             ..crate::ClientConfig::default()
         }
+    }
+
+    fn unavailable_client_config(root: &Path, client_name: &str) -> crate::ClientConfig {
+        let tls_dir = root.join(format!("tls-{client_name}"));
+        let bundle_dir = root.join(format!("bundle-{client_name}"));
+        let mut server_tls = ServerTlsConfig::local_dev(&tls_dir);
+        server_tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(&tls_dir, &server_tls)
+            .expect("tls materials should be created");
+        issue_client_tls_bundle(&tls_dir, &server_tls, client_name, &bundle_dir)
+            .expect("client bundle should be issued");
+        local_client_config(String::from("127.0.0.1:1"), &bundle_dir, "localhost")
     }
 
     #[tokio::test]
@@ -892,6 +1271,122 @@ mod tests {
             .shutdown()
             .await
             .expect("server should shut down");
+    }
+
+    #[tokio::test]
+    async fn filesystem_service_mounts_from_local_store_when_remote_is_unavailable() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let client_state = fixture.path().join("client-state");
+        let mut store = ClientLegatoStore::open(&client_state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 1,
+                path: String::from("/"),
+                size: 0,
+                mtime_ns: 1,
+                is_dir: true,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: Vec::new(),
+            })
+            .expect("root inode should record");
+        store
+            .record_directory(
+                "/",
+                FileId(1),
+                vec![DirectoryEntry {
+                    name: String::from("cached.wav"),
+                    path: String::from("/cached.wav"),
+                    is_dir: false,
+                    file_id: 7,
+                }],
+            )
+            .expect("root directory should record");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 7,
+                path: String::from("/cached.wav"),
+                size: 6,
+                mtime_ns: 2,
+                is_dir: false,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: vec![ExtentDescriptor {
+                        extent_index: 0,
+                        file_offset: 0,
+                        length: 6,
+                        extent_hash: Vec::new(),
+                    }],
+                }),
+                inode_generation: 1,
+                content_hash: b"cached".to_vec(),
+            })
+            .expect("file inode should record");
+        store
+            .put_extent(&ExtentRecord {
+                file_id: 7,
+                extent_index: 0,
+                file_offset: 0,
+                data: b"cached".to_vec(),
+                extent_hash: Vec::new(),
+                transfer_class: TransferClass::Unitary as i32,
+            })
+            .expect("extent should store");
+        store.checkpoint().expect("checkpoint should write");
+        drop(store);
+
+        let mut service = FilesystemService::connect(
+            unavailable_client_config(fixture.path(), "offline-client"),
+            "offline-client",
+            &client_state,
+        )
+        .await
+        .expect("service should mount from local store");
+
+        assert!(!service.has_active_subscription());
+        assert_eq!(service.server_name(), "localhost");
+        let root = service.lookup("/").await.expect("root should resolve");
+        assert!(root.is_dir);
+        let entries = service.read_dir("/").await.expect("root should list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/cached.wav");
+        let attrs = service
+            .lookup("/cached.wav")
+            .await
+            .expect("cached file should resolve");
+        assert_eq!(attrs.size, 6);
+        let handle = service
+            .open("/cached.wav")
+            .await
+            .expect("cached file should open");
+        let bytes = service
+            .read(handle.local_handle, 0, 6)
+            .await
+            .expect("resident bytes should read");
+
+        assert_eq!(bytes, b"cached");
+    }
+
+    #[tokio::test]
+    async fn filesystem_service_exposes_empty_root_without_catalog_or_remote() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let client_state = fixture.path().join("empty-client-state");
+        let mut service = FilesystemService::connect(
+            unavailable_client_config(fixture.path(), "empty-offline-client"),
+            "empty-offline-client",
+            &client_state,
+        )
+        .await
+        .expect("service should mount without a populated catalog");
+
+        let root = service.lookup("/").await.expect("root should resolve");
+        let entries = service.read_dir("/").await.expect("root should list");
+
+        assert!(root.is_dir);
+        assert!(entries.is_empty());
     }
 
     #[tokio::test]

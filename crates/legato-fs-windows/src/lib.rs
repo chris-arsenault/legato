@@ -581,9 +581,9 @@ fn map_error(error: FilesystemServiceError) -> PlatformErrorCode {
         FilesystemServiceError::NotFound(_) => FilesystemError::NotFound,
         FilesystemServiceError::UnknownHandle(_) => FilesystemError::StaleHandle,
         FilesystemServiceError::InvalidRead { .. } => FilesystemError::InvalidInput,
-        FilesystemServiceError::Transport(_) | FilesystemServiceError::Store(_) => {
-            FilesystemError::Transient
-        }
+        FilesystemServiceError::Unavailable(_)
+        | FilesystemServiceError::Transport(_)
+        | FilesystemServiceError::Store(_) => FilesystemError::Transient,
     };
     platform_error_code(ClientPlatform::Windows, kind)
 }
@@ -700,9 +700,9 @@ fn map_mount_error(error: FilesystemServiceError) -> FspError {
         FilesystemServiceError::InvalidRead { .. } => {
             FspError::IO(std::io::ErrorKind::InvalidInput)
         }
-        FilesystemServiceError::Transport(_) | FilesystemServiceError::Store(_) => {
-            FspError::NTSTATUS(0xC000_00E9u32 as i32)
-        }
+        FilesystemServiceError::Unavailable(_)
+        | FilesystemServiceError::Transport(_)
+        | FilesystemServiceError::Store(_) => FspError::NTSTATUS(0xC000_00E9u32 as i32),
     }
 }
 

@@ -8,8 +8,8 @@ use std::{
 };
 
 use legato_proto::{
-    ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, InodeMetadata, InvalidationEvent,
-    InvalidationKind,
+    ChangeKind, ChangeRecord, DirectoryEntry, ExtentRecord, FileMetadata, InodeMetadata,
+    InvalidationEvent, InvalidationKind, TransferClass,
 };
 use legato_types::{FileId, PrefetchPriority};
 
@@ -83,6 +83,30 @@ impl ClientLegatoStore {
         Ok(())
     }
 
+    /// Records file metadata from a stat-style response while preserving any known extent layout.
+    pub fn record_metadata(&mut self, metadata: FileMetadata) -> Result<(), CatalogStoreError> {
+        let existing = self
+            .catalog
+            .resolve_file_id(FileId(metadata.file_id))
+            .or_else(|| self.catalog.resolve_path(&metadata.path))
+            .cloned();
+        let inode = CatalogInode {
+            file_id: FileId(metadata.file_id),
+            path: metadata.path,
+            inode_generation: existing.as_ref().map_or(1, |inode| inode.inode_generation),
+            size: metadata.size,
+            mtime_ns: metadata.mtime_ns as i64,
+            is_dir: metadata.is_dir,
+            content_hash: metadata.content_hash,
+            transfer_class: existing
+                .as_ref()
+                .map_or(TransferClass::Unitary as i32, |inode| inode.transfer_class),
+            extents: existing.map_or_else(Vec::new, |inode| inode.extents),
+        };
+        let _ = self.catalog.append_inode(inode)?;
+        Ok(())
+    }
+
     /// Records one canonical directory listing in the local catalog.
     pub fn record_directory(
         &mut self,
@@ -116,6 +140,22 @@ impl ClientLegatoStore {
     #[must_use]
     pub fn resolve_path(&self, path: &str) -> Option<InodeMetadata> {
         self.catalog.resolve_path(path).cloned().map(inode_to_proto)
+    }
+
+    /// Returns a locally known directory listing when one has been persisted.
+    #[must_use]
+    pub fn list_directory(&self, path: &str) -> Option<Vec<DirectoryEntry>> {
+        self.catalog.list_directory(path).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| DirectoryEntry {
+                    name: entry.name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                    file_id: entry.file_id.0,
+                })
+                .collect()
+        })
     }
 
     /// Returns the durable subscription cursor for replay resumption.
@@ -664,6 +704,80 @@ mod tests {
         assert!(state.join("catalog").is_dir());
         assert!(state.join("segments").is_dir());
         assert!(state.join("checkpoints").is_dir());
+    }
+
+    #[test]
+    fn client_store_replays_directory_listings_after_reopen() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 1,
+                path: String::from("/"),
+                size: 0,
+                mtime_ns: 1,
+                is_dir: true,
+                layout: Some(legato_proto::FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: Vec::new(),
+            })
+            .expect("root inode should record");
+        store
+            .record_directory(
+                "/",
+                FileId(1),
+                vec![DirectoryEntry {
+                    name: String::from("piano.wav"),
+                    path: String::from("/piano.wav"),
+                    is_dir: false,
+                    file_id: 7,
+                }],
+            )
+            .expect("directory should record");
+        drop(store);
+
+        let reopened = ClientLegatoStore::open(&state, 200).expect("store should reopen");
+        let entries = reopened
+            .list_directory("/")
+            .expect("directory should be available");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/piano.wav");
+        assert_eq!(entries[0].file_id, 7);
+    }
+
+    #[test]
+    fn client_store_stat_metadata_preserves_resident_extent_layout() {
+        let temp = tempdir().expect("tempdir should exist");
+        let state = temp.path().join("state");
+        let mut store = ClientLegatoStore::open(&state, 100).expect("store should open");
+        store
+            .record_inode(sample_inode())
+            .expect("inode should record");
+        store
+            .put_extent(&sample_extent(b"resident-data"))
+            .expect("extent should store");
+        store
+            .record_metadata(legato_proto::FileMetadata {
+                file_id: 7,
+                path: String::from("/library/piano.wav"),
+                size: 13,
+                mtime_ns: 999,
+                content_hash: b"updated".to_vec(),
+                is_dir: false,
+            })
+            .expect("metadata should record");
+
+        let inode = store
+            .resolve_path("/library/piano.wav")
+            .expect("inode should remain");
+        assert_eq!(inode.mtime_ns, 999);
+        assert_eq!(inode.layout.expect("layout should remain").extents.len(), 1);
+        assert_eq!(store.resident_extent_count(), 1);
     }
 
     #[test]

@@ -25,6 +25,8 @@ use legato_proto::{
 };
 
 const CHANGE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Session metadata returned after a successful attach.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -528,6 +530,8 @@ async fn connect_client(
 ) -> Result<LegatoClient<Channel>, ClientTransportError> {
     let endpoint = Endpoint::from_shared(endpoint_uri(&config.endpoint))
         .map_err(|_error| ClientTransportError::InvalidEndpoint(config.endpoint.clone()))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(RPC_TIMEOUT)
         .tls_config(load_tonic_tls_config(&config.tls)?)?;
     let channel = endpoint.connect().await?;
     Ok(LegatoClient::new(channel))

@@ -133,7 +133,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     ));
-    let server_name = service.lock().await.server_name().to_owned();
+    let (server_name, remote_connected) = {
+        let service = service.lock().await;
+        (
+            service.server_name().to_owned(),
+            service.has_active_subscription(),
+        )
+    };
 
     #[cfg(target_os = "macos")]
     {
@@ -146,16 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telemetry.set_lifecycle_state("ready", 1);
         tracing::info!(
             server_name = server_name.as_str(),
+            remote_connected,
             mount_point = adapter.mount_point(),
             platform = adapter.platform_name(),
             library_root = process_config.mount.library_root.as_str(),
-            "client connected and mounting"
+            "client mounting"
         );
-        println!(
-            "legatofs connected to {} and mounting on {} for {}",
-            server_name,
+        print_mount_status(
+            &server_name,
+            remote_connected,
             adapter.mount_point(),
-            adapter.platform_name()
+            adapter.platform_name(),
         );
         return legato_fs_macos::mount(
             service,
@@ -176,16 +183,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telemetry.set_lifecycle_state("ready", 1);
         tracing::info!(
             server_name = server_name.as_str(),
+            remote_connected,
             mount_point = adapter.mount_point(),
             platform = adapter.platform_name(),
             library_root = process_config.mount.library_root.as_str(),
-            "client connected and mounting"
+            "client mounting"
         );
-        println!(
-            "legatofs connected to {} and mounting on {} for {}",
-            server_name,
+        print_mount_status(
+            &server_name,
+            remote_connected,
             adapter.mount_point(),
-            adapter.platform_name()
+            adapter.platform_name(),
         );
         return legato_fs_windows::mount(
             service,
@@ -201,13 +209,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         telemetry.set_lifecycle_state("ready", 1);
         tracing::info!(
             server_name = server_name.as_str(),
-            "client connected on unsupported host"
+            remote_connected,
+            "client ready on unsupported host"
         );
-        println!(
-            "legatofs connected to {} and bootstrap ready for unsupported-host development",
-            server_name
-        );
+        if remote_connected {
+            println!(
+                "legatofs connected to {} and bootstrap ready for unsupported-host development",
+                server_name
+            );
+        } else {
+            println!(
+                "legatofs mounted local state for {} and will reconnect on demand",
+                server_name
+            );
+        }
         Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn print_mount_status(
+    server_name: &str,
+    remote_connected: bool,
+    mount_point: &str,
+    platform: &str,
+) {
+    if remote_connected {
+        println!(
+            "legatofs connected to {server_name} and mounting on {mount_point} for {platform}"
+        );
+    } else {
+        println!(
+            "legatofs mounting local state on {mount_point} for {platform}; remote {server_name} is unavailable"
+        );
     }
 }
 
