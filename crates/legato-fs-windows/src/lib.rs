@@ -363,6 +363,7 @@ pub async fn mount(
     library_root: impl Into<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mount_point = normalize_mount_point(mount_point.as_ref());
+    let mount_point_label = mount_point.to_string_lossy().into_owned();
     prepare_mount_point(&mount_point)?;
     let _winfsp = winfsp::winfsp_init()?;
     let mut volume_params = VolumeParams::new();
@@ -384,6 +385,10 @@ pub async fn mount(
     )?;
     host.mount(mount_point)?;
     host.start()?;
+    tracing::info!(
+        mount_point = mount_point_label.as_str(),
+        "windows mount started"
+    );
     std::future::pending::<()>().await;
     Ok(())
 }

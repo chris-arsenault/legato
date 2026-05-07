@@ -843,10 +843,14 @@ fn stop_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "windows")]
 fn stop_mount_agent_service() -> Result<(), Box<dyn std::error::Error>> {
-    run_process(
+    let task_result = run_process(
         process_with_args("schtasks", ["/End", "/TN", LEGATO_WINDOWS_TASK_NAME]),
         "stop scheduled task",
-    )?;
+    );
+    let _ = ProcessCommand::new("taskkill")
+        .args(["/IM", "legatofs.exe", "/F"])
+        .status();
+    task_result?;
     println!("stopped scheduled task {}", LEGATO_WINDOWS_TASK_NAME);
     Ok(())
 }
@@ -1347,6 +1351,7 @@ fn windows_task_command(config_path: &Path) -> Result<String, Box<dyn std::error
             config_path,
             &log_dir.join("legatofs.out.log"),
             &log_dir.join("legatofs.err.log"),
+            &log_dir.join("legatofs.wrapper.log"),
         ),
     )?;
     Ok(windows_task_command_for_wrapper(&wrapper_path))
@@ -1358,19 +1363,31 @@ fn render_windows_task_wrapper(
     config_path: &Path,
     stdout_log: &Path,
     stderr_log: &Path,
+    wrapper_log: &Path,
 ) -> String {
     format!(
         "Set shell = CreateObject(\"WScript.Shell\")\r\n\
+         Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
          Set env = shell.Environment(\"PROCESS\")\r\n\
          env(\"LEGATO_FS_CONFIG\") = \"{}\"\r\n\
          quote = Chr(34)\r\n\
          command = quote & \"{}\" & quote & \" >> \" & quote & \"{}\" & quote & \" 2>> \" & quote & \"{}\" & quote\r\n\
-         exitCode = shell.Run(\"%ComSpec% /D /S /C \" & quote & command & quote, 0, True)\r\n\
-         WScript.Quit exitCode\r\n",
+         logPath = \"{}\"\r\n\
+         Do\r\n\
+         \x20\x20Set log = fso.OpenTextFile(logPath, 8, True)\r\n\
+         \x20\x20log.WriteLine Now & \" starting legatofs\"\r\n\
+         \x20\x20log.Close\r\n\
+         \x20\x20exitCode = shell.Run(\"%ComSpec% /D /S /C \" & quote & command & quote, 0, True)\r\n\
+         \x20\x20Set log = fso.OpenTextFile(logPath, 8, True)\r\n\
+         \x20\x20log.WriteLine Now & \" legatofs exited code=\" & exitCode & \"; restarting in 5s\"\r\n\
+         \x20\x20log.Close\r\n\
+         \x20\x20WScript.Sleep 5000\r\n\
+         Loop\r\n",
         vbs_escape(config_path.to_string_lossy().as_ref()),
         vbs_escape(executable.to_string_lossy().as_ref()),
         vbs_escape(stdout_log.to_string_lossy().as_ref()),
-        vbs_escape(stderr_log.to_string_lossy().as_ref())
+        vbs_escape(stderr_log.to_string_lossy().as_ref()),
+        vbs_escape(wrapper_log.to_string_lossy().as_ref())
     )
 }
 
@@ -2076,6 +2093,7 @@ mod tests {
             &config,
             &log_dir.join("legatofs.out.log"),
             &log_dir.join("legatofs.err.log"),
+            &log_dir.join("legatofs.wrapper.log"),
         );
 
         assert!(command.contains("wscript.exe"));
@@ -2086,8 +2104,11 @@ mod tests {
         assert!(wrapper.contains("C:\\Program Files\\Legato\\legatofs.exe"));
         assert!(wrapper.contains("legatofs.out.log"));
         assert!(wrapper.contains("legatofs.err.log"));
+        assert!(wrapper.contains("legatofs.wrapper.log"));
         assert!(wrapper.contains("shell.Run"));
         assert!(wrapper.contains(", 0, True"));
+        assert!(wrapper.contains("Do"));
+        assert!(wrapper.contains("restarting in 5s"));
     }
 
     #[test]
