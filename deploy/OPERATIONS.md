@@ -27,6 +27,8 @@ This document is the deployment and recovery guide for running Legato as a Docke
 
 For the `apps` pool layout, a helper script is available at [create-legato-datasets.sh](/home/dev/repos/legato/deploy/truenas/create-legato-datasets.sh). It creates the Legato app datasets plus the SMB-ready `VST`, `samples`, and `kontakt` datasets under `/mnt/apps/shares/legato/`. The helper defaults to the same `42173:42173` UID/GID as [compose.yaml](/home/dev/repos/legato/compose.yaml) and creates a local UNIX account by default; set `LEGATO_SMB_USER=true` and `LEGATO_SMB_PASSWORD=...` if you also want a TrueNAS SMB-enabled account created for that identity.
 
+For one-time SMB ACL setup and temporary Windows or macOS copy mounts, see [SMB_SETUP.md](/home/dev/repos/legato/deploy/truenas/SMB_SETUP.md).
+
 The canonical host-to-container mount mapping for that layout is:
 
 - `/mnt/apps/shares/legato` -> `/srv/libraries` (read-only)
