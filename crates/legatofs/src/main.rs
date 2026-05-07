@@ -1408,13 +1408,13 @@ fn render_windows_task_wrapper(
          command = quote & \"{}\" & quote & \" >> \" & quote & \"{}\" & quote & \" 2>> \" & quote & \"{}\" & quote\r\n\
          logPath = \"{}\"\r\n\
          Do\r\n\
-         \x20\x20Set log = fso.OpenTextFile(logPath, 8, True)\r\n\
-         \x20\x20log.WriteLine Now & \" starting legatofs\"\r\n\
-         \x20\x20log.Close\r\n\
+         \x20\x20Set logFile = fso.OpenTextFile(logPath, 8, True)\r\n\
+         \x20\x20logFile.WriteLine Now & \" starting legatofs\"\r\n\
+         \x20\x20logFile.Close\r\n\
          \x20\x20exitCode = shell.Run(\"%ComSpec% /D /S /C \" & quote & command & quote, 0, True)\r\n\
-         \x20\x20Set log = fso.OpenTextFile(logPath, 8, True)\r\n\
-         \x20\x20log.WriteLine Now & \" legatofs exited code=\" & exitCode & \"; restarting in 5s\"\r\n\
-         \x20\x20log.Close\r\n\
+         \x20\x20Set logFile = fso.OpenTextFile(logPath, 8, True)\r\n\
+         \x20\x20logFile.WriteLine Now & \" legatofs exited code=\" & exitCode & \"; restarting in 5s\"\r\n\
+         \x20\x20logFile.Close\r\n\
          \x20\x20WScript.Sleep 5000\r\n\
          Loop\r\n",
         vbs_escape(config_path.to_string_lossy().as_ref()),
@@ -2140,6 +2140,8 @@ mod tests {
         assert!(wrapper.contains("legatofs.err.log"));
         assert!(wrapper.contains("legatofs.wrapper.log"));
         assert!(wrapper.contains("shell.Run"));
+        assert!(wrapper.contains("Set logFile ="));
+        assert!(!wrapper.contains("Set log ="));
         assert!(wrapper.contains(", 0, True"));
         assert!(wrapper.contains("Do"));
         assert!(wrapper.contains("restarting in 5s"));
