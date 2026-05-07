@@ -79,7 +79,7 @@ Client logs are local host diagnostics:
 - macOS: `~/Library/Logs/Legato/`
 - Windows: `C:\ProgramData\Legato\logs\`
 
-New client installs also write a tracing log file named `legatofs.log` in the client log directory. The scheduled service still redirects stdout and stderr to `legatofs.out.log` and `legatofs.err.log`.
+New client installs write a tracing log file named `legatofs.log` in the client log directory. On Windows, the scheduled task runs `legatofs.exe --config C:\ProgramData\Legato\legatofs.toml` directly, with no generated VBS or `cmd.exe` launcher.
 
 The Windows client logs any mount callback or client metadata/read operation that takes longer than 250 ms. Slow lines include the operation name, path or handle, and elapsed milliseconds.
 

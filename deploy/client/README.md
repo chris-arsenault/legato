@@ -76,7 +76,7 @@ The installer prompts for:
 
 Windows mounts require the WinFsp MSI from `https://winfsp.dev/rel/`. The Legato installer validates the installed runtime and fixes the WinFsp registry compatibility key used by the client before starting the background task.
 
-The installer registers the client, installs the scheduled task, and starts the client before it exits.
+The installer registers the client, installs the per-user scheduled task, and starts the client before it exits. The task is per-user because the WinFsp drive letter is hosted in that user's interactive Windows session.
 
 Default Windows runtime paths:
 
@@ -84,7 +84,7 @@ Default Windows runtime paths:
 - Config: `C:\ProgramData\Legato\legatofs.toml`
 - Logs: `C:\ProgramData\Legato\logs\`
 
-The main client tracing file is `C:\ProgramData\Legato\logs\legatofs.log`. The Windows scheduled task also redirects process stdout and stderr to `legatofs.out.log` and `legatofs.err.log`.
+The main client tracing file is `C:\ProgramData\Legato\logs\legatofs.log`. The Windows scheduled task runs `legatofs.exe --config C:\ProgramData\Legato\legatofs.toml` directly, with no generated VBS or `cmd.exe` launcher.
 
 The Windows client writes slow-operation warnings to the log when a mount callback or client metadata/read operation takes longer than 250 ms.
 

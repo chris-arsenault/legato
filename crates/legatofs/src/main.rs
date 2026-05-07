@@ -94,11 +94,16 @@ struct PrefetchControlServer {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(command) = parse_command()? {
-        return run_command(command).await;
+    match parse_invocation()? {
+        Invocation::Runtime { config_path } => run_mount_runtime(config_path.as_deref()).await,
+        Invocation::Command(command) => run_command(command).await,
     }
+}
 
-    let runtime_config_path = runtime_config_path();
+async fn run_mount_runtime(config_path: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(runtime_config_path);
     let mut process_config =
         load_config::<ClientProcessConfig>(Some(&runtime_config_path), "LEGATO_FS")?;
     apply_client_operational_defaults(&mut process_config);
@@ -120,10 +125,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("local client metrics exporter is disabled; metrics report through server");
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        loop {
+            match run_mount_once(&process_config, &telemetry).await {
+                Ok(()) => {
+                    tracing::warn!("windows mount runtime exited; restarting in 5s");
+                }
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        "windows mount runtime failed; restarting in 5s"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    run_mount_once(&process_config, &telemetry).await
+}
+
+async fn run_mount_once(
+    process_config: &ClientProcessConfig,
+    telemetry: &ProcessTelemetry,
+) -> Result<(), Box<dyn std::error::Error>> {
     #[allow(unused_variables)]
     let startup = startup_context(&process_config.mount);
     let client_name = default_client_name();
-    let client_metrics = ClientRuntimeMetrics::new("legatofs", &telemetry);
+    let client_metrics = ClientRuntimeMetrics::new("legatofs", telemetry);
     let service = Arc::new(Mutex::new(
         FilesystemService::connect_with_metrics(
             process_config.client.clone(),
@@ -246,6 +277,12 @@ fn print_mount_status(
 }
 
 #[derive(Debug, Eq, PartialEq)]
+enum Invocation {
+    Runtime { config_path: Option<PathBuf> },
+    Command(Command),
+}
+
+#[derive(Debug, Eq, PartialEq)]
 enum Command {
     Cache {
         action: CacheCommand,
@@ -293,8 +330,34 @@ enum ServiceCommand {
     Status,
 }
 
-fn parse_command() -> Result<Option<Command>, Box<dyn std::error::Error>> {
-    parse_command_impl(env::args().skip(1))
+fn parse_invocation() -> Result<Invocation, Box<dyn std::error::Error>> {
+    parse_invocation_impl(env::args().skip(1))
+}
+
+fn parse_invocation_impl<I>(arguments: I) -> Result<Invocation, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut arguments = arguments.into_iter();
+    let Some(first) = arguments.next() else {
+        return Ok(Invocation::Runtime { config_path: None });
+    };
+    if first == "--config" {
+        let config_path = arguments
+            .next()
+            .ok_or("missing value for top-level --config")?;
+        if let Some(extra) = arguments.next() {
+            return Err(format!("unsupported runtime argument after --config: {extra}").into());
+        }
+        return Ok(Invocation::Runtime {
+            config_path: Some(PathBuf::from(config_path)),
+        });
+    }
+
+    parse_command_impl(std::iter::once(first).chain(arguments)).map(|command| match command {
+        Some(command) => Invocation::Command(command),
+        None => Invocation::Runtime { config_path: None },
+    })
 }
 
 fn parse_command_impl<I>(arguments: I) -> Result<Option<Command>, Box<dyn std::error::Error>>
@@ -748,6 +811,8 @@ fn install_mount_agent_service(
     require_readable_file("legatofs config", config_path)?;
     fs::create_dir_all(windows_log_dir())?;
     let task = windows_task_command(config_path)?;
+    // The WinFsp drive letter is hosted in the installing user's interactive
+    // session, so this remains a per-user ONLOGON task rather than SYSTEM.
     let mut command = ProcessCommand::new("schtasks");
     command.args([
         "/Create",
@@ -1377,61 +1442,21 @@ fn macos_service_definition(
 fn windows_task_command(config_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     let executable = env::current_exe()?;
     let log_dir = windows_log_dir();
-    let wrapper_path = windows_task_wrapper_path(&log_dir);
-    fs::write(
-        &wrapper_path,
-        render_windows_task_wrapper(
-            &executable,
-            config_path,
-            &log_dir.join("legatofs.out.log"),
-            &log_dir.join("legatofs.err.log"),
-            &log_dir.join("legatofs.wrapper.log"),
-        ),
-    )?;
-    Ok(windows_task_command_for_wrapper(&wrapper_path))
+    let _ = fs::remove_file(legacy_windows_task_wrapper_path(&log_dir));
+    Ok(windows_task_command_for_runtime(&executable, config_path))
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn render_windows_task_wrapper(
-    executable: &Path,
-    config_path: &Path,
-    stdout_log: &Path,
-    stderr_log: &Path,
-    wrapper_log: &Path,
-) -> String {
+fn windows_task_command_for_runtime(executable: &Path, config_path: &Path) -> String {
     format!(
-        "Set shell = CreateObject(\"WScript.Shell\")\r\n\
-         Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
-         Set env = shell.Environment(\"PROCESS\")\r\n\
-         env(\"LEGATO_FS_CONFIG\") = \"{}\"\r\n\
-         quote = Chr(34)\r\n\
-         command = quote & \"{}\" & quote & \" >> \" & quote & \"{}\" & quote & \" 2>> \" & quote & \"{}\" & quote\r\n\
-         logPath = \"{}\"\r\n\
-         Do\r\n\
-         \x20\x20Set logFile = fso.OpenTextFile(logPath, 8, True)\r\n\
-         \x20\x20logFile.WriteLine Now & \" starting legatofs\"\r\n\
-         \x20\x20logFile.Close\r\n\
-         \x20\x20exitCode = shell.Run(\"%ComSpec% /D /S /C \" & quote & command & quote, 0, True)\r\n\
-         \x20\x20Set logFile = fso.OpenTextFile(logPath, 8, True)\r\n\
-         \x20\x20logFile.WriteLine Now & \" legatofs exited code=\" & exitCode & \"; restarting in 5s\"\r\n\
-         \x20\x20logFile.Close\r\n\
-         \x20\x20WScript.Sleep 5000\r\n\
-         Loop\r\n",
-        vbs_escape(config_path.to_string_lossy().as_ref()),
-        vbs_escape(executable.to_string_lossy().as_ref()),
-        vbs_escape(stdout_log.to_string_lossy().as_ref()),
-        vbs_escape(stderr_log.to_string_lossy().as_ref()),
-        vbs_escape(wrapper_log.to_string_lossy().as_ref())
+        "\"{}\" --config \"{}\"",
+        executable.display(),
+        config_path.display()
     )
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_task_command_for_wrapper(wrapper_path: &Path) -> String {
-    format!("wscript.exe \"{}\"", wrapper_path.display())
-}
-
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_task_wrapper_path(log_dir: &Path) -> PathBuf {
+fn legacy_windows_task_wrapper_path(log_dir: &Path) -> PathBuf {
     log_dir.join("run-legatofs.vbs")
 }
 
@@ -1465,11 +1490,6 @@ fn wait_for_windows_mount_point(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-}
-
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn vbs_escape(value: &str) -> String {
-    value.replace('"', "\"\"")
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1723,14 +1743,14 @@ mod tests {
     };
 
     use super::{
-        CacheCommand, ClientProcessConfig, Command, MountConfig, PrefetchControlServer,
+        CacheCommand, ClientProcessConfig, Command, Invocation, MountConfig, PrefetchControlServer,
         acquire_state_dir_lock, cache_repair_report, cache_status_report, default_client_name,
         default_config_path, default_library_root, default_mount_point, default_state_dir,
         endpoint_socket, install_client_bundle, load_bundle_manifest, mount_root_attributes,
-        normalize_bootstrap_url, parse_command_impl, parse_http_response,
-        render_macos_launchd_plist, render_windows_task_wrapper, resolve_optional_install_value,
-        resolve_required_install_value, spawn_prefetch_control_server, startup_context,
-        windows_mount_probe_path, windows_task_command_for_wrapper, windows_task_wrapper_path,
+        normalize_bootstrap_url, parse_command_impl, parse_http_response, parse_invocation_impl,
+        render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
+        spawn_prefetch_control_server, startup_context, windows_mount_probe_path,
+        windows_task_command_for_runtime,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
@@ -1795,6 +1815,33 @@ mod tests {
     #[test]
     fn default_client_name_is_present() {
         assert!(!default_client_name().trim().is_empty());
+    }
+
+    #[test]
+    fn parse_runtime_invocation_accepts_top_level_config() {
+        let invocation = parse_invocation_impl([
+            String::from("--config"),
+            String::from("C:\\ProgramData\\Legato\\legatofs.toml"),
+        ])
+        .expect("runtime invocation should parse");
+
+        assert_eq!(
+            invocation,
+            Invocation::Runtime {
+                config_path: Some(PathBuf::from("C:\\ProgramData\\Legato\\legatofs.toml")),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_runtime_invocation_keeps_existing_commands() {
+        let invocation = parse_invocation_impl([String::from("doctor")])
+            .expect("command invocation should parse");
+
+        assert_eq!(
+            invocation,
+            Invocation::Command(Command::Doctor { config_path: None })
+        );
     }
 
     #[test]
@@ -2116,35 +2163,17 @@ mod tests {
     }
 
     #[test]
-    fn windows_task_command_uses_hidden_wrapper_with_config_and_logs() {
+    fn windows_task_command_runs_legatofs_directly_with_config() {
         let executable = PathBuf::from("C:\\Program Files\\Legato\\legatofs.exe");
         let config = PathBuf::from("C:\\ProgramData\\Legato\\legatofs.toml");
-        let log_dir = PathBuf::from("C:\\ProgramData\\Legato\\logs");
-        let wrapper_path = windows_task_wrapper_path(&log_dir);
-        let command = windows_task_command_for_wrapper(&wrapper_path);
-        let wrapper = render_windows_task_wrapper(
-            &executable,
-            &config,
-            &log_dir.join("legatofs.out.log"),
-            &log_dir.join("legatofs.err.log"),
-            &log_dir.join("legatofs.wrapper.log"),
-        );
+        let command = windows_task_command_for_runtime(&executable, &config);
 
-        assert!(command.contains("wscript.exe"));
-        assert!(command.contains("run-legatofs.vbs"));
+        assert!(command.contains("C:\\Program Files\\Legato\\legatofs.exe"));
+        assert!(command.contains("--config"));
+        assert!(command.contains("C:\\ProgramData\\Legato\\legatofs.toml"));
+        assert!(!command.contains("wscript.exe"));
+        assert!(!command.contains("run-legatofs.vbs"));
         assert!(!command.contains("cmd.exe"));
-        assert!(wrapper.contains("LEGATO_FS_CONFIG"));
-        assert!(wrapper.contains("C:\\ProgramData\\Legato\\legatofs.toml"));
-        assert!(wrapper.contains("C:\\Program Files\\Legato\\legatofs.exe"));
-        assert!(wrapper.contains("legatofs.out.log"));
-        assert!(wrapper.contains("legatofs.err.log"));
-        assert!(wrapper.contains("legatofs.wrapper.log"));
-        assert!(wrapper.contains("shell.Run"));
-        assert!(wrapper.contains("Set logFile ="));
-        assert!(!wrapper.contains("Set log ="));
-        assert!(wrapper.contains(", 0, True"));
-        assert!(wrapper.contains("Do"));
-        assert!(wrapper.contains("restarting in 5s"));
     }
 
     #[test]
