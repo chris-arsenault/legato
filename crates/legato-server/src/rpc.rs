@@ -505,6 +505,9 @@ impl Legato for LiveServer {
             let mut ticker = interval(Duration::from_millis(250));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                if sender.is_closed() {
+                    return;
+                }
                 let started = Instant::now();
                 let since_sequence = next_sequence;
                 let records = {

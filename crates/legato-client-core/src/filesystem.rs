@@ -220,7 +220,6 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
             self.report_metrics_if_due(false).await;
@@ -232,12 +231,6 @@ impl FilesystemService {
             self.control.register_path(metadata.clone(), now_ns);
             self.report_metrics_if_due(false).await;
             log_slow_operation("lookup", path, "synthetic", started.elapsed());
-            return Ok(metadata_to_attributes(metadata));
-        }
-
-        if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
-            self.report_metrics_if_due(false).await;
-            log_slow_operation("lookup", path, "store", started.elapsed());
             return Ok(metadata_to_attributes(metadata));
         }
 
@@ -262,60 +255,61 @@ impl FilesystemService {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
-        if let Some(entries) = self.lookup_local_directory(path, now_ns) {
-            self.report_metrics_if_due(false).await;
-            log_directory_operation("read_dir", path, "cache", entries.len(), started.elapsed());
-            return Ok(entries);
-        }
-
-        if let Some(entries) = self.lookup_local_directory(path, now_ns) {
-            self.report_metrics_if_due(false).await;
-            log_directory_operation("read_dir", path, "store", entries.len(), started.elapsed());
-            return Ok(entries);
-        }
-
-        let directory_metadata = match self.directory_metadata(path, now_ns).await {
-            Ok(metadata) => metadata,
-            Err(error) if path == "/" && is_remote_unavailable(&error) => {
+        match self.remote_directory_listing(path).await {
+            Ok((directory_metadata, entries)) => {
+                let entries = sanitize_directory_entries(path, entries);
+                self.store.record_metadata(directory_metadata.clone())?;
+                self.store.record_directory(
+                    path,
+                    FileId(directory_metadata.file_id),
+                    entries.clone(),
+                )?;
+                self.control.register_path(directory_metadata, now_ns);
+                self.control.register_dir(path, entries.clone(), now_ns);
                 self.report_metrics_if_due(false).await;
-                log_directory_operation("read_dir", path, "offline-empty", 0, started.elapsed());
-                return Ok(Vec::new());
+                log_directory_operation(
+                    "read_dir",
+                    path,
+                    "remote",
+                    entries.len(),
+                    started.elapsed(),
+                );
+                Ok(entries)
+            }
+            Err(error) if is_remote_unavailable(&error) => {
+                if let Some(entries) = self.lookup_local_directory(path, now_ns) {
+                    self.report_metrics_if_due(false).await;
+                    log_directory_operation(
+                        "read_dir",
+                        path,
+                        "cache",
+                        entries.len(),
+                        started.elapsed(),
+                    );
+                    return Ok(entries);
+                }
+                if path == "/" {
+                    self.report_metrics_if_due(false).await;
+                    log_directory_operation(
+                        "read_dir",
+                        path,
+                        "offline-empty",
+                        0,
+                        started.elapsed(),
+                    );
+                    return Ok(Vec::new());
+                }
+                let error = map_lookup_error(path)(error);
+                log_operation_failure("read_dir", path, &error, started.elapsed());
+                Err(error)
             }
             Err(error) => {
                 let error = map_lookup_error(path)(error);
                 log_operation_failure("read_dir", path, &error, started.elapsed());
-                return Err(error);
+                Err(error)
             }
-        };
-        if !directory_metadata.is_dir {
-            let error = FilesystemServiceError::NotFound(path.to_owned());
-            log_operation_failure("read_dir", path, &error, started.elapsed());
-            return Err(error);
         }
-        let entries = match self.remote_list_dir(path).await {
-            Ok(entries) => entries,
-            Err(error) if path == "/" && is_remote_unavailable(&error) => {
-                self.report_metrics_if_due(false).await;
-                log_directory_operation("read_dir", path, "offline-empty", 0, started.elapsed());
-                return Ok(Vec::new());
-            }
-            Err(error) => {
-                let error = map_lookup_error(path)(error);
-                log_operation_failure("read_dir", path, &error, started.elapsed());
-                return Err(error);
-            }
-        };
-        let entries = sanitize_directory_entries(path, entries);
-        self.store.record_metadata(directory_metadata.clone())?;
-        self.store
-            .record_directory(path, FileId(directory_metadata.file_id), entries.clone())?;
-        self.control.register_path(directory_metadata, now_ns);
-        self.control.register_dir(path, entries.clone(), now_ns);
-        self.report_metrics_if_due(false).await;
-        log_directory_operation("read_dir", path, "remote", entries.len(), started.elapsed());
-        Ok(entries)
     }
 
     /// Opens one remote file and returns a stable local handle.
@@ -324,32 +318,25 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
-        if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
-            self.control.register_resolved_path(inode.clone(), now_ns);
-            let handle = inode_to_open_handle(self.next_handle, inode);
-            self.next_handle += 1;
-            self.open_handles
-                .insert(handle.local_handle, handle.clone());
-            self.report_metrics_if_due(false).await;
-            log_slow_operation("open", path, "store", started.elapsed());
-            return Ok(handle);
-        }
-
-        if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
-            self.control.register_resolved_path(inode.clone(), now_ns);
-            let handle = inode_to_open_handle(self.next_handle, inode);
-            self.next_handle += 1;
-            self.open_handles
-                .insert(handle.local_handle, handle.clone());
-            self.report_metrics_if_due(false).await;
-            log_slow_operation("open", path, "store", started.elapsed());
-            return Ok(handle);
-        }
-
         let inode = match self.remote_resolve(path).await {
             Ok(inode) => inode,
+            Err(error) if is_remote_unavailable(&error) => {
+                let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir)
+                else {
+                    let error = map_lookup_error(path)(error);
+                    log_operation_failure("open", path, &error, started.elapsed());
+                    return Err(error);
+                };
+                self.control.register_resolved_path(inode.clone(), now_ns);
+                let handle = inode_to_open_handle(self.next_handle, inode);
+                self.next_handle += 1;
+                self.open_handles
+                    .insert(handle.local_handle, handle.clone());
+                self.report_metrics_if_due(false).await;
+                log_slow_operation("open", path, "store", started.elapsed());
+                return Ok(handle);
+            }
             Err(error) => {
                 let error = map_lookup_error(path)(error);
                 log_operation_failure("open", path, &error, started.elapsed());
@@ -402,7 +389,6 @@ impl FilesystemService {
         size: u32,
     ) -> Result<Vec<u8>, FilesystemServiceError> {
         let started = Instant::now();
-        self.sync_changes_if_due(false).await?;
         let snapshot = match self.open_handles.get(&local_handle).cloned() {
             Some(snapshot) => snapshot,
             None => {
@@ -572,18 +558,20 @@ impl FilesystemService {
         Some(entries)
     }
 
-    async fn directory_metadata(
+    async fn remote_directory_listing(
         &mut self,
         path: &str,
-        now_ns: u64,
-    ) -> Result<FileMetadata, FilesystemServiceError> {
-        if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
-            return Ok(metadata);
+    ) -> Result<(FileMetadata, Vec<DirectoryEntry>), FilesystemServiceError> {
+        let directory_metadata = if path == "/" {
+            synthetic_root_metadata()
+        } else {
+            self.remote_stat(path).await?
+        };
+        if !directory_metadata.is_dir {
+            return Err(FilesystemServiceError::NotFound(path.to_owned()));
         }
-        if path == "/" {
-            return Ok(synthetic_root_metadata());
-        }
-        self.remote_stat(path).await
+        let entries = self.remote_list_dir(path).await?;
+        Ok((directory_metadata, entries))
     }
 
     async fn remote_stat(&mut self, path: &str) -> Result<FileMetadata, FilesystemServiceError> {
@@ -1555,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_service_replays_changes_before_serving_cached_directory() {
+    async fn filesystem_service_remote_lists_directory_before_stale_local_cache() {
         let fixture = tempdir().expect("tempdir should be created");
         let library_root = fixture.path().join("library");
         let state_dir = fixture.path().join("state");
@@ -1632,10 +1620,15 @@ mod tests {
         let entries = service
             .read_dir("/Samples")
             .await
-            .expect("readdir should succeed after replay");
+            .expect("readdir should succeed through remote listing");
         assert!(
             entries.iter().any(|entry| entry.name == "kick.wav"),
-            "client should replay server changes before serving cached directory"
+            "client should fetch a bounded remote directory listing before stale local cache"
+        );
+        assert_eq!(
+            service.subscription_cursor(),
+            0,
+            "interactive directory listing should not run global change replay"
         );
 
         bound.shutdown().await.expect("server should shut down");

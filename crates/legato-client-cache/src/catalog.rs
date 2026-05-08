@@ -431,6 +431,9 @@ impl CatalogStore {
         &self,
         since_sequence: u64,
     ) -> Result<Vec<ChangeRecord>, CatalogStoreError> {
+        if since_sequence >= self.state.last_sequence {
+            return Ok(Vec::new());
+        }
         let mut records = Vec::new();
         for path in segment_paths(&self.root_dir.join("segments"))? {
             let scan = repair_incomplete_tail(&path)?;
@@ -901,6 +904,25 @@ mod tests {
         assert_eq!(reopened.resolve_path("/piano.wav"), Some(&inode));
         assert_eq!(reopened.subscription_cursor(), 41);
         assert_eq!(reopened.last_sequence(), checkpoint_sequence);
+    }
+
+    #[test]
+    fn caught_up_change_replay_does_not_scan_segments() {
+        let temp = tempdir().expect("tempdir should exist");
+        let root = temp.path().join("store");
+        let mut store = CatalogStore::open(&root, 100).expect("catalog should open");
+        store
+            .append_inode(sample_inode())
+            .expect("inode should append");
+        let last_sequence = store.last_sequence();
+        fs::create_dir(root.join("segments").join("99999999999999999999.lseg"))
+            .expect("poison segment directory should be created");
+
+        let records = store
+            .change_records_since(last_sequence)
+            .expect("caught-up replay should not inspect segment files");
+
+        assert!(records.is_empty());
     }
 
     #[test]
