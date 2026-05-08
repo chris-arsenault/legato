@@ -6,13 +6,11 @@ use std::{
     process,
     process::Command as ProcessCommand,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::time::Instant;
 
 use legato_client_cache::client_store::ClientLegatoStore;
 use legato_client_core::{ClientConfig, ClientRuntimeMetrics, FilesystemService};
@@ -316,6 +314,13 @@ enum Command {
         offset: u64,
         size: u32,
     },
+    Perf {
+        config_path: Option<PathBuf>,
+        path: String,
+        iterations: usize,
+        offset: u64,
+        size: u32,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -508,6 +513,50 @@ where
                 size,
             }))
         }
+        "perf" => {
+            let mut config_path = None;
+            let mut path = None;
+            let mut iterations = 20_usize;
+            let mut offset = 0_u64;
+            let mut size = 1024 * 1024_u32;
+
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "--config" => config_path = arguments.next().map(PathBuf::from),
+                    "--path" => path = arguments.next(),
+                    "--iterations" | "--count" => {
+                        iterations = arguments
+                            .next()
+                            .ok_or("missing value for --iterations")?
+                            .parse()?;
+                    }
+                    "--offset" => {
+                        offset = arguments
+                            .next()
+                            .ok_or("missing value for --offset")?
+                            .parse()?;
+                    }
+                    "--size" => {
+                        size = arguments
+                            .next()
+                            .ok_or("missing value for --size")?
+                            .parse()?;
+                    }
+                    other => return Err(format!("unsupported argument for perf: {other}").into()),
+                }
+            }
+            if iterations == 0 {
+                return Err("--iterations must be greater than zero".into());
+            }
+
+            Ok(Some(Command::Perf {
+                config_path,
+                path: path.ok_or("missing --path for perf")?,
+                iterations,
+                offset,
+                size,
+            }))
+        }
         other => Err(format!("unsupported legatofs command: {other}").into()),
     }
 }
@@ -663,6 +712,30 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             println!("{}", report?);
             Ok(())
         }
+        Command::Perf {
+            config_path,
+            path,
+            iterations,
+            offset,
+            size,
+        } => {
+            let mut process_config =
+                load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
+            apply_client_operational_defaults(&mut process_config);
+            let perf_state_dir = create_smoke_state_dir()?;
+            let report = run_perf_command(
+                &process_config,
+                &path,
+                iterations,
+                offset,
+                size,
+                perf_state_dir.as_path(),
+            )
+            .await;
+            let _ = fs::remove_dir_all(&perf_state_dir);
+            println!("{}", report?);
+            Ok(())
+        }
     }
 }
 
@@ -725,6 +798,121 @@ fn create_smoke_state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path = env::temp_dir().join(format!("legatofs-smoke-{}-{now}", process::id()));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+async fn run_perf_command(
+    process_config: &ClientProcessConfig,
+    path: &str,
+    iterations: usize,
+    offset: u64,
+    size: u32,
+    state_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut service = FilesystemService::connect(
+        process_config.client.clone(),
+        default_client_name(),
+        state_dir,
+    )
+    .await?;
+    let attributes = service.lookup(path).await?;
+    let mut timings = Vec::with_capacity(iterations);
+    if attributes.is_dir {
+        let mut last_entries = Vec::new();
+        for _ in 0..iterations {
+            let started = Instant::now();
+            last_entries = service.read_dir(path).await?;
+            timings.push(started.elapsed());
+        }
+        let files = last_entries.iter().filter(|entry| !entry.is_dir).count();
+        let directories = last_entries.len().saturating_sub(files);
+        let stats = LatencyStats::from_timings(&timings);
+        return Ok(format!(
+            "perf ok: server={} path={} kind=directory iterations={} entries={} files={} directories={} first_ms={:.3} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} avg_ms={:.3}",
+            service.server_name(),
+            path,
+            iterations,
+            last_entries.len(),
+            files,
+            directories,
+            stats.first_ms,
+            stats.min_ms,
+            stats.p50_ms,
+            stats.p95_ms,
+            stats.max_ms,
+            stats.avg_ms
+        ));
+    }
+
+    let mut last_bytes = 0_usize;
+    let mut total_bytes = 0_usize;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let handle = service.open(path).await?;
+        let bytes = service.read(handle.local_handle, offset, size).await?;
+        service.release(handle.local_handle).await?;
+        timings.push(started.elapsed());
+        last_bytes = bytes.len();
+        total_bytes = total_bytes.saturating_add(bytes.len());
+    }
+    let stats = LatencyStats::from_timings(&timings);
+    Ok(format!(
+        "perf ok: server={} path={} kind=file iterations={} bytes_per_read={} total_bytes={} offset={} size={} first_ms={:.3} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} avg_ms={:.3}",
+        service.server_name(),
+        path,
+        iterations,
+        last_bytes,
+        total_bytes,
+        offset,
+        size,
+        stats.first_ms,
+        stats.min_ms,
+        stats.p50_ms,
+        stats.p95_ms,
+        stats.max_ms,
+        stats.avg_ms
+    ))
+}
+
+#[derive(Debug)]
+struct LatencyStats {
+    first_ms: f64,
+    min_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+    avg_ms: f64,
+}
+
+impl LatencyStats {
+    fn from_timings(timings: &[Duration]) -> Self {
+        let mut sorted = timings.iter().map(duration_ms).collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        let sum = sorted.iter().sum::<f64>();
+        Self {
+            first_ms: timings.first().map_or(0.0, duration_ms),
+            min_ms: *sorted.first().unwrap_or(&0.0),
+            p50_ms: percentile(&sorted, 0.50),
+            p95_ms: percentile(&sorted, 0.95),
+            max_ms: *sorted.last().unwrap_or(&0.0),
+            avg_ms: if sorted.is_empty() {
+                0.0
+            } else {
+                sum / sorted.len() as f64
+            },
+        }
+    }
+}
+
+fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted.len() - 1) as f64 * percentile).ceil() as usize;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+fn duration_ms(duration: &Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 async fn client_doctor_report(
@@ -2150,6 +2338,35 @@ mod tests {
                 path: String::from("/Kontakt/piano.nki"),
                 offset: 8,
                 size: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_perf_command() {
+        let command = parse_command_impl([
+            String::from("perf"),
+            String::from("--config"),
+            String::from("/tmp/legato-state/legatofs.toml"),
+            String::from("--path"),
+            String::from("/samples/Packs/Kit/Percs"),
+            String::from("--iterations"),
+            String::from("50"),
+            String::from("--offset"),
+            String::from("8"),
+            String::from("--size"),
+            String::from("65536"),
+        ])
+        .expect("command should parse");
+
+        assert_eq!(
+            command,
+            Some(Command::Perf {
+                config_path: Some(PathBuf::from("/tmp/legato-state/legatofs.toml")),
+                path: String::from("/samples/Packs/Kit/Percs"),
+                iterations: 50,
+                offset: 8,
+                size: 65_536,
             })
         );
     }
