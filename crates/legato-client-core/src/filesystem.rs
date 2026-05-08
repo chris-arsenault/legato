@@ -500,9 +500,9 @@ impl FilesystemService {
 
     fn lookup_local_directory(&mut self, path: &str, now_ns: u64) -> Option<Vec<DirectoryEntry>> {
         if let Some(entries) = self.control.list_dir(path, now_ns) {
-            return Some(entries);
+            return Some(sanitize_directory_entries(path, entries));
         }
-        let entries = self.store.list_directory(path)?;
+        let entries = sanitize_directory_entries(path, self.store.list_directory(path)?);
         self.control.register_dir(path, entries.clone(), now_ns);
         Some(entries)
     }
