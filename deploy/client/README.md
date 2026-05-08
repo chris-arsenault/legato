@@ -4,7 +4,8 @@ The normal client install flow is:
 
 1. Download the macOS `.pkg` or Windows `.exe` from the `v0.8` release.
 2. Run the installer.
-3. Accept the defaults, or change the mount point in the installer UI.
+3. Run the setup helper if the platform installer does not show setup prompts.
+4. Accept the defaults, or change the mount point in the setup UI.
 
 The installer/setup path contacts the Legato server, asks it for a client certificate bundle, writes the local config, installs the background service, and starts the mount. You should not need to copy bundle directories, edit TOML, or run registration commands by hand.
 
@@ -38,13 +39,13 @@ Install the package:
 sudo installer -pkg legatofs-0.8-macos.pkg -target /
 ```
 
-The package attempts LAN discovery, registers the client, installs the launchd agent for the logged-in user, and starts the client with the default mount point. The launchd agent runs the native `legatofs service launch --config /Library/Application Support/Legato/legatofs.toml` action, which hosts the normal mount runtime under launchd.
-
-If you need to override discovery or the mount point after installation, run the setup helper:
+Then run the setup helper:
 
 ```bash
 legato-setup-client
 ```
+
+The package installs the binaries and prepares `/Library/Application Support/Legato`. The setup helper performs LAN discovery or uses the bootstrap URL you enter, registers the client, sets ownership for the logged-in user's launchd agent, installs the agent, and starts the mount. The launchd agent runs the native `legatofs service launch --config /Library/Application Support/Legato/legatofs.toml` action, which hosts the normal mount runtime under launchd.
 
 The helper prompts for:
 

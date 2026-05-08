@@ -6,8 +6,12 @@ CERT_DIR="${STATE_DIR}/certs"
 CONFIG_EXAMPLE="${STATE_DIR}/legatofs.toml.example"
 CONFIG_PATH="${STATE_DIR}/legatofs.toml"
 CERT_README="${CERT_DIR}/README.txt"
+INSTALL_LOG="${STATE_DIR}/logs/install.log"
 
 mkdir -p "${STATE_DIR}" "${CERT_DIR}" "${STATE_DIR}/catalog" "${STATE_DIR}/segments" "${STATE_DIR}/checkpoints" "${STATE_DIR}/logs"
+exec >> "${INSTALL_LOG}" 2>&1
+
+echo "Legato postinstall started at $(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 if [ -f "${STATE_DIR}/certs-README.txt" ] && [ ! -f "${CERT_README}" ]; then
   mv "${STATE_DIR}/certs-README.txt" "${CERT_README}"
@@ -23,20 +27,53 @@ chmod 755 /usr/local/bin/legato-setup-client
 chmod 755 "${STATE_DIR}"
 chmod 700 "${CERT_DIR}"
 
-CLIENT_NAME="$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || /bin/hostname)"
-/usr/local/bin/legatofs install \
-  --client-name "${CLIENT_NAME}" \
-  --mount-point "/Volumes/Legato" \
-  --state-dir "${STATE_DIR}" \
-  --library-root "/" \
-  --force
+console_user() {
+  /usr/bin/stat -f %Su /dev/console
+}
 
-CONSOLE_USER="$(/usr/bin/stat -f %Su /dev/console)"
-if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ] && [ "${CONSOLE_USER}" != "loginwindow" ]; then
-  CONSOLE_UID="$(/usr/bin/id -u "${CONSOLE_USER}")"
-  CONSOLE_HOME="$(/usr/bin/dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory | /usr/bin/awk '{print $2}')"
-  /bin/launchctl asuser "${CONSOLE_UID}" /usr/bin/sudo -u "${CONSOLE_USER}" HOME="${CONSOLE_HOME}" /usr/local/bin/legatofs service install --force
-  /bin/launchctl asuser "${CONSOLE_UID}" /usr/bin/sudo -u "${CONSOLE_USER}" HOME="${CONSOLE_HOME}" /usr/local/bin/legatofs service start
+console_home() {
+  /usr/bin/dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | /usr/bin/sed 's/^NFSHomeDirectory: //'
+}
+
+client_config_ready() {
+  [ -f "${CONFIG_PATH}" ] &&
+    [ -f "${CERT_DIR}/server-ca.pem" ] &&
+    [ -f "${CERT_DIR}/client.pem" ] &&
+    [ -f "${CERT_DIR}/client-key.pem" ]
+}
+
+run_as_console_user() {
+  local user
+  local uid
+  local home
+  user="$(console_user)"
+  if [ -z "${user}" ] || [ "${user}" = "root" ] || [ "${user}" = "loginwindow" ]; then
+    echo "No interactive console user; skipping launchd agent update."
+    return 1
+  fi
+
+  uid="$(/usr/bin/id -u "${user}")"
+  home="$(console_home "${user}")"
+  if [ -z "${home}" ]; then
+    home="/Users/${user}"
+  fi
+
+  /usr/sbin/chown -R "${user}:staff" "${STATE_DIR}"
+  /bin/chmod 755 "${STATE_DIR}"
+  /bin/chmod 700 "${CERT_DIR}"
+
+  /bin/launchctl asuser "${uid}" /usr/bin/sudo -u "${user}" /usr/bin/env HOME="${home}" "$@"
+}
+
+if client_config_ready; then
+  if ! run_as_console_user /usr/local/bin/legatofs service install --force; then
+    echo "warn: unable to install Legato launchd agent during package install"
+  elif ! run_as_console_user /usr/local/bin/legatofs service start; then
+    echo "warn: unable to start Legato launchd agent during package install"
+  fi
+else
+  echo "Legato package installed without client registration."
+  echo "Run /usr/local/bin/legato-setup-client to configure the bootstrap endpoint, mount point, and launchd agent."
 fi
 
 exit 0

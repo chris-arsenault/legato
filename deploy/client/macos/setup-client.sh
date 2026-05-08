@@ -30,6 +30,10 @@ if [[ -n "${bootstrap_url}" ]]; then
 fi
 
 /usr/bin/sudo "${LEGATOFS}" "${install_args[@]}"
+current_user="$(/usr/bin/id -un)"
+/usr/bin/sudo /usr/sbin/chown -R "${current_user}:staff" "/Library/Application Support/Legato"
+/usr/bin/sudo /bin/chmod 755 "/Library/Application Support/Legato"
+/usr/bin/sudo /bin/chmod 700 "/Library/Application Support/Legato/certs"
 "${LEGATOFS}" service install --force
 "${LEGATOFS}" service start
 
