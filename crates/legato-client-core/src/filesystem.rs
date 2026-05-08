@@ -220,6 +220,7 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemAttributes, FilesystemServiceError> {
         let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
             self.report_metrics_if_due(false).await;
@@ -234,7 +235,6 @@ impl FilesystemService {
             return Ok(metadata_to_attributes(metadata));
         }
 
-        self.sync_changes_if_due(false).await?;
         if let Some(metadata) = self.lookup_local_metadata(path, now_ns) {
             self.report_metrics_if_due(false).await;
             log_slow_operation("lookup", path, "store", started.elapsed());
@@ -262,6 +262,7 @@ impl FilesystemService {
         path: &str,
     ) -> Result<Vec<DirectoryEntry>, FilesystemServiceError> {
         let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.lookup_local_directory(path, now_ns) {
             self.report_metrics_if_due(false).await;
@@ -269,7 +270,6 @@ impl FilesystemService {
             return Ok(entries);
         }
 
-        self.sync_changes_if_due(false).await?;
         if let Some(entries) = self.lookup_local_directory(path, now_ns) {
             self.report_metrics_if_due(false).await;
             log_directory_operation("read_dir", path, "store", entries.len(), started.elapsed());
@@ -324,6 +324,7 @@ impl FilesystemService {
         path: &str,
     ) -> Result<FilesystemOpenHandle, FilesystemServiceError> {
         let started = Instant::now();
+        self.sync_changes_if_due(false).await?;
         let now_ns = now_monotonic_ns();
         if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
             self.control.register_resolved_path(inode.clone(), now_ns);
@@ -336,7 +337,6 @@ impl FilesystemService {
             return Ok(handle);
         }
 
-        self.sync_changes_if_due(false).await?;
         if let Some(inode) = self.store.resolve_path(path).filter(|inode| !inode.is_dir) {
             self.control.register_resolved_path(inode.clone(), now_ns);
             let handle = inode_to_open_handle(self.next_handle, inode);
@@ -1552,6 +1552,93 @@ mod tests {
             .shutdown()
             .await
             .expect("server should shut down");
+    }
+
+    #[tokio::test]
+    async fn filesystem_service_replays_changes_before_serving_cached_directory() {
+        let fixture = tempdir().expect("tempdir should be created");
+        let library_root = fixture.path().join("library");
+        let state_dir = fixture.path().join("state");
+        let tls_dir = fixture.path().join("tls");
+        let samples_dir = library_root.join("Samples");
+        fs::create_dir_all(&samples_dir).expect("library tree should be created");
+        fs::write(samples_dir.join("kick.wav"), b"kick").expect("sample should be written");
+
+        let client_state = fixture.path().join("client-state");
+        let mut store = ClientLegatoStore::open(&client_state, 100).expect("store should open");
+        store
+            .record_inode(InodeMetadata {
+                file_id: 2,
+                path: String::from("/Samples"),
+                size: 0,
+                mtime_ns: 1,
+                is_dir: true,
+                layout: Some(FileLayout {
+                    transfer_class: TransferClass::Unitary as i32,
+                    extents: Vec::new(),
+                }),
+                inode_generation: 1,
+                content_hash: Vec::new(),
+            })
+            .expect("stale directory inode should record");
+        store
+            .record_directory("/Samples", FileId(2), Vec::new())
+            .expect("stale empty directory should record");
+        store.checkpoint().expect("checkpoint should write");
+        drop(store);
+
+        let mut config = ServerConfig {
+            bind_address: String::from("127.0.0.1:0"),
+            library_root: library_root.to_string_lossy().into_owned(),
+            state_dir: state_dir.to_string_lossy().into_owned(),
+            tls_dir: tls_dir.to_string_lossy().into_owned(),
+            tls: ServerTlsConfig::local_dev(&tls_dir),
+            bootstrap: Default::default(),
+        };
+        config.tls.server_names = vec![String::from("127.0.0.1"), String::from("localhost")];
+        ensure_server_tls_materials(Path::new(&config.tls_dir), &config.tls)
+            .expect("tls materials should be created");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("addr should be available");
+        let server = LiveServer::bootstrap(config.clone()).expect("server should bootstrap");
+        let bound = server
+            .bind(
+                listener,
+                Some(load_runtime_tls(&config.tls).expect("runtime tls should load")),
+            )
+            .await
+            .expect("server should bind");
+
+        let bundle_dir = fixture.path().join("bundle");
+        issue_client_tls_bundle(
+            Path::new(&config.tls_dir),
+            &config.tls,
+            "studio-windows",
+            &bundle_dir,
+        )
+        .expect("client bundle should be issued");
+
+        let mut service = FilesystemService::connect(
+            local_client_config(address.to_string(), &bundle_dir, "localhost"),
+            "studio-windows",
+            &client_state,
+        )
+        .await
+        .expect("service should connect");
+
+        let entries = service
+            .read_dir("/Samples")
+            .await
+            .expect("readdir should succeed after replay");
+        assert!(
+            entries.iter().any(|entry| entry.name == "kick.wav"),
+            "client should replay server changes before serving cached directory"
+        );
+
+        bound.shutdown().await.expect("server should shut down");
     }
 
     #[tokio::test]
