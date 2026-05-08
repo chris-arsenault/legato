@@ -3,6 +3,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process,
     process::Command as ProcessCommand,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -649,39 +650,81 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             let mut process_config =
                 load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
             apply_client_operational_defaults(&mut process_config);
-            let _state_lock = acquire_state_dir_lock(Path::new(&process_config.mount.state_dir))?;
-            let mut service = FilesystemService::connect(
-                process_config.client.clone(),
-                default_client_name(),
-                Path::new(&process_config.mount.state_dir),
-            )
-            .await?;
-            let attributes = service.lookup(&path).await?;
-            if attributes.is_dir {
-                let entries = service.read_dir(&path).await?;
-                println!(
-                    "smoke ok: server={} path={} entries={}",
-                    service.server_name(),
-                    path,
-                    entries.len()
-                );
-                return Ok(());
-            }
-
-            let handle = service.open(&path).await?;
-            let bytes = service.read(handle.local_handle, offset, size).await?;
-            service.release(handle.local_handle).await?;
-            println!(
-                "smoke ok: server={} path={} bytes={} offset={} size={}",
-                service.server_name(),
-                path,
-                bytes.len(),
+            let smoke_state_dir = create_smoke_state_dir()?;
+            let report = run_smoke_command(
+                &process_config,
+                &path,
                 offset,
-                size
-            );
+                size,
+                smoke_state_dir.as_path(),
+            )
+            .await;
+            let _ = fs::remove_dir_all(&smoke_state_dir);
+            println!("{}", report?);
             Ok(())
         }
     }
+}
+
+async fn run_smoke_command(
+    process_config: &ClientProcessConfig,
+    path: &str,
+    offset: u64,
+    size: u32,
+    state_dir: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut service = FilesystemService::connect(
+        process_config.client.clone(),
+        default_client_name(),
+        state_dir,
+    )
+    .await?;
+    let attributes = service.lookup(path).await?;
+    if attributes.is_dir {
+        let entries = service.read_dir(path).await?;
+        let files = entries.iter().filter(|entry| !entry.is_dir).count();
+        let directories = entries.len().saturating_sub(files);
+        let names = entries
+            .iter()
+            .take(25)
+            .map(|entry| {
+                if entry.is_dir {
+                    format!("{}/", entry.name)
+                } else {
+                    entry.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return Ok(format!(
+            "smoke ok: server={} path={} entries={} files={} directories={} names={}",
+            service.server_name(),
+            path,
+            entries.len(),
+            files,
+            directories,
+            names
+        ));
+    }
+
+    let handle = service.open(path).await?;
+    let bytes = service.read(handle.local_handle, offset, size).await?;
+    service.release(handle.local_handle).await?;
+    Ok(format!(
+        "smoke ok: server={} path={} bytes={} offset={} size={}",
+        service.server_name(),
+        path,
+        bytes.len(),
+        offset,
+        size
+    ))
+}
+
+fn create_smoke_state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let path = env::temp_dir().join(format!("legatofs-smoke-{}-{now}", process::id()));
+    fs::create_dir_all(&path)?;
+    Ok(path)
 }
 
 async fn client_doctor_report(
