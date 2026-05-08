@@ -365,12 +365,18 @@ impl CatalogStore {
             .paths
             .get(path)
             .and_then(|file_id| self.state.inodes.get(&file_id.0))
+            .filter(|inode| inode.path == path)
     }
 
     /// Resolves an active file ID to inode metadata.
     #[must_use]
     pub fn resolve_file_id(&self, file_id: FileId) -> Option<&CatalogInode> {
-        self.state.inodes.get(&file_id.0)
+        self.state.inodes.get(&file_id.0).filter(|inode| {
+            self.state
+                .paths
+                .get(&inode.path)
+                .is_some_and(|active_file_id| *active_file_id == file_id)
+        })
     }
 
     /// Returns a directory listing by path.
@@ -384,13 +390,28 @@ impl CatalogStore {
     /// Returns active catalog paths.
     #[must_use]
     pub fn active_paths(&self) -> Vec<String> {
-        self.state.paths.keys().cloned().collect()
+        self.state
+            .paths
+            .keys()
+            .filter(|path| self.resolve_path(path).is_some())
+            .cloned()
+            .collect()
     }
 
     /// Returns active inode records in stable file-id order.
     #[must_use]
     pub fn active_inodes(&self) -> Vec<CatalogInode> {
-        self.state.inodes.values().cloned().collect()
+        self.state
+            .inodes
+            .values()
+            .filter(|inode| {
+                self.state
+                    .paths
+                    .get(&inode.path)
+                    .is_some_and(|file_id| *file_id == inode.file_id)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Reads and verifies one resident extent payload from its canonical segment.
@@ -542,10 +563,15 @@ fn replay_record(state: &mut CatalogState, record: StoreRecord) -> Result<(), Ca
 fn apply_catalog_payload(state: &mut CatalogState, sequence: u64, payload: CatalogRecordPayload) {
     match payload {
         CatalogRecordPayload::Inode(inode) => {
+            remove_replaced_path_identity(state, &inode.path, inode.file_id);
             state.paths.insert(inode.path.clone(), inode.file_id);
+            if !inode.is_dir {
+                state.directories.remove(&inode.file_id.0);
+            }
             state.inodes.insert(inode.file_id.0, inode);
         }
         CatalogRecordPayload::Directory(directory) => {
+            remove_replaced_path_identity(state, &directory.path, directory.directory_id);
             state
                 .paths
                 .insert(directory.path.clone(), directory.directory_id);
@@ -588,6 +614,29 @@ fn apply_catalog_payload(state: &mut CatalogState, sequence: u64, payload: Catal
         }
     }
     state.last_sequence = sequence;
+}
+
+fn remove_replaced_path_identity(state: &mut CatalogState, path: &str, new_file_id: FileId) {
+    let Some(previous_file_id) = state.paths.get(path).copied() else {
+        return;
+    };
+    if previous_file_id == new_file_id {
+        return;
+    }
+    if state
+        .inodes
+        .get(&previous_file_id.0)
+        .is_some_and(|inode| inode.path == path)
+    {
+        state.inodes.remove(&previous_file_id.0);
+    }
+    if state
+        .directories
+        .get(&previous_file_id.0)
+        .is_some_and(|directory| directory.path == path)
+    {
+        state.directories.remove(&previous_file_id.0);
+    }
 }
 
 fn change_record_from_store_record(
@@ -904,6 +953,69 @@ mod tests {
         assert_eq!(reopened.resolve_path("/piano.wav"), Some(&inode));
         assert_eq!(reopened.subscription_cursor(), 41);
         assert_eq!(reopened.last_sequence(), checkpoint_sequence);
+    }
+
+    #[test]
+    fn same_path_new_identity_replaces_old_inode() {
+        let temp = tempdir().expect("tempdir should exist");
+        let root = temp.path().join("store");
+        let mut store = CatalogStore::open(&root, 100).expect("catalog should open");
+        let old_inode = sample_inode();
+        let mut new_inode = sample_inode();
+        new_inode.file_id = FileId(8);
+        new_inode.inode_generation = 2;
+        new_inode.content_hash = b"replacement".to_vec();
+
+        store
+            .append_inode(old_inode)
+            .expect("old inode should append");
+        store
+            .append_inode(new_inode.clone())
+            .expect("new inode should append");
+
+        assert_eq!(store.resolve_path("/piano.wav"), Some(&new_inode));
+        assert!(store.resolve_file_id(FileId(7)).is_none());
+        assert_eq!(store.active_inodes(), vec![new_inode]);
+    }
+
+    #[test]
+    fn directory_identity_replacement_does_not_duplicate_active_directory_counts() {
+        let temp = tempdir().expect("tempdir should exist");
+        let root = temp.path().join("store");
+        let mut store = CatalogStore::open(&root, 100).expect("catalog should open");
+        let old_dir = CatalogInode::directory(FileId(1), "/Samples", 10);
+        let new_dir = CatalogInode::directory(FileId(2), "/Samples", 20);
+        let entry = CatalogDirectoryEntry {
+            name: String::from("kick.wav"),
+            path: String::from("/Samples/kick.wav"),
+            file_id: FileId(3),
+            is_dir: false,
+        };
+
+        store
+            .append_inode(old_dir)
+            .expect("old directory inode should append");
+        store
+            .append_directory(CatalogDirectory {
+                directory_id: FileId(1),
+                path: String::from("/Samples"),
+                entries: BTreeMap::new(),
+            })
+            .expect("old directory listing should append");
+        store
+            .append_inode(new_dir.clone())
+            .expect("new directory inode should append");
+        store
+            .append_directory(CatalogDirectory {
+                directory_id: FileId(2),
+                path: String::from("/Samples"),
+                entries: BTreeMap::from([(entry.name.clone(), entry.clone())]),
+            })
+            .expect("new directory listing should append");
+
+        assert_eq!(store.active_inodes(), vec![new_dir]);
+        assert_eq!(store.list_directory("/Samples"), Some(vec![entry]));
+        assert!(store.resolve_file_id(FileId(1)).is_none());
     }
 
     #[test]
