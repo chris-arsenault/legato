@@ -1,6 +1,7 @@
 //! Binary entrypoint for the native Legato filesystem client.
 
 use std::{
+    collections::VecDeque,
     env, fs,
     path::{Path, PathBuf},
     process,
@@ -320,7 +321,27 @@ enum Command {
         iterations: usize,
         offset: u64,
         size: u32,
+        sample: PerfSample,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerfSample {
+    Fixed,
+    Directories,
+    Files,
+    Mixed,
+}
+
+impl PerfSample {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Directories => "directories",
+            Self::Files => "files",
+            Self::Mixed => "mixed",
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -519,6 +540,7 @@ where
             let mut iterations = 20_usize;
             let mut offset = 0_u64;
             let mut size = 1024 * 1024_u32;
+            let mut sample = PerfSample::Fixed;
 
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
@@ -542,6 +564,12 @@ where
                             .ok_or("missing value for --size")?
                             .parse()?;
                     }
+                    "--sample" => {
+                        sample = parse_perf_sample(
+                            &arguments.next().ok_or("missing value for --sample")?,
+                        )?;
+                    }
+                    "--random" => sample = PerfSample::Directories,
                     other => return Err(format!("unsupported argument for perf: {other}").into()),
                 }
             }
@@ -555,6 +583,7 @@ where
                 iterations,
                 offset,
                 size,
+                sample,
             }))
         }
         other => Err(format!("unsupported legatofs command: {other}").into()),
@@ -718,6 +747,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
             iterations,
             offset,
             size,
+            sample,
         } => {
             let mut process_config =
                 load_config::<ClientProcessConfig>(config_path.as_deref(), "LEGATO_FS")?;
@@ -729,6 +759,7 @@ async fn run_command(command: Command) -> Result<(), Box<dyn std::error::Error>>
                 iterations,
                 offset,
                 size,
+                sample,
                 perf_state_dir.as_path(),
             )
             .await;
@@ -800,12 +831,26 @@ fn create_smoke_state_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(path)
 }
 
+fn parse_perf_sample(value: &str) -> Result<PerfSample, Box<dyn std::error::Error>> {
+    match value {
+        "fixed" => Ok(PerfSample::Fixed),
+        "directories" | "dirs" => Ok(PerfSample::Directories),
+        "files" => Ok(PerfSample::Files),
+        "mixed" => Ok(PerfSample::Mixed),
+        other => Err(format!(
+            "unsupported --sample value {other}: expected fixed, directories, files, or mixed"
+        )
+        .into()),
+    }
+}
+
 async fn run_perf_command(
     process_config: &ClientProcessConfig,
     path: &str,
     iterations: usize,
     offset: u64,
     size: u32,
+    sample: PerfSample,
     state_dir: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut service = FilesystemService::connect(
@@ -815,6 +860,13 @@ async fn run_perf_command(
     )
     .await?;
     let attributes = service.lookup(path).await?;
+    if sample != PerfSample::Fixed {
+        if !attributes.is_dir {
+            return Err("--sample modes require --path to be a directory".into());
+        }
+        return run_sampled_perf(&mut service, path, iterations, offset, size, sample).await;
+    }
+
     let mut timings = Vec::with_capacity(iterations);
     if attributes.is_dir {
         let mut last_entries = Vec::new();
@@ -871,6 +923,168 @@ async fn run_perf_command(
         stats.max_ms,
         stats.avg_ms
     ))
+}
+
+async fn run_sampled_perf(
+    service: &mut FilesystemService,
+    root: &str,
+    iterations: usize,
+    offset: u64,
+    size: u32,
+    sample: PerfSample,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let discovered = discover_perf_targets(service, root, sample).await?;
+    if discovered.targets.is_empty() {
+        return Err(format!("no {} targets discovered under {root}", sample.label()).into());
+    }
+    let mut rng = SimpleRng::new(random_seed());
+    let mut timings = Vec::with_capacity(iterations);
+    let mut directory_ops = 0_usize;
+    let mut file_ops = 0_usize;
+    let mut total_entries = 0_usize;
+    let mut total_bytes = 0_usize;
+    let mut last_path = String::new();
+
+    for _ in 0..iterations {
+        let target_index = rng.next_index(discovered.targets.len());
+        let target = &discovered.targets[target_index];
+        last_path = target.path.clone();
+        match target.kind {
+            PerfTargetKind::Directory => {
+                let started = Instant::now();
+                let entries = service.read_dir(&target.path).await?;
+                timings.push(started.elapsed());
+                directory_ops = directory_ops.saturating_add(1);
+                total_entries = total_entries.saturating_add(entries.len());
+            }
+            PerfTargetKind::File => {
+                let started = Instant::now();
+                let handle = service.open(&target.path).await?;
+                let bytes = service.read(handle.local_handle, offset, size).await?;
+                service.release(handle.local_handle).await?;
+                timings.push(started.elapsed());
+                file_ops = file_ops.saturating_add(1);
+                total_bytes = total_bytes.saturating_add(bytes.len());
+            }
+        }
+    }
+
+    let stats = LatencyStats::from_timings(&timings);
+    Ok(format!(
+        "perf ok: server={} root={} sample={} discovered_targets={} discovered_directories={} discovered_files={} iterations={} directory_ops={} file_ops={} total_entries={} total_bytes={} last_path=\"{}\" first_ms={:.3} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} avg_ms={:.3}",
+        service.server_name(),
+        root,
+        sample.label(),
+        discovered.targets.len(),
+        discovered.directories,
+        discovered.files,
+        iterations,
+        directory_ops,
+        file_ops,
+        total_entries,
+        total_bytes,
+        last_path,
+        stats.first_ms,
+        stats.min_ms,
+        stats.p50_ms,
+        stats.p95_ms,
+        stats.max_ms,
+        stats.avg_ms
+    ))
+}
+
+async fn discover_perf_targets(
+    service: &mut FilesystemService,
+    root: &str,
+    sample: PerfSample,
+) -> Result<PerfTargets, Box<dyn std::error::Error>> {
+    let mut queue = VecDeque::from([root.to_owned()]);
+    let mut targets = Vec::new();
+    let mut directories = 0_usize;
+    let mut files = 0_usize;
+
+    while let Some(path) = queue.pop_front() {
+        let entries = service.read_dir(&path).await?;
+        if path != root && matches!(sample, PerfSample::Directories | PerfSample::Mixed) {
+            targets.push(PerfTarget {
+                path: path.clone(),
+                kind: PerfTargetKind::Directory,
+            });
+        }
+        if path != root {
+            directories = directories.saturating_add(1);
+        }
+        for entry in entries {
+            if entry.is_dir {
+                queue.push_back(entry.path);
+            } else {
+                files = files.saturating_add(1);
+                if matches!(sample, PerfSample::Files | PerfSample::Mixed) {
+                    targets.push(PerfTarget {
+                        path: entry.path,
+                        kind: PerfTargetKind::File,
+                    });
+                }
+            }
+        }
+    }
+
+    if targets.is_empty() && matches!(sample, PerfSample::Directories | PerfSample::Mixed) {
+        targets.push(PerfTarget {
+            path: root.to_owned(),
+            kind: PerfTargetKind::Directory,
+        });
+    }
+
+    Ok(PerfTargets {
+        targets,
+        directories,
+        files,
+    })
+}
+
+#[derive(Debug)]
+struct PerfTargets {
+    targets: Vec<PerfTarget>,
+    directories: usize,
+    files: usize,
+}
+
+#[derive(Debug)]
+struct PerfTarget {
+    path: String,
+    kind: PerfTargetKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerfTargetKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_index(&mut self, upper_bound: usize) -> usize {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state as usize) % upper_bound
+    }
+}
+
+fn random_seed() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    time ^ u64::from(process::id())
 }
 
 #[derive(Debug)]
@@ -2045,13 +2259,14 @@ mod tests {
     };
 
     use super::{
-        CacheCommand, ClientProcessConfig, Command, Invocation, MountConfig, PrefetchControlServer,
-        acquire_state_dir_lock, cache_repair_report, cache_status_report, default_client_name,
-        default_config_path, default_library_root, default_mount_point, default_state_dir,
-        endpoint_socket, install_client_bundle, load_bundle_manifest, mount_root_attributes,
-        normalize_bootstrap_url, parse_command_impl, parse_http_response, parse_invocation_impl,
-        render_macos_launchd_plist, resolve_optional_install_value, resolve_required_install_value,
-        spawn_prefetch_control_server, startup_context, windows_task_command_for_service_launch,
+        CacheCommand, ClientProcessConfig, Command, Invocation, MountConfig, PerfSample,
+        PrefetchControlServer, acquire_state_dir_lock, cache_repair_report, cache_status_report,
+        default_client_name, default_config_path, default_library_root, default_mount_point,
+        default_state_dir, endpoint_socket, install_client_bundle, load_bundle_manifest,
+        mount_root_attributes, normalize_bootstrap_url, parse_command_impl, parse_http_response,
+        parse_invocation_impl, render_macos_launchd_plist, resolve_optional_install_value,
+        resolve_required_install_value, spawn_prefetch_control_server, startup_context,
+        windows_task_command_for_service_launch,
     };
     use legato_client_cache::client_store::ClientLegatoStore;
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
@@ -2367,6 +2582,49 @@ mod tests {
                 iterations: 50,
                 offset: 8,
                 size: 65_536,
+                sample: PerfSample::Fixed,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_perf_sample_command() {
+        let sample = parse_command_impl([
+            String::from("perf"),
+            String::from("--path"),
+            String::from("/samples/Packs"),
+            String::from("--sample"),
+            String::from("files"),
+        ])
+        .expect("sample command should parse");
+        let random = parse_command_impl([
+            String::from("perf"),
+            String::from("--path"),
+            String::from("/samples/Packs"),
+            String::from("--random"),
+        ])
+        .expect("random command should parse");
+
+        assert_eq!(
+            sample,
+            Some(Command::Perf {
+                config_path: None,
+                path: String::from("/samples/Packs"),
+                iterations: 20,
+                offset: 0,
+                size: 1024 * 1024,
+                sample: PerfSample::Files,
+            })
+        );
+        assert_eq!(
+            random,
+            Some(Command::Perf {
+                config_path: None,
+                path: String::from("/samples/Packs"),
+                iterations: 20,
+                offset: 0,
+                size: 1024 * 1024,
+                sample: PerfSample::Directories,
             })
         );
     }
