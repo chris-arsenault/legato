@@ -1,4 +1,25 @@
 #!/bin/bash
-set -euo pipefail
+set -uo pipefail
+
+STATE_DIR="/Library/Application Support/Legato"
+LOG_DIR="${STATE_DIR}/logs"
+INSTALL_LOG="${LOG_DIR}/install.log"
+SERVICE_LABEL="com.legato.legatofs"
+
+mkdir -p "${LOG_DIR}"
+exec >> "${INSTALL_LOG}" 2>&1
+
+echo "Legato preinstall started at $(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+CONSOLE_USER="$(/usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ] && [ "${CONSOLE_USER}" != "loginwindow" ]; then
+  CONSOLE_UID="$(/usr/bin/id -u "${CONSOLE_USER}" 2>/dev/null || true)"
+  if [ -n "${CONSOLE_UID}" ]; then
+    echo "Stopping existing Legato launchd agent for ${CONSOLE_USER} (${CONSOLE_UID})"
+    /bin/launchctl bootout "gui/${CONSOLE_UID}/${SERVICE_LABEL}" || true
+  fi
+else
+  echo "No interactive console user; skipping launchd stop."
+fi
 
 exit 0
