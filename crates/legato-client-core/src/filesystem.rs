@@ -384,7 +384,7 @@ impl FilesystemService {
             );
             return Err(error);
         };
-        tracing::info!(
+        tracing::debug!(
             operation = "release",
             path = handle.path.as_str(),
             local_handle,
@@ -1149,13 +1149,23 @@ fn log_slow_operation(
     source: &'static str,
     elapsed: Duration,
 ) {
-    tracing::info!(
-        operation,
-        path,
-        source,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "client filesystem operation"
-    );
+    if source == "remote" {
+        tracing::info!(
+            operation,
+            path,
+            source,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation"
+        );
+    } else {
+        tracing::debug!(
+            operation,
+            path,
+            source,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation"
+        );
+    }
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -1200,13 +1210,23 @@ fn log_operation_failure(
     error: &FilesystemServiceError,
     elapsed: Duration,
 ) {
-    tracing::warn!(
-        operation,
-        path,
-        error = %error,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "client filesystem operation failed"
-    );
+    if matches!(error, FilesystemServiceError::NotFound(_)) {
+        tracing::debug!(
+            operation,
+            path,
+            error = %error,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation failed"
+        );
+    } else {
+        tracing::warn!(
+            operation,
+            path,
+            error = %error,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation failed"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1220,18 +1240,33 @@ fn log_slow_read(
     remote_bytes: u64,
     elapsed: Duration,
 ) {
-    tracing::info!(
-        operation = "read",
-        path,
-        offset,
-        size,
-        cache_hits,
-        cache_misses,
-        local_bytes,
-        remote_bytes,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "client filesystem read"
-    );
+    if local_bytes == 0 && remote_bytes == 0 {
+        tracing::debug!(
+            operation = "read",
+            path,
+            offset,
+            size,
+            cache_hits,
+            cache_misses,
+            local_bytes,
+            remote_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem read"
+        );
+    } else {
+        tracing::info!(
+            operation = "read",
+            path,
+            offset,
+            size,
+            cache_hits,
+            cache_misses,
+            local_bytes,
+            remote_bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem read"
+        );
+    }
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation = "read",
@@ -1249,12 +1284,21 @@ fn log_slow_read(
 }
 
 fn log_slow_change_sync(records: usize, elapsed: Duration) {
-    tracing::info!(
-        operation = "sync_changes",
-        records,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "client filesystem operation"
-    );
+    if records == 0 {
+        tracing::debug!(
+            operation = "sync_changes",
+            records,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation"
+        );
+    } else {
+        tracing::info!(
+            operation = "sync_changes",
+            records,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "client filesystem operation"
+        );
+    }
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation = "sync_changes",

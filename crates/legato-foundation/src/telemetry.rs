@@ -45,6 +45,7 @@ impl Default for TracingConfig {
 #[derive(Debug)]
 pub struct TracingGuard {
     _file_guard: Option<WorkerGuard>,
+    _stdout_guard: WorkerGuard,
 }
 
 #[derive(Debug)]
@@ -407,9 +408,13 @@ pub fn init_tracing(
         .or_else(|_| EnvFilter::try_new(tracing_config.level.as_str()))?;
     let file_sink = tracing_file_sink(service_name, tracing_config.log_dir.as_deref())?;
     let file_path = file_sink.as_ref().map(|sink| sink.path.clone());
+    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let file_guard = if tracing_config.json {
-        let formatting = fmt::layer().with_target(true).with_thread_ids(true);
+        let formatting = fmt::layer()
+            .with_writer(stdout_writer)
+            .with_target(true)
+            .with_thread_ids(true);
         if let Some(sink) = file_sink {
             let file_layer = fmt::layer()
                 .with_writer(sink.writer)
@@ -443,7 +448,10 @@ pub fn init_tracing(
             None
         }
     } else {
-        let formatting = fmt::layer().with_target(true).with_thread_ids(true);
+        let formatting = fmt::layer()
+            .with_writer(stdout_writer)
+            .with_target(true)
+            .with_thread_ids(true);
         if let Some(sink) = file_sink {
             let file_layer = fmt::layer()
                 .with_writer(sink.writer)
@@ -476,6 +484,7 @@ pub fn init_tracing(
     install_panic_logger(service_name);
     Ok(TracingGuard {
         _file_guard: file_guard,
+        _stdout_guard: stdout_guard,
     })
 }
 

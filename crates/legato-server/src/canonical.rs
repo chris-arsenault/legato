@@ -449,13 +449,14 @@ pub(crate) fn logical_request_path(
     library_root: &Path,
     path: &str,
 ) -> Result<String, CanonicalStoreError> {
-    let request_path = Path::new(path);
+    let path = path.replace('\\', "/");
+    let request_path = Path::new(&path);
     if request_path.is_absolute()
         && (request_path == library_root || request_path.starts_with(library_root))
     {
         return logical_path(library_root, request_path);
     }
-    Ok(normalize_logical_path(path))
+    Ok(normalize_logical_path(&path))
 }
 
 fn logical_path(library_root: &Path, path: &Path) -> Result<String, CanonicalStoreError> {
@@ -466,7 +467,8 @@ fn logical_path(library_root: &Path, path: &Path) -> Result<String, CanonicalSto
 }
 
 fn normalize_logical_path(path: &str) -> String {
-    normalize_relative_components(Path::new(path))
+    let path = path.replace('\\', "/");
+    normalize_relative_components(Path::new(&path))
 }
 
 fn normalize_relative_components(path: &Path) -> String {
@@ -810,6 +812,16 @@ mod tests {
         assert_eq!(
             logical_request_path(library, "/Kontakt/piano.nki")
                 .expect("logical path should normalize"),
+            "/Kontakt/piano.nki"
+        );
+        assert_eq!(
+            logical_request_path(library, r"/Kontakt\piano.nki")
+                .expect("logical Windows path should normalize"),
+            "/Kontakt/piano.nki"
+        );
+        assert_eq!(
+            logical_request_path(library, r"/srv/libraries\Kontakt\piano.nki")
+                .expect("legacy Windows path should normalize"),
             "/Kontakt/piano.nki"
         );
     }

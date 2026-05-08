@@ -791,7 +791,7 @@ fn attributes_from_directory_entry(entry: &DirectoryEntry) -> WindowsAttributes 
 }
 
 fn log_slow_callback(operation: &'static str, path: &str, elapsed: Duration) {
-    tracing::info!(
+    tracing::debug!(
         operation,
         path,
         elapsed_ms = elapsed.as_millis() as u64,
@@ -813,7 +813,7 @@ fn log_slow_callback_with_count(
     entries: usize,
     elapsed: Duration,
 ) {
-    tracing::info!(
+    tracing::debug!(
         operation,
         path,
         entries,
@@ -839,7 +839,7 @@ fn log_slow_read_callback(
     actual_size: usize,
     elapsed: Duration,
 ) {
-    tracing::info!(
+    tracing::debug!(
         operation,
         handle,
         offset,
@@ -869,7 +869,7 @@ fn log_slow_read_directory_callback(
     bytes_read: u32,
     elapsed: Duration,
 ) {
-    tracing::info!(
+    tracing::debug!(
         operation,
         path,
         buffer_size,
@@ -906,13 +906,35 @@ fn attributes_from_open_handle(handle: &FilesystemOpenHandle) -> FilesystemAttri
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn map_virtual_path(library_root: &str, virtual_path: &Path) -> String {
-    let mut mapped = PathBuf::from(library_root);
+    let mut components = logical_path_components(library_root);
     for component in virtual_path.components() {
         if let std::path::Component::Normal(segment) = component {
-            mapped.push(segment);
+            push_logical_path_components(&mut components, &segment.to_string_lossy());
         }
     }
-    mapped.to_string_lossy().into_owned()
+    if components.is_empty() {
+        String::from("/")
+    } else {
+        format!("/{}", components.join("/"))
+    }
+}
+
+fn logical_path_components(path: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    push_logical_path_components(&mut components, path);
+    components
+}
+
+fn push_logical_path_components(components: &mut Vec<String>, path: &str) {
+    for segment in path.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                let _ = components.pop();
+            }
+            segment => components.push(segment.to_owned()),
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1031,6 +1053,14 @@ mod tests {
         assert_eq!(
             map_virtual_path("/", Path::new("/Kontakt/piano.nki")),
             "/Kontakt/piano.nki"
+        );
+        assert_eq!(
+            map_virtual_path("/", Path::new(r"\Kontakt\piano.nki")),
+            "/Kontakt/piano.nki"
+        );
+        assert_eq!(
+            map_virtual_path("/kontakt", Path::new(r"\Factory\piano.nki")),
+            "/kontakt/Factory/piano.nki"
         );
     }
 

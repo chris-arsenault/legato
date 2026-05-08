@@ -244,13 +244,11 @@ fn spawn_watch_task(
             let channel_closed =
                 debounce_watch_events(&mut receiver, &library_root, WATCH_RECONCILE_DEBOUNCE).await;
             tracing::info!("server library reconcile started");
-            println!("legato-server reconcile started phase=watch");
             let reconcile_started = Instant::now();
             let stats = match reconcile_library_root_to_store(&state_dir, &library_root) {
                 Ok(stats) => stats,
                 Err(error) => {
                     tracing::warn!(error = %error, "server library reconcile failed");
-                    println!("legato-server reconcile failed phase=watch error={error}");
                     if channel_closed {
                         break;
                     }
@@ -262,7 +260,6 @@ fn spawn_watch_task(
                 Ok(catalog) => catalog,
                 Err(error) => {
                     tracing::warn!(error = %error, "server catalog reopen failed after reconcile");
-                    println!("legato-server catalog reopen failed phase=watch error={error}");
                     if channel_closed {
                         break;
                     }
@@ -724,15 +721,11 @@ fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, St
 }
 
 fn log_slow_rpc(operation: &'static str, path: &str, elapsed: Duration) {
-    tracing::info!(
+    tracing::debug!(
         operation,
         path,
         elapsed_ms = elapsed.as_millis() as u64,
         "server rpc"
-    );
-    println!(
-        "legato-server rpc operation={operation} path={path} elapsed_ms={}",
-        elapsed.as_millis()
     );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
@@ -751,18 +744,25 @@ fn log_rpc_failure(
     error: &str,
     elapsed: Duration,
 ) {
-    tracing::warn!(
-        operation,
-        path,
-        status,
-        error,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "server rpc failed"
-    );
-    println!(
-        "legato-server rpc failed operation={operation} path={path} status={status} error={error} elapsed_ms={}",
-        elapsed.as_millis()
-    );
+    if status == "not_found" {
+        tracing::debug!(
+            operation,
+            path,
+            status,
+            error,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "server rpc failed"
+        );
+    } else {
+        tracing::warn!(
+            operation,
+            path,
+            status,
+            error,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "server rpc failed"
+        );
+    }
 }
 
 fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, elapsed: Duration) {
@@ -772,10 +772,6 @@ fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, el
         count,
         elapsed_ms = elapsed.as_millis() as u64,
         "server rpc"
-    );
-    println!(
-        "legato-server rpc operation={operation} path={path} count={count} elapsed_ms={}",
-        elapsed.as_millis()
     );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
@@ -796,10 +792,6 @@ fn log_fetch_failure(error: &str, requested_extents: usize, elapsed: Duration) {
         elapsed_ms = elapsed.as_millis() as u64,
         "server rpc failed"
     );
-    println!(
-        "legato-server rpc failed operation=fetch requested_extents={requested_extents} error={error} elapsed_ms={}",
-        elapsed.as_millis()
-    );
 }
 
 fn log_fetch_rpc(extents: usize, bytes: usize, elapsed: Duration) {
@@ -809,10 +801,6 @@ fn log_fetch_rpc(extents: usize, bytes: usize, elapsed: Duration) {
         bytes,
         elapsed_ms = elapsed.as_millis() as u64,
         "server rpc"
-    );
-    println!(
-        "legato-server rpc operation=fetch extents={extents} bytes={bytes} elapsed_ms={}",
-        elapsed.as_millis()
     );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
@@ -844,17 +832,6 @@ fn log_reconcile_summary(phase: &'static str, stats: &crate::ReconcileStats, ela
         changed_records,
         elapsed_ms = elapsed.as_millis() as u64,
         "server library reconcile completed"
-    );
-    println!(
-        "legato-server reconcile completed phase={phase} directories_created={} directories_updated={} directories_deleted={} files_created={} files_updated={} files_deleted={} changed_records={} elapsed_ms={}",
-        stats.directories_created,
-        stats.directories_updated,
-        stats.directories_deleted,
-        stats.files_created,
-        stats.files_updated,
-        stats.files_deleted,
-        changed_records,
-        elapsed.as_millis()
     );
 }
 
