@@ -366,6 +366,7 @@ pub async fn mount(
     volume_params
         .filesystem_name("legato")
         .read_only_volume(true)
+        .pass_query_directory_pattern(true)
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)
@@ -518,7 +519,7 @@ impl FileSystemContext for WindowsMountService {
     fn read_directory(
         &self,
         context: &Self::FileContext,
-        _pattern: Option<&U16CStr>,
+        pattern: Option<&U16CStr>,
         marker: DirMarker<'_>,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
@@ -527,7 +528,7 @@ impl FileSystemContext for WindowsMountService {
             return Err(FspError::IO(std::io::ErrorKind::NotADirectory));
         }
         if marker.is_none() {
-            self.fill_directory_buffer(context)?;
+            self.fill_directory_buffer(context, pattern)?;
         }
         let bytes = context.directory_buffer.read(marker, buffer);
         log_slow_read_directory_callback(
@@ -658,7 +659,11 @@ impl WindowsMountService {
         })
     }
 
-    fn fill_directory_buffer(&self, context: &WinfspFileContext) -> winfsp::Result<()> {
+    fn fill_directory_buffer(
+        &self,
+        context: &WinfspFileContext,
+        pattern: Option<&U16CStr>,
+    ) -> winfsp::Result<()> {
         let started = Instant::now();
         let entries = self.runtime.block_on(async {
             self.service
@@ -668,15 +673,24 @@ impl WindowsMountService {
                 .await
                 .map_err(map_mount_error)
         })?;
+        let pattern = pattern.map(|pattern| pattern.to_string_lossy());
         let lock = context
             .directory_buffer
             .acquire(true, Some(entries.len().saturating_add(2) as u32))?;
-        write_dir_entry(&lock, ".", &context.attributes)?;
-        write_dir_entry(&lock, "..", &context.attributes)?;
-        let entry_count = entries.len();
-        for entry in entries {
+        if directory_entry_matches_pattern(".", pattern.as_deref()) {
+            write_dir_entry(&lock, ".", &context.attributes)?;
+        }
+        if directory_entry_matches_pattern("..", pattern.as_deref()) {
+            write_dir_entry(&lock, "..", &context.attributes)?;
+        }
+        let mut entry_count = 0_usize;
+        for entry in entries
+            .into_iter()
+            .filter(|entry| directory_entry_matches_pattern(&entry.name, pattern.as_deref()))
+        {
             let attributes = attributes_from_directory_entry(&entry);
             write_dir_entry(&lock, &entry.name, &attributes)?;
+            entry_count = entry_count.saturating_add(1);
         }
         log_slow_callback_with_count(
             "runtime_fill_directory_buffer",
@@ -712,6 +726,54 @@ fn write_dir_entry(
     fill_file_info(dir_info.file_info_mut(), attributes);
     dir_info.set_name(name)?;
     lock.write(&mut dir_info)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn directory_entry_matches_pattern(name: &str, pattern: Option<&str>) -> bool {
+    let Some(pattern) = pattern.map(str::trim).filter(|pattern| !pattern.is_empty()) else {
+        return true;
+    };
+    if pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    wildcard_match_ci(pattern, name)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn wildcard_match_ci(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    wildcard_match_bytes(pattern.as_bytes(), name.as_bytes())
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn wildcard_match_bytes(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut pattern_index, mut name_index) = (0_usize, 0_usize);
+    let mut star_index = None;
+    let mut star_name_index = 0_usize;
+
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == name[name_index])
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_name_index = name_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            star_name_index += 1;
+            name_index = star_name_index;
+        } else {
+            return false;
+        }
+    }
+
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == b'*')
 }
 
 #[cfg(target_os = "windows")]
@@ -962,8 +1024,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        MountPointError, MountPointReadiness, WindowsFilesystem, drive_letter_mount_point,
-        map_virtual_path, normalize_mount_point, prepare_mount_point, windows_directory_entries,
+        MountPointError, MountPointReadiness, WindowsFilesystem, directory_entry_matches_pattern,
+        drive_letter_mount_point, map_virtual_path, normalize_mount_point, prepare_mount_point,
+        windows_directory_entries,
     };
 
     fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
@@ -1016,6 +1079,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![String::from("Drums"), String::from("Samples")]
         );
+    }
+
+    #[test]
+    fn directory_patterns_filter_entries_case_insensitively() {
+        assert!(directory_entry_matches_pattern("samples", None));
+        assert!(directory_entry_matches_pattern("samples", Some("*")));
+        assert!(directory_entry_matches_pattern("samples", Some("*.*")));
+        assert!(directory_entry_matches_pattern("samples", Some("sam*")));
+        assert!(directory_entry_matches_pattern("samples", Some("SAMPLES")));
+        assert!(directory_entry_matches_pattern("kick.wav", Some("*.wav")));
+        assert!(directory_entry_matches_pattern("kick.wav", Some("k?ck.*")));
+
+        assert!(!directory_entry_matches_pattern("samples", Some("vst*")));
+        assert!(!directory_entry_matches_pattern("kick.wav", Some("*.nki")));
     }
 
     #[test]
