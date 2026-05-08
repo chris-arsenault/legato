@@ -4,8 +4,9 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     net::TcpListener,
+    panic,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +16,8 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{FoundationError, ShutdownToken};
+
+static PANIC_HOOK: Once = Once::new();
 
 /// Tracing output configuration shared across Legato binaries.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -470,9 +473,39 @@ pub fn init_tracing(
             .map(|path| path.to_string_lossy().into_owned()),
         "tracing initialized"
     );
+    install_panic_logger(service_name);
     Ok(TracingGuard {
         _file_guard: file_guard,
     })
+}
+
+fn install_panic_logger(service_name: &str) {
+    let service_name = service_name.to_owned();
+    PANIC_HOOK.call_once(move || {
+        let default_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map_or_else(|| String::from("unknown"), |location| location.to_string());
+            let message = info.payload().downcast_ref::<&str>().map_or_else(
+                || {
+                    info.payload()
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_else(|| String::from("<non-string panic payload>"))
+                },
+                |message| String::from(*message),
+            );
+            tracing::error!(
+                service = service_name.as_str(),
+                location = location.as_str(),
+                panic = message.as_str(),
+                "process panic"
+            );
+            eprintln!("{} panic at {}: {}", service_name, location, message);
+            default_hook(info);
+        }));
+    });
 }
 
 fn tracing_file_sink(

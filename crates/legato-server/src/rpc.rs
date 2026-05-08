@@ -127,6 +127,7 @@ impl LiveServer {
         if let Some(metrics) = &metrics {
             metrics.record_bootstrap_reconcile(&stats, started.elapsed().as_nanos() as u64);
         }
+        log_reconcile_summary("bootstrap", &stats, started.elapsed());
         let invalidations = InvalidationHub::new("/");
 
         Ok(Self {
@@ -242,20 +243,33 @@ fn spawn_watch_task(
             }
             let channel_closed =
                 debounce_watch_events(&mut receiver, &library_root, WATCH_RECONCILE_DEBOUNCE).await;
-            if reconcile_library_root_to_store(&state_dir, &library_root).is_err() {
-                if channel_closed {
-                    break;
+            tracing::info!("server library reconcile started");
+            println!("legato-server reconcile started phase=watch");
+            let reconcile_started = Instant::now();
+            let stats = match reconcile_library_root_to_store(&state_dir, &library_root) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    tracing::warn!(error = %error, "server library reconcile failed");
+                    println!("legato-server reconcile failed phase=watch error={error}");
+                    if channel_closed {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if let Ok(reopened_catalog) = CatalogStore::open(&state_dir, 0) {
-                *catalog.lock().await = reopened_catalog;
-            } else {
-                if channel_closed {
-                    break;
-                }
-                continue;
             };
+            log_reconcile_summary("watch", &stats, reconcile_started.elapsed());
+            let reopened_catalog = match CatalogStore::open(&state_dir, 0) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    tracing::warn!(error = %error, "server catalog reopen failed after reconcile");
+                    println!("legato-server catalog reopen failed phase=watch error={error}");
+                    if channel_closed {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            *catalog.lock().await = reopened_catalog;
 
             let mut hub = invalidations.lock().await;
             hub.publish(subtree_invalidation("/", 0));
@@ -326,19 +340,32 @@ impl Legato for LiveServer {
         request: Request<ResolveRequest>,
     ) -> Result<Response<ResolveResponse>, Status> {
         let started = Instant::now();
-        let path = logical_request_path(
-            Path::new(&self.config.library_root),
-            &request.into_inner().path,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let inode = self
-            .catalog
-            .lock()
-            .await
-            .resolve_path(&path)
-            .cloned()
-            .ok_or_else(|| Status::not_found("path not found"))
-            .map(inode_to_proto)?;
+        let request_path = request.into_inner().path;
+        let path = logical_request_path(Path::new(&self.config.library_root), &request_path)
+            .map_err(|error| {
+                let message = error.to_string();
+                log_rpc_failure(
+                    "resolve",
+                    &request_path,
+                    "invalid_argument",
+                    &message,
+                    started.elapsed(),
+                );
+                Status::invalid_argument(message)
+            })?;
+        let inode = match self.catalog.lock().await.resolve_path(&path).cloned() {
+            Some(inode) => inode_to_proto(inode),
+            None => {
+                log_rpc_failure(
+                    "resolve",
+                    &path,
+                    "not_found",
+                    "path not found",
+                    started.elapsed(),
+                );
+                return Err(Status::not_found("path not found"));
+            }
+        };
         log_slow_rpc("resolve", &path, started.elapsed());
         Ok(Response::new(ResolveResponse { inode: Some(inode) }))
     }
@@ -352,28 +379,43 @@ impl Legato for LiveServer {
         let requested_extents = request.extents.len();
         let catalog = self.catalog.lock().await;
         let mut records = Vec::with_capacity(request.extents.len());
+        let mut response_bytes = 0_usize;
         for extent in request.extents {
-            let inode = catalog
-                .resolve_file_id(FileId(extent.file_id))
-                .ok_or_else(|| Status::not_found("file id not found"))?;
+            let Some(inode) = catalog.resolve_file_id(FileId(extent.file_id)) else {
+                log_fetch_failure(
+                    "file id not found",
+                    requested_extents,
+                    rpc_started.elapsed(),
+                );
+                return Err(Status::not_found("file id not found"));
+            };
             if inode.inode_generation != extent.inode_generation {
+                log_fetch_failure(
+                    "stale inode generation",
+                    requested_extents,
+                    rpc_started.elapsed(),
+                );
                 return Err(Status::failed_precondition("stale inode generation"));
             }
-            let catalog_extent = inode
-                .extents
-                .iter()
-                .find(|candidate| {
-                    candidate.extent_index == extent.extent_index
-                        && candidate.file_offset == extent.file_offset
-                        && candidate.length == extent.length
-                        && (extent.extent_hash.is_empty()
-                            || candidate.payload_hash == extent.extent_hash)
-                })
-                .ok_or_else(|| Status::not_found("extent not found"))?;
+            let Some(catalog_extent) = inode.extents.iter().find(|candidate| {
+                candidate.extent_index == extent.extent_index
+                    && candidate.file_offset == extent.file_offset
+                    && candidate.length == extent.length
+                    && (extent.extent_hash.is_empty()
+                        || candidate.payload_hash == extent.extent_hash)
+            }) else {
+                log_fetch_failure("extent not found", requested_extents, rpc_started.elapsed());
+                return Err(Status::not_found("extent not found"));
+            };
             let started = Instant::now();
-            let data = catalog
-                .read_extent_payload(catalog_extent)
-                .map_err(map_catalog_error)?;
+            let data = match catalog.read_extent_payload(catalog_extent) {
+                Ok(data) => data,
+                Err(error) => {
+                    let status = map_catalog_error(error);
+                    log_fetch_failure(status.message(), requested_extents, rpc_started.elapsed());
+                    return Err(status);
+                }
+            };
             if let Some(metrics) = &self.metrics {
                 metrics.record_extent_fetch(
                     crate::ExtentFetchSource::CacheHit,
@@ -381,6 +423,7 @@ impl Legato for LiveServer {
                     started.elapsed().as_nanos() as u64,
                 );
             }
+            response_bytes = response_bytes.saturating_add(data.len());
             records.push(ExtentRecord {
                 file_id: inode.file_id.0,
                 extent_index: catalog_extent.extent_index,
@@ -391,7 +434,7 @@ impl Legato for LiveServer {
             });
         }
         let stream = tokio_stream::iter(records.into_iter().map(Ok));
-        log_slow_rpc_with_count("fetch", "", requested_extents, rpc_started.elapsed());
+        log_fetch_rpc(requested_extents, response_bytes, rpc_started.elapsed());
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -485,21 +528,32 @@ impl Legato for LiveServer {
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
         let started = Instant::now();
-        let path = logical_request_path(
-            Path::new(&self.config.library_root),
-            &request.into_inner().path,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let response = self
-            .catalog
-            .lock()
-            .await
-            .resolve_path(&path)
-            .cloned()
-            .map(|inode| StatResponse {
-                metadata: Some(catalog_inode_to_metadata(inode)),
-            })
-            .ok_or_else(|| Status::not_found("path not found"))?;
+        let request_path = request.into_inner().path;
+        let path = logical_request_path(Path::new(&self.config.library_root), &request_path)
+            .map_err(|error| {
+                let message = error.to_string();
+                log_rpc_failure(
+                    "stat",
+                    &request_path,
+                    "invalid_argument",
+                    &message,
+                    started.elapsed(),
+                );
+                Status::invalid_argument(message)
+            })?;
+        let Some(inode) = self.catalog.lock().await.resolve_path(&path).cloned() else {
+            log_rpc_failure(
+                "stat",
+                &path,
+                "not_found",
+                "path not found",
+                started.elapsed(),
+            );
+            return Err(Status::not_found("path not found"));
+        };
+        let response = StatResponse {
+            metadata: Some(catalog_inode_to_metadata(inode)),
+        };
         log_slow_rpc("stat", &path, started.elapsed());
         Ok(Response::new(response))
     }
@@ -509,28 +563,40 @@ impl Legato for LiveServer {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
         let started = Instant::now();
-        let path = logical_request_path(
-            Path::new(&self.config.library_root),
-            &request.into_inner().path,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let response = self
-            .catalog
-            .lock()
-            .await
-            .list_directory(&path)
-            .map(|entries| ListDirResponse {
-                entries: entries
-                    .into_iter()
-                    .map(|entry| DirectoryEntry {
-                        name: entry.name,
-                        path: entry.path,
-                        is_dir: entry.is_dir,
-                        file_id: entry.file_id.0,
-                    })
-                    .collect(),
-            })
-            .ok_or_else(|| Status::not_found("directory not found"))?;
+        let request_path = request.into_inner().path;
+        let path = logical_request_path(Path::new(&self.config.library_root), &request_path)
+            .map_err(|error| {
+                let message = error.to_string();
+                log_rpc_failure(
+                    "list_dir",
+                    &request_path,
+                    "invalid_argument",
+                    &message,
+                    started.elapsed(),
+                );
+                Status::invalid_argument(message)
+            })?;
+        let Some(entries) = self.catalog.lock().await.list_directory(&path) else {
+            log_rpc_failure(
+                "list_dir",
+                &path,
+                "not_found",
+                "directory not found",
+                started.elapsed(),
+            );
+            return Err(Status::not_found("directory not found"));
+        };
+        let response = ListDirResponse {
+            entries: entries
+                .into_iter()
+                .map(|entry| DirectoryEntry {
+                    name: entry.name,
+                    path: entry.path,
+                    is_dir: entry.is_dir,
+                    file_id: entry.file_id.0,
+                })
+                .collect(),
+        };
         log_slow_rpc_with_count("list_dir", &path, response.entries.len(), started.elapsed());
         Ok(Response::new(response))
     }
@@ -540,21 +606,32 @@ impl Legato for LiveServer {
         request: Request<ResolvePathRequest>,
     ) -> Result<Response<ResolvePathResponse>, Status> {
         let started = Instant::now();
-        let path = logical_request_path(
-            Path::new(&self.config.library_root),
-            &request.into_inner().path,
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let response = self
-            .catalog
-            .lock()
-            .await
-            .resolve_path(&path)
-            .cloned()
-            .map(|inode| ResolvePathResponse {
-                metadata: Some(catalog_inode_to_metadata(inode)),
-            })
-            .ok_or_else(|| Status::not_found("path not found"))?;
+        let request_path = request.into_inner().path;
+        let path = logical_request_path(Path::new(&self.config.library_root), &request_path)
+            .map_err(|error| {
+                let message = error.to_string();
+                log_rpc_failure(
+                    "resolve_path",
+                    &request_path,
+                    "invalid_argument",
+                    &message,
+                    started.elapsed(),
+                );
+                Status::invalid_argument(message)
+            })?;
+        let Some(inode) = self.catalog.lock().await.resolve_path(&path).cloned() else {
+            log_rpc_failure(
+                "resolve_path",
+                &path,
+                "not_found",
+                "path not found",
+                started.elapsed(),
+            );
+            return Err(Status::not_found("path not found"));
+        };
+        let response = ResolvePathResponse {
+            metadata: Some(catalog_inode_to_metadata(inode)),
+        };
         log_slow_rpc("resolve_path", &path, started.elapsed());
         Ok(Response::new(response))
     }
@@ -647,6 +724,16 @@ fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, St
 }
 
 fn log_slow_rpc(operation: &'static str, path: &str, elapsed: Duration) {
+    tracing::info!(
+        operation,
+        path,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server rpc"
+    );
+    println!(
+        "legato-server rpc operation={operation} path={path} elapsed_ms={}",
+        elapsed.as_millis()
+    );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -657,7 +744,39 @@ fn log_slow_rpc(operation: &'static str, path: &str, elapsed: Duration) {
     }
 }
 
+fn log_rpc_failure(
+    operation: &'static str,
+    path: &str,
+    status: &'static str,
+    error: &str,
+    elapsed: Duration,
+) {
+    tracing::warn!(
+        operation,
+        path,
+        status,
+        error,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server rpc failed"
+    );
+    println!(
+        "legato-server rpc failed operation={operation} path={path} status={status} error={error} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+}
+
 fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, elapsed: Duration) {
+    tracing::info!(
+        operation,
+        path,
+        count,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server rpc"
+    );
+    println!(
+        "legato-server rpc operation={operation} path={path} count={count} elapsed_ms={}",
+        elapsed.as_millis()
+    );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -667,6 +786,76 @@ fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, el
             "slow server rpc"
         );
     }
+}
+
+fn log_fetch_failure(error: &str, requested_extents: usize, elapsed: Duration) {
+    tracing::warn!(
+        operation = "fetch",
+        requested_extents,
+        error,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server rpc failed"
+    );
+    println!(
+        "legato-server rpc failed operation=fetch requested_extents={requested_extents} error={error} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+}
+
+fn log_fetch_rpc(extents: usize, bytes: usize, elapsed: Duration) {
+    tracing::info!(
+        operation = "fetch",
+        extents,
+        bytes,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server rpc"
+    );
+    println!(
+        "legato-server rpc operation=fetch extents={extents} bytes={bytes} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    if elapsed >= SLOW_RPC_WARN_AFTER {
+        tracing::warn!(
+            operation = "fetch",
+            extents,
+            bytes,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow server rpc"
+        );
+    }
+}
+
+fn log_reconcile_summary(phase: &'static str, stats: &crate::ReconcileStats, elapsed: Duration) {
+    let changed_records = stats
+        .directories_created
+        .saturating_add(stats.directories_updated)
+        .saturating_add(stats.directories_deleted)
+        .saturating_add(stats.files_created)
+        .saturating_add(stats.files_updated)
+        .saturating_add(stats.files_deleted);
+    tracing::info!(
+        phase,
+        directories_created = stats.directories_created,
+        directories_updated = stats.directories_updated,
+        directories_deleted = stats.directories_deleted,
+        files_created = stats.files_created,
+        files_updated = stats.files_updated,
+        files_deleted = stats.files_deleted,
+        changed_records,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "server library reconcile completed"
+    );
+    println!(
+        "legato-server reconcile completed phase={phase} directories_created={} directories_updated={} directories_deleted={} files_created={} files_updated={} files_deleted={} changed_records={} elapsed_ms={}",
+        stats.directories_created,
+        stats.directories_updated,
+        stats.directories_deleted,
+        stats.files_created,
+        stats.files_updated,
+        stats.files_deleted,
+        changed_records,
+        elapsed.as_millis()
+    );
 }
 
 #[cfg(test)]

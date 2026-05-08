@@ -241,10 +241,14 @@ impl FilesystemService {
             return Ok(metadata_to_attributes(metadata));
         }
 
-        let metadata = self
-            .remote_stat(path)
-            .await
-            .map_err(map_lookup_error(path))?;
+        let metadata = match self.remote_stat(path).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let error = map_lookup_error(path)(error);
+                log_operation_failure("lookup", path, &error, started.elapsed());
+                return Err(error);
+            }
+        };
         self.store.record_metadata(metadata.clone())?;
         self.control.register_path(metadata.clone(), now_ns);
         self.report_metrics_if_due(false).await;
@@ -261,14 +265,14 @@ impl FilesystemService {
         let now_ns = now_monotonic_ns();
         if let Some(entries) = self.lookup_local_directory(path, now_ns) {
             self.report_metrics_if_due(false).await;
-            log_slow_operation("read_dir", path, "cache", started.elapsed());
+            log_directory_operation("read_dir", path, "cache", entries.len(), started.elapsed());
             return Ok(entries);
         }
 
         self.sync_changes_if_due(false).await?;
         if let Some(entries) = self.lookup_local_directory(path, now_ns) {
             self.report_metrics_if_due(false).await;
-            log_slow_operation("read_dir", path, "store", started.elapsed());
+            log_directory_operation("read_dir", path, "store", entries.len(), started.elapsed());
             return Ok(entries);
         }
 
@@ -276,22 +280,32 @@ impl FilesystemService {
             Ok(metadata) => metadata,
             Err(error) if path == "/" && is_remote_unavailable(&error) => {
                 self.report_metrics_if_due(false).await;
-                log_slow_operation("read_dir", path, "offline-empty", started.elapsed());
+                log_directory_operation("read_dir", path, "offline-empty", 0, started.elapsed());
                 return Ok(Vec::new());
             }
-            Err(error) => return Err(map_lookup_error(path)(error)),
+            Err(error) => {
+                let error = map_lookup_error(path)(error);
+                log_operation_failure("read_dir", path, &error, started.elapsed());
+                return Err(error);
+            }
         };
         if !directory_metadata.is_dir {
-            return Err(FilesystemServiceError::NotFound(path.to_owned()));
+            let error = FilesystemServiceError::NotFound(path.to_owned());
+            log_operation_failure("read_dir", path, &error, started.elapsed());
+            return Err(error);
         }
         let entries = match self.remote_list_dir(path).await {
             Ok(entries) => entries,
             Err(error) if path == "/" && is_remote_unavailable(&error) => {
                 self.report_metrics_if_due(false).await;
-                log_slow_operation("read_dir", path, "offline-empty", started.elapsed());
+                log_directory_operation("read_dir", path, "offline-empty", 0, started.elapsed());
                 return Ok(Vec::new());
             }
-            Err(error) => return Err(map_lookup_error(path)(error)),
+            Err(error) => {
+                let error = map_lookup_error(path)(error);
+                log_operation_failure("read_dir", path, &error, started.elapsed());
+                return Err(error);
+            }
         };
         let entries = sanitize_directory_entries(path, entries);
         self.store.record_metadata(directory_metadata.clone())?;
@@ -300,7 +314,7 @@ impl FilesystemService {
         self.control.register_path(directory_metadata, now_ns);
         self.control.register_dir(path, entries.clone(), now_ns);
         self.report_metrics_if_due(false).await;
-        log_slow_operation("read_dir", path, "remote", started.elapsed());
+        log_directory_operation("read_dir", path, "remote", entries.len(), started.elapsed());
         Ok(entries)
     }
 
@@ -334,12 +348,18 @@ impl FilesystemService {
             return Ok(handle);
         }
 
-        let inode = self
-            .remote_resolve(path)
-            .await
-            .map_err(map_lookup_error(path))?;
+        let inode = match self.remote_resolve(path).await {
+            Ok(inode) => inode,
+            Err(error) => {
+                let error = map_lookup_error(path)(error);
+                log_operation_failure("open", path, &error, started.elapsed());
+                return Err(error);
+            }
+        };
         if inode.is_dir {
-            return Err(FilesystemServiceError::NotFound(path.to_owned()));
+            let error = FilesystemServiceError::NotFound(path.to_owned());
+            log_operation_failure("open", path, &error, started.elapsed());
+            return Err(error);
         }
         self.store.record_inode(inode.clone())?;
         self.control.register_resolved_path(inode.clone(), now_ns);
@@ -355,9 +375,21 @@ impl FilesystemService {
     /// Releases a previously opened file handle.
     pub async fn release(&mut self, local_handle: u64) -> Result<(), FilesystemServiceError> {
         let Some(handle) = self.open_handles.remove(&local_handle) else {
-            return Err(FilesystemServiceError::UnknownHandle(local_handle));
+            let error = FilesystemServiceError::UnknownHandle(local_handle);
+            tracing::warn!(
+                operation = "release",
+                local_handle,
+                error = %error,
+                "client filesystem operation failed"
+            );
+            return Err(error);
         };
-        let _ = handle;
+        tracing::info!(
+            operation = "release",
+            path = handle.path.as_str(),
+            local_handle,
+            "client filesystem operation"
+        );
         self.report_metrics_if_due(false).await;
         Ok(())
     }
@@ -371,12 +403,31 @@ impl FilesystemService {
     ) -> Result<Vec<u8>, FilesystemServiceError> {
         let started = Instant::now();
         self.sync_changes_if_due(false).await?;
-        let snapshot = self
-            .open_handles
-            .get(&local_handle)
-            .cloned()
-            .ok_or(FilesystemServiceError::UnknownHandle(local_handle))?;
+        let snapshot = match self.open_handles.get(&local_handle).cloned() {
+            Some(snapshot) => snapshot,
+            None => {
+                let error = FilesystemServiceError::UnknownHandle(local_handle);
+                tracing::warn!(
+                    operation = "read",
+                    local_handle,
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "client filesystem operation failed"
+                );
+                return Err(error);
+            }
+        };
         if size == 0 || offset >= snapshot.size {
+            log_slow_read(
+                snapshot.path.as_str(),
+                offset,
+                size,
+                0,
+                0,
+                0,
+                0,
+                started.elapsed(),
+            );
             return Ok(Vec::new());
         }
         let planned_extents = read_plan(&snapshot, offset, size);
@@ -410,12 +461,26 @@ impl FilesystemService {
 
         if !missing_extents.is_empty() {
             let fetch_plan = head_biased_fetch_plan(&snapshot, &missing_extents);
-            self.fetch_missing_extents(&snapshot, &fetch_plan, now_ns)
-                .await?;
+            if let Err(error) = self
+                .fetch_missing_extents(&snapshot, &fetch_plan, now_ns)
+                .await
+            {
+                log_operation_failure("read", snapshot.path.as_str(), &error, started.elapsed());
+                return Err(error);
+            }
         }
 
-        let bytes = assemble_read(&mut self.store, &snapshot, offset, size, now_ns)?;
-        self.enforce_cache_budget()?;
+        let bytes = match assemble_read(&mut self.store, &snapshot, offset, size, now_ns) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log_operation_failure("read", snapshot.path.as_str(), &error, started.elapsed());
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.enforce_cache_budget() {
+            log_operation_failure("read", snapshot.path.as_str(), &error, started.elapsed());
+            return Err(error);
+        }
         if let Some(metrics) = &self.metrics {
             metrics.record_read(
                 cache_hits,
@@ -779,7 +844,8 @@ impl FilesystemService {
         missing_extents: &[ExtentDescriptor],
         now_ns: u64,
     ) -> Result<(), FilesystemServiceError> {
-        let request_extents = missing_extents
+        let started = Instant::now();
+        let requested_refs = missing_extents
             .iter()
             .map(|extent| ExtentRef {
                 file_id: handle.file_id.0,
@@ -790,12 +856,39 @@ impl FilesystemService {
                 extent_hash: extent.extent_hash.clone(),
             })
             .collect::<Vec<_>>();
-        match self.remote_fetch_extents(request_extents).await {
+        let requested_extents = requested_refs.len();
+        match self.remote_fetch_extents(requested_refs).await {
             Ok(extents) => {
+                let returned_extents = extents.len();
+                let bytes = extents
+                    .iter()
+                    .map(|extent| extent.data.len())
+                    .sum::<usize>();
                 self.store_extents(&extents, now_ns)?;
+                tracing::info!(
+                    operation = "fetch_extents",
+                    path = handle.path.as_str(),
+                    file_id = handle.file_id.0,
+                    requested_extents,
+                    returned_extents,
+                    bytes,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "client fetched missing extents"
+                );
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    operation = "fetch_extents",
+                    path = handle.path.as_str(),
+                    file_id = handle.file_id.0,
+                    requested_extents,
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "client extent fetch failed"
+                );
+                Err(error)
+            }
         }
     }
 
@@ -1056,6 +1149,13 @@ fn log_slow_operation(
     source: &'static str,
     elapsed: Duration,
 ) {
+    tracing::info!(
+        operation,
+        path,
+        source,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "client filesystem operation"
+    );
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -1065,6 +1165,48 @@ fn log_slow_operation(
             "slow client filesystem operation"
         );
     }
+}
+
+fn log_directory_operation(
+    operation: &'static str,
+    path: &str,
+    source: &'static str,
+    entries: usize,
+    elapsed: Duration,
+) {
+    tracing::info!(
+        operation,
+        path,
+        source,
+        entries,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "client filesystem directory operation"
+    );
+    if elapsed >= SLOW_OPERATION_WARN_AFTER {
+        tracing::warn!(
+            operation,
+            path,
+            source,
+            entries,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "slow client filesystem operation"
+        );
+    }
+}
+
+fn log_operation_failure(
+    operation: &'static str,
+    path: &str,
+    error: &FilesystemServiceError,
+    elapsed: Duration,
+) {
+    tracing::warn!(
+        operation,
+        path,
+        error = %error,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "client filesystem operation failed"
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1078,6 +1220,18 @@ fn log_slow_read(
     remote_bytes: u64,
     elapsed: Duration,
 ) {
+    tracing::info!(
+        operation = "read",
+        path,
+        offset,
+        size,
+        cache_hits,
+        cache_misses,
+        local_bytes,
+        remote_bytes,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "client filesystem read"
+    );
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation = "read",
@@ -1095,6 +1249,12 @@ fn log_slow_read(
 }
 
 fn log_slow_change_sync(records: usize, elapsed: Duration) {
+    tracing::info!(
+        operation = "sync_changes",
+        records,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "client filesystem operation"
+    );
     if elapsed >= SLOW_OPERATION_WARN_AFTER {
         tracing::warn!(
             operation = "sync_changes",

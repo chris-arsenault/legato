@@ -566,6 +566,12 @@ fn translate_directory_entry(entry: DirectoryEntry) -> MacosDirectoryEntry {
 }
 
 fn log_slow_callback(operation: &'static str, path: &str, elapsed: Duration) {
+    tracing::info!(
+        operation,
+        path,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "macOS filesystem callback"
+    );
     if elapsed >= SLOW_CALLBACK_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -582,6 +588,13 @@ fn log_slow_callback_with_count(
     entries: usize,
     elapsed: Duration,
 ) {
+    tracing::info!(
+        operation,
+        path,
+        entries,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "macOS filesystem callback"
+    );
     if elapsed >= SLOW_CALLBACK_WARN_AFTER {
         tracing::warn!(
             operation,
@@ -601,6 +614,15 @@ fn log_slow_read_callback(
     actual_size: usize,
     elapsed: Duration,
 ) {
+    tracing::info!(
+        operation,
+        handle,
+        offset,
+        requested_size,
+        actual_size,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "macOS filesystem callback"
+    );
     if elapsed >= SLOW_CALLBACK_WARN_AFTER {
         tracing::warn!(
             operation,
