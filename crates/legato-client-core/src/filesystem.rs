@@ -1,7 +1,7 @@
 //! Client-side filesystem service backed by the live transport and local caches.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::Path,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -293,6 +293,7 @@ impl FilesystemService {
             }
             Err(error) => return Err(map_lookup_error(path)(error)),
         };
+        let entries = sanitize_directory_entries(path, entries);
         self.store.record_metadata(directory_metadata.clone())?;
         self.store
             .record_directory(path, FileId(directory_metadata.file_id), entries.clone())?;
@@ -1118,6 +1119,35 @@ fn should_retry_after_reconnect(error: &crate::ClientTransportError) -> bool {
     }
 }
 
+fn sanitize_directory_entries(path: &str, entries: Vec<DirectoryEntry>) -> Vec<DirectoryEntry> {
+    let mut names = BTreeSet::new();
+    let parent = normalize_listing_path(path);
+    let mut sanitized = entries
+        .into_iter()
+        .filter(|entry| {
+            !entry.name.is_empty()
+                && entry.name != "."
+                && entry.name != ".."
+                && normalize_listing_path(&entry.path) != parent
+                && names.insert(entry.name.clone())
+        })
+        .collect::<Vec<_>>();
+    sanitized.sort_by(|left, right| left.name.cmp(&right.name));
+    sanitized
+}
+
+fn normalize_listing_path(path: &str) -> String {
+    let mut normalized = String::from("/");
+    let components = path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".");
+    normalized.push_str(&components.collect::<Vec<_>>().join("/"));
+    if normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    normalized
+}
+
 fn overlap_len(
     extent_offset: u64,
     extent_len: u64,
@@ -1154,6 +1184,53 @@ mod tests {
     use super::{
         FilesystemService, head_biased_fetch_plan, inode_to_open_handle, now_monotonic_ns,
     };
+
+    #[test]
+    fn directory_listing_sanitizer_drops_self_and_duplicate_entries() {
+        let entries = super::sanitize_directory_entries(
+            "/samples",
+            vec![
+                DirectoryEntry {
+                    name: String::from("pack-b"),
+                    path: String::from("/samples/pack-b"),
+                    is_dir: true,
+                    file_id: 2,
+                },
+                DirectoryEntry {
+                    name: String::from("."),
+                    path: String::from("/samples"),
+                    is_dir: true,
+                    file_id: 1,
+                },
+                DirectoryEntry {
+                    name: String::from("pack-a"),
+                    path: String::from("/samples/pack-a"),
+                    is_dir: true,
+                    file_id: 3,
+                },
+                DirectoryEntry {
+                    name: String::from("pack-a"),
+                    path: String::from("/samples/pack-a-duplicate"),
+                    is_dir: true,
+                    file_id: 4,
+                },
+                DirectoryEntry {
+                    name: String::from("self"),
+                    path: String::from("\\samples"),
+                    is_dir: true,
+                    file_id: 5,
+                },
+            ],
+        );
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec![String::from("pack-a"), String::from("pack-b")]
+        );
+    }
 
     fn local_client_config(
         endpoint: String,

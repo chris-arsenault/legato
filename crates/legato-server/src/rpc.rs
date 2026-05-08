@@ -15,7 +15,7 @@ use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
     task::JoinHandle,
-    time::{MissedTickBehavior, interval, timeout},
+    time::{Instant as TokioInstant, MissedTickBehavior, Sleep, interval, timeout},
 };
 use tokio_stream::{
     Stream, StreamExt,
@@ -37,6 +37,7 @@ use legato_proto::{
 };
 
 const SLOW_RPC_WARN_AFTER: Duration = Duration::from_millis(250);
+const WATCH_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(750);
 use legato_types::FileId;
 
 use crate::{
@@ -239,19 +240,64 @@ fn spawn_watch_task(
             if matches!(action, NotificationAction::Ignore) {
                 continue;
             }
+            let channel_closed =
+                debounce_watch_events(&mut receiver, &library_root, WATCH_RECONCILE_DEBOUNCE).await;
             if reconcile_library_root_to_store(&state_dir, &library_root).is_err() {
+                if channel_closed {
+                    break;
+                }
                 continue;
             }
             if let Ok(reopened_catalog) = CatalogStore::open(&state_dir, 0) {
                 *catalog.lock().await = reopened_catalog;
             } else {
+                if channel_closed {
+                    break;
+                }
                 continue;
             };
 
             let mut hub = invalidations.lock().await;
             hub.publish(subtree_invalidation("/", 0));
+            if channel_closed {
+                break;
+            }
         }
     })
+}
+
+async fn debounce_watch_events(
+    receiver: &mut mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    library_root: &Path,
+    delay: Duration,
+) -> bool {
+    // SMB imports can emit thousands of notifications; wait for a quiet window
+    // before the expensive full-library reconcile.
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    drain_watch_events_until(receiver, library_root, &mut sleep, delay).await
+}
+
+async fn drain_watch_events_until(
+    receiver: &mut mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
+    library_root: &Path,
+    sleep: &mut Pin<&mut Sleep>,
+    delay: Duration,
+) -> bool {
+    loop {
+        tokio::select! {
+            _ = sleep.as_mut() => return false,
+            maybe_result = receiver.recv() => {
+                let Some(result) = maybe_result else {
+                    return true;
+                };
+                let action = plan_notification_result(library_root, result);
+                if !matches!(action, NotificationAction::Ignore) {
+                    sleep.as_mut().reset(TokioInstant::now() + delay);
+                }
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]

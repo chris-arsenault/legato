@@ -3,6 +3,7 @@
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 use std::{
+    collections::BTreeSet,
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -236,12 +237,7 @@ impl WindowsFilesystem {
         let result = service
             .read_dir(path)
             .await
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .map(translate_directory_entry)
-                    .collect::<Vec<_>>()
-            })
+            .map(windows_directory_entries)
             .map_err(map_error);
         match &result {
             Ok(entries) => {
@@ -766,6 +762,22 @@ fn translate_directory_entry(entry: DirectoryEntry) -> WindowsDirectoryEntry {
     }
 }
 
+fn windows_directory_entries(entries: Vec<DirectoryEntry>) -> Vec<WindowsDirectoryEntry> {
+    let mut seen = BTreeSet::new();
+    let mut entries = entries
+        .into_iter()
+        .map(translate_directory_entry)
+        .filter(|entry| seen.insert(entry.name.to_lowercase()))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    entries
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn attributes_from_directory_entry(entry: &DirectoryEntry) -> WindowsAttributes {
     WindowsAttributes {
@@ -888,6 +900,7 @@ mod tests {
     };
 
     use legato_client_core::{ClientConfig, ClientTlsConfig, FilesystemService, RetryPolicy};
+    use legato_proto::DirectoryEntry;
     use legato_server::{
         LiveServer, ServerConfig, ServerTlsConfig, ensure_server_tls_materials,
         issue_client_tls_bundle, load_runtime_tls,
@@ -898,7 +911,7 @@ mod tests {
 
     use super::{
         MountPointError, MountPointReadiness, WindowsFilesystem, drive_letter_mount_point,
-        map_virtual_path, normalize_mount_point, prepare_mount_point,
+        map_virtual_path, normalize_mount_point, prepare_mount_point, windows_directory_entries,
     };
 
     fn local_client_config(endpoint: String, bundle_dir: &Path, server_name: &str) -> ClientConfig {
@@ -919,6 +932,38 @@ mod tests {
         let adapter = WindowsFilesystem::new("L:");
         assert_eq!(adapter.platform_name(), "windows");
         assert_eq!(adapter.mount_point(), "L:");
+    }
+
+    #[test]
+    fn windows_directory_entries_are_case_insensitive_and_sorted() {
+        let entries = windows_directory_entries(vec![
+            DirectoryEntry {
+                name: String::from("Samples"),
+                path: String::from("/samples/Samples"),
+                is_dir: true,
+                file_id: 2,
+            },
+            DirectoryEntry {
+                name: String::from("samples"),
+                path: String::from("/samples/samples"),
+                is_dir: true,
+                file_id: 3,
+            },
+            DirectoryEntry {
+                name: String::from("Drums"),
+                path: String::from("/samples/Drums"),
+                is_dir: true,
+                file_id: 4,
+            },
+        ]);
+
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec![String::from("Drums"), String::from("Samples")]
+        );
     }
 
     #[test]

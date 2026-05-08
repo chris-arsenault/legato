@@ -38,11 +38,17 @@ pub fn reconcile_library_root_to_store(
     let mut seen = HashSet::new();
     let mut stats = ReconcileStats::default();
 
-    for entry in WalkDir::new(&library_root).sort_by_file_name() {
+    for entry in WalkDir::new(&library_root)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
         let entry = entry.map_err(|source| CanonicalStoreError::Io {
             path: library_root.clone(),
             source: io::Error::other(source),
         })?;
+        if !entry.file_type().is_dir() && !entry.file_type().is_file() {
+            continue;
+        }
         if entry.file_type().is_file() && is_policy_path(&library_root, entry.path()) {
             continue;
         }
@@ -282,6 +288,9 @@ fn directory_entries(
                 path: child_path.clone(),
                 source,
             })?;
+        if !child_file_type.is_dir() && !child_file_type.is_file() {
+            continue;
+        }
         if child_file_type.is_file() && is_policy_path(library_root, &child_path) {
             continue;
         }
@@ -675,6 +684,28 @@ mod tests {
             blake3::hash(b"sample-payload").as_bytes()
         );
         assert!(catalog.list_directory("/").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_ingest_skips_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("tempdir should exist");
+        let library = temp.path().join("library");
+        let store = temp.path().join("store");
+        std::fs::create_dir_all(library.join("samples")).expect("library should create");
+        symlink(&library, library.join("samples").join("library-loop"))
+            .expect("symlink should create");
+
+        reconcile_library_root_to_store(&store, &library).expect("ingest should succeed");
+        let catalog = CatalogStore::open(&store, 200).expect("catalog should open");
+        let entries = catalog
+            .list_directory("/samples")
+            .expect("samples directory should list");
+
+        assert!(entries.is_empty());
+        assert!(catalog.resolve_path("/samples/library-loop").is_none());
     }
 
     #[test]
