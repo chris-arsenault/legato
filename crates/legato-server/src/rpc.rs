@@ -471,6 +471,7 @@ impl Legato for LiveServer {
         &self,
         request: Request<SubscribeChangesRequest>,
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
+        let started = Instant::now();
         let since_sequence = request.into_inner().since_sequence;
         let (initial_records, initial_checkpoint, mut next_sequence) = {
             let catalog = self.catalog.lock().await;
@@ -488,12 +489,22 @@ impl Legato for LiveServer {
             };
             (records, checkpoint, current_sequence)
         };
+        let initial_summary = ChangeRecordSummary::from_records(&initial_records);
+        log_change_replay_summary(
+            "initial",
+            since_sequence,
+            next_sequence,
+            &initial_summary,
+            started.elapsed(),
+        );
         let catalog = Arc::clone(&self.catalog);
         let (sender, receiver) = mpsc::channel(16);
         let _task = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(250));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
+                let started = Instant::now();
+                let since_sequence = next_sequence;
                 let records = {
                     let catalog = catalog.lock().await;
                     catalog
@@ -502,6 +513,19 @@ impl Legato for LiveServer {
                 };
                 match records {
                     Ok(records) => {
+                        let summary = ChangeRecordSummary::from_records(&records);
+                        if summary.records > 0 {
+                            let current_sequence = records
+                                .last()
+                                .map_or(since_sequence, |record| record.sequence);
+                            log_change_replay_summary(
+                                "live",
+                                since_sequence,
+                                current_sequence,
+                                &summary,
+                                started.elapsed(),
+                            );
+                        }
                         for record in records {
                             next_sequence = record.sequence;
                             if sender.send(Ok(record)).await.is_err() {
@@ -564,8 +588,7 @@ impl Legato for LiveServer {
         let path = logical_request_path(Path::new(&self.config.library_root), &request_path)
             .map_err(|error| {
                 let message = error.to_string();
-                log_rpc_failure(
-                    "list_dir",
+                log_directory_listing_failure(
                     &request_path,
                     "invalid_argument",
                     &message,
@@ -574,8 +597,7 @@ impl Legato for LiveServer {
                 Status::invalid_argument(message)
             })?;
         let Some(entries) = self.catalog.lock().await.list_directory(&path) else {
-            log_rpc_failure(
-                "list_dir",
+            log_directory_listing_failure(
                 &path,
                 "not_found",
                 "directory not found",
@@ -583,6 +605,9 @@ impl Legato for LiveServer {
             );
             return Err(Status::not_found("directory not found"));
         };
+        let entry_count = entries.len();
+        let directory_count = entries.iter().filter(|entry| entry.is_dir).count();
+        let file_count = entry_count.saturating_sub(directory_count);
         let response = ListDirResponse {
             entries: entries
                 .into_iter()
@@ -594,7 +619,13 @@ impl Legato for LiveServer {
                 })
                 .collect(),
         };
-        log_slow_rpc_with_count("list_dir", &path, response.entries.len(), started.elapsed());
+        log_directory_listing(
+            &path,
+            entry_count,
+            directory_count,
+            file_count,
+            started.elapsed(),
+        );
         Ok(Response::new(response))
     }
 
@@ -720,6 +751,59 @@ fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, St
     })
 }
 
+#[derive(Debug, Default)]
+struct ChangeRecordSummary {
+    records: usize,
+    file_records: usize,
+    directory_records: usize,
+    directory_entries: usize,
+    directory_entry_files: usize,
+    directory_entry_dirs: usize,
+    deleted_records: usize,
+    invalidated_records: usize,
+}
+
+impl ChangeRecordSummary {
+    fn from_records(records: &[ChangeRecord]) -> Self {
+        let mut summary = Self {
+            records: records.len(),
+            ..Self::default()
+        };
+        for record in records {
+            match legato_proto::ChangeKind::try_from(record.kind)
+                .unwrap_or(legato_proto::ChangeKind::Unspecified)
+            {
+                legato_proto::ChangeKind::Upsert => {
+                    if let Some(inode) = &record.inode {
+                        if inode.is_dir {
+                            summary.directory_records += 1;
+                        } else {
+                            summary.file_records += 1;
+                        }
+                    }
+                    summary.directory_entries = summary
+                        .directory_entries
+                        .saturating_add(record.entries.len());
+                    summary.directory_entry_dirs = summary
+                        .directory_entry_dirs
+                        .saturating_add(record.entries.iter().filter(|entry| entry.is_dir).count());
+                    summary.directory_entry_files = summary.directory_entry_files.saturating_add(
+                        record.entries.iter().filter(|entry| !entry.is_dir).count(),
+                    );
+                }
+                legato_proto::ChangeKind::Delete => {
+                    summary.deleted_records += 1;
+                }
+                legato_proto::ChangeKind::Invalidate => {
+                    summary.invalidated_records += 1;
+                }
+                legato_proto::ChangeKind::Checkpoint | legato_proto::ChangeKind::Unspecified => {}
+            }
+        }
+        summary
+    }
+}
+
 fn log_slow_rpc(operation: &'static str, path: &str, elapsed: Duration) {
     tracing::debug!(
         operation,
@@ -765,21 +849,105 @@ fn log_rpc_failure(
     }
 }
 
-fn log_slow_rpc_with_count(operation: &'static str, path: &str, count: usize, elapsed: Duration) {
+fn log_directory_listing(
+    path: &str,
+    entries: usize,
+    directories: usize,
+    files: usize,
+    elapsed: Duration,
+) {
     tracing::info!(
-        operation,
+        operation = "list_dir",
         path,
-        count,
+        entries,
+        directories,
+        files,
         elapsed_ms = elapsed.as_millis() as u64,
-        "server rpc"
+        "server directory listing returned"
     );
     if elapsed >= SLOW_RPC_WARN_AFTER {
         tracing::warn!(
-            operation,
+            operation = "list_dir",
             path,
-            count,
+            entries,
+            directories,
+            files,
             elapsed_ms = elapsed.as_millis() as u64,
             "slow server rpc"
+        );
+    }
+}
+
+fn log_directory_listing_failure(path: &str, status: &'static str, error: &str, elapsed: Duration) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if status == "not_found" {
+        tracing::info!(
+            operation = "list_dir",
+            path,
+            status,
+            error,
+            entries = 0_usize,
+            directories = 0_usize,
+            files = 0_usize,
+            elapsed_ms,
+            "server directory listing returned"
+        );
+    } else {
+        tracing::warn!(
+            operation = "list_dir",
+            path,
+            status,
+            error,
+            entries = 0_usize,
+            directories = 0_usize,
+            files = 0_usize,
+            elapsed_ms,
+            "server directory listing failed"
+        );
+    }
+}
+
+fn log_change_replay_summary(
+    phase: &'static str,
+    since_sequence: u64,
+    current_sequence: u64,
+    summary: &ChangeRecordSummary,
+    elapsed: Duration,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    if since_sequence == 0 || summary.records > 0 {
+        tracing::info!(
+            operation = "subscribe_changes",
+            phase,
+            since_sequence,
+            current_sequence,
+            records = summary.records,
+            file_records = summary.file_records,
+            directory_records = summary.directory_records,
+            directory_entries = summary.directory_entries,
+            directory_entry_files = summary.directory_entry_files,
+            directory_entry_dirs = summary.directory_entry_dirs,
+            deleted_records = summary.deleted_records,
+            invalidated_records = summary.invalidated_records,
+            elapsed_ms,
+            "server change replay returned"
+        );
+    } else {
+        tracing::debug!(
+            operation = "subscribe_changes",
+            phase,
+            since_sequence,
+            current_sequence,
+            records = summary.records,
+            file_records = summary.file_records,
+            directory_records = summary.directory_records,
+            directory_entries = summary.directory_entries,
+            directory_entry_files = summary.directory_entry_files,
+            directory_entry_dirs = summary.directory_entry_dirs,
+            deleted_records = summary.deleted_records,
+            invalidated_records = summary.invalidated_records,
+            elapsed_ms,
+            "server change replay returned"
         );
     }
 }
