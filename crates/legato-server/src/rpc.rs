@@ -473,12 +473,13 @@ impl Legato for LiveServer {
     ) -> Result<Response<Self::SubscribeChangesStream>, Status> {
         let started = Instant::now();
         let since_sequence = request.into_inner().since_sequence;
-        let (initial_records, initial_checkpoint, mut next_sequence) = {
+        let (initial_records, initial_checkpoint, mut next_sequence, initial_snapshot) = {
             let catalog = self.catalog.lock().await;
             let records = catalog
                 .change_records_since(since_sequence)
                 .map_err(map_catalog_error)?;
             let current_sequence = catalog.last_sequence();
+            let snapshot = CatalogSnapshotSummary::from_catalog(&catalog);
             let checkpoint = ChangeRecord {
                 sequence: current_sequence,
                 kind: legato_proto::ChangeKind::Checkpoint as i32,
@@ -487,7 +488,7 @@ impl Legato for LiveServer {
                 inode: None,
                 entries: Vec::new(),
             };
-            (records, checkpoint, current_sequence)
+            (records, checkpoint, current_sequence, snapshot)
         };
         let initial_summary = ChangeRecordSummary::from_records(&initial_records);
         log_change_replay_summary(
@@ -495,6 +496,7 @@ impl Legato for LiveServer {
             since_sequence,
             next_sequence,
             &initial_summary,
+            Some(&initial_snapshot),
             started.elapsed(),
         );
         let catalog = Arc::clone(&self.catalog);
@@ -507,12 +509,20 @@ impl Legato for LiveServer {
                 let since_sequence = next_sequence;
                 let records = {
                     let catalog = catalog.lock().await;
-                    catalog
+                    match catalog
                         .change_records_since(next_sequence)
                         .map_err(map_catalog_error)
+                    {
+                        Ok(records) => {
+                            let snapshot = (!records.is_empty())
+                                .then(|| CatalogSnapshotSummary::from_catalog(&catalog));
+                            Ok((records, snapshot))
+                        }
+                        Err(status) => Err(status),
+                    }
                 };
                 match records {
-                    Ok(records) => {
+                    Ok((records, snapshot)) => {
                         let summary = ChangeRecordSummary::from_records(&records);
                         if summary.records > 0 {
                             let current_sequence = records
@@ -523,6 +533,7 @@ impl Legato for LiveServer {
                                 since_sequence,
                                 current_sequence,
                                 &summary,
+                                snapshot.as_ref(),
                                 started.elapsed(),
                             );
                         }
@@ -752,6 +763,50 @@ fn reported_metric_to_sample(metric: &ReportedMetric) -> Result<MetricSample, St
 }
 
 #[derive(Debug, Default)]
+struct CatalogSnapshotSummary {
+    active_files: usize,
+    active_directories: usize,
+    active_paths: usize,
+    active_directory_entries: usize,
+    root_entries: usize,
+    root_files: usize,
+    root_directories: usize,
+    root_entry_names: String,
+}
+
+impl CatalogSnapshotSummary {
+    fn from_catalog(catalog: &CatalogStore) -> Self {
+        let inodes = catalog.active_inodes();
+        let active_files = inodes.iter().filter(|inode| !inode.is_dir).count();
+        let active_directories = inodes.iter().filter(|inode| inode.is_dir).count();
+        let active_directory_entries = inodes
+            .iter()
+            .filter(|inode| inode.is_dir)
+            .filter_map(|inode| catalog.list_directory(&inode.path))
+            .map(|entries| entries.len())
+            .sum();
+        let root_entries = catalog.list_directory("/").unwrap_or_default();
+        let root_directories = root_entries.iter().filter(|entry| entry.is_dir).count();
+        let root_files = root_entries.len().saturating_sub(root_directories);
+        let root_entry_names = root_entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self {
+            active_files,
+            active_directories,
+            active_paths: inodes.len(),
+            active_directory_entries,
+            root_entries: root_entries.len(),
+            root_files,
+            root_directories,
+            root_entry_names,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct ChangeRecordSummary {
     records: usize,
     file_records: usize,
@@ -912,23 +967,40 @@ fn log_change_replay_summary(
     since_sequence: u64,
     current_sequence: u64,
     summary: &ChangeRecordSummary,
+    snapshot: Option<&CatalogSnapshotSummary>,
     elapsed: Duration,
 ) {
     let elapsed_ms = elapsed.as_millis() as u64;
+    let active_files = snapshot.map_or(0, |snapshot| snapshot.active_files);
+    let active_directories = snapshot.map_or(0, |snapshot| snapshot.active_directories);
+    let active_paths = snapshot.map_or(0, |snapshot| snapshot.active_paths);
+    let active_directory_entries = snapshot.map_or(0, |snapshot| snapshot.active_directory_entries);
+    let root_entries = snapshot.map_or(0, |snapshot| snapshot.root_entries);
+    let root_files = snapshot.map_or(0, |snapshot| snapshot.root_files);
+    let root_directories = snapshot.map_or(0, |snapshot| snapshot.root_directories);
+    let root_entry_names = snapshot.map_or("", |snapshot| snapshot.root_entry_names.as_str());
     if since_sequence == 0 || summary.records > 0 {
         tracing::info!(
             operation = "subscribe_changes",
             phase,
             since_sequence,
             current_sequence,
-            records = summary.records,
-            file_records = summary.file_records,
-            directory_records = summary.directory_records,
-            directory_entries = summary.directory_entries,
-            directory_entry_files = summary.directory_entry_files,
-            directory_entry_dirs = summary.directory_entry_dirs,
-            deleted_records = summary.deleted_records,
-            invalidated_records = summary.invalidated_records,
+            replay_records = summary.records,
+            replay_file_records = summary.file_records,
+            replay_directory_records = summary.directory_records,
+            replay_directory_entries = summary.directory_entries,
+            replay_directory_entry_files = summary.directory_entry_files,
+            replay_directory_entry_dirs = summary.directory_entry_dirs,
+            replay_deleted_records = summary.deleted_records,
+            replay_invalidated_records = summary.invalidated_records,
+            active_paths,
+            active_files,
+            active_directories,
+            active_directory_entries,
+            root_entries,
+            root_files,
+            root_directories,
+            root_entry_names,
             elapsed_ms,
             "server change replay returned"
         );
@@ -938,14 +1010,22 @@ fn log_change_replay_summary(
             phase,
             since_sequence,
             current_sequence,
-            records = summary.records,
-            file_records = summary.file_records,
-            directory_records = summary.directory_records,
-            directory_entries = summary.directory_entries,
-            directory_entry_files = summary.directory_entry_files,
-            directory_entry_dirs = summary.directory_entry_dirs,
-            deleted_records = summary.deleted_records,
-            invalidated_records = summary.invalidated_records,
+            replay_records = summary.records,
+            replay_file_records = summary.file_records,
+            replay_directory_records = summary.directory_records,
+            replay_directory_entries = summary.directory_entries,
+            replay_directory_entry_files = summary.directory_entry_files,
+            replay_directory_entry_dirs = summary.directory_entry_dirs,
+            replay_deleted_records = summary.deleted_records,
+            replay_invalidated_records = summary.invalidated_records,
+            active_paths,
+            active_files,
+            active_directories,
+            active_directory_entries,
+            root_entries,
+            root_files,
+            root_directories,
+            root_entry_names,
             elapsed_ms,
             "server change replay returned"
         );
