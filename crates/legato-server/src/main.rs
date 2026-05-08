@@ -16,6 +16,7 @@ use legato_server::{
     load_runtime_tls, parse_bind_address, write_client_bundle_manifest,
 };
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
 struct ServerProcessConfig {
@@ -139,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum Command {
     Doctor {
         config_path: Option<PathBuf>,
+        paths: Vec<String>,
     },
     IssueClient {
         name: String,
@@ -153,7 +155,7 @@ enum Command {
 impl Command {
     fn config_path(&self) -> Option<&Path> {
         match self {
-            Self::Doctor { config_path } => config_path.as_deref(),
+            Self::Doctor { config_path, .. } => config_path.as_deref(),
             Self::IssueClient { .. } => None,
         }
     }
@@ -175,13 +177,17 @@ where
     match command.as_str() {
         "doctor" => {
             let mut config_path = None;
+            let mut paths = Vec::new();
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--config" => config_path = arguments.next().map(PathBuf::from),
+                    "--path" => {
+                        paths.push(arguments.next().ok_or("missing --path value for doctor")?)
+                    }
                     other => return Err(format!("unsupported argument for doctor: {other}").into()),
                 }
             }
-            Ok(Some(Command::Doctor { config_path }))
+            Ok(Some(Command::Doctor { config_path, paths }))
         }
         "issue-client" => {
             let mut name = None;
@@ -227,8 +233,8 @@ fn run_command(
     process_config: &ServerProcessConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        Command::Doctor { .. } => {
-            let report = server_doctor_report(process_config)?;
+        Command::Doctor { paths, .. } => {
+            let report = server_doctor_report(process_config, &paths)?;
             println!("{report}");
             Ok(())
         }
@@ -269,11 +275,13 @@ fn default_config_path() -> PathBuf {
 
 fn server_doctor_report(
     process_config: &ServerProcessConfig,
+    inspect_paths: &[String],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let config = &process_config.server;
     let mut lines = vec![String::from("legato-server doctor")];
 
-    require_directory("library_root", Path::new(&config.library_root))?;
+    let library_root = Path::new(&config.library_root);
+    require_directory("library_root", library_root)?;
     lines.push(format!("ok library_root {}", config.library_root));
 
     require_writable_directory("state_dir", Path::new(&config.state_dir))?;
@@ -301,13 +309,86 @@ fn server_doctor_report(
     lines.push(format!("ok tls_dir {}", config.tls_dir));
 
     let catalog = CatalogStore::open(&config.state_dir, 0)?;
+    let source_summary = source_tree_summary(library_root)?;
     lines.push(format!(
-        "ok canonical_store {} sequence={}",
-        config.state_dir,
-        catalog.last_sequence()
+        "ok source_tree files={} directories={}",
+        source_summary.files, source_summary.directories
     ));
 
+    let active_inodes = catalog.active_inodes();
+    let active_files = active_inodes.iter().filter(|inode| !inode.is_dir).count();
+    let active_directories = active_inodes.iter().filter(|inode| inode.is_dir).count();
+    let root_entries = catalog.list_directory("/").unwrap_or_default();
+    let root_files = root_entries.iter().filter(|entry| !entry.is_dir).count();
+    let root_directories = root_entries.len().saturating_sub(root_files);
+    lines.push(format!(
+        "ok canonical_store {} sequence={} active_files={} active_directories={} active_paths={} root_entries={} root_files={} root_directories={}",
+        config.state_dir,
+        catalog.last_sequence(),
+        active_files,
+        active_directories,
+        active_inodes.len(),
+        root_entries.len(),
+        root_files,
+        root_directories
+    ));
+    if !root_entries.is_empty() {
+        lines.push(format!(
+            "ok catalog_root names={}",
+            root_entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    for entry in root_entries.iter().filter(|entry| entry.is_dir) {
+        push_catalog_directory_summary(&mut lines, &catalog, &entry.path);
+    }
+    for path in inspect_paths {
+        push_catalog_directory_summary(&mut lines, &catalog, path);
+    }
+
     Ok(lines.join("\n"))
+}
+
+#[derive(Debug, Default)]
+struct SourceTreeSummary {
+    files: usize,
+    directories: usize,
+}
+
+fn source_tree_summary(
+    library_root: &Path,
+) -> Result<SourceTreeSummary, Box<dyn std::error::Error>> {
+    let mut summary = SourceTreeSummary::default();
+    for entry in WalkDir::new(library_root).follow_links(false) {
+        let entry = entry?;
+        let file_type = entry.file_type();
+        if file_type.is_dir() {
+            summary.directories = summary.directories.saturating_add(1);
+        } else if file_type.is_file() {
+            summary.files = summary.files.saturating_add(1);
+        }
+    }
+    Ok(summary)
+}
+
+fn push_catalog_directory_summary(lines: &mut Vec<String>, catalog: &CatalogStore, path: &str) {
+    match catalog.list_directory(path) {
+        Some(entries) => {
+            let files = entries.iter().filter(|entry| !entry.is_dir).count();
+            let directories = entries.len().saturating_sub(files);
+            lines.push(format!(
+                "ok catalog_directory path={} entries={} files={} directories={}",
+                path,
+                entries.len(),
+                files,
+                directories
+            ));
+        }
+        None => lines.push(format!("warn catalog_directory_missing path={path}")),
+    }
 }
 
 fn require_directory(label: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -391,6 +472,7 @@ mod tests {
             command,
             Some(Command::Doctor {
                 config_path: Some(PathBuf::from("/tmp/server.toml")),
+                paths: Vec::new(),
             })
         );
     }
@@ -460,10 +542,13 @@ server_names = ["192.168.66.3"]
             bootstrap: Default::default(),
         };
 
-        let report = server_doctor_report(&ServerProcessConfig {
-            common: Default::default(),
-            server: config,
-        })
+        let report = server_doctor_report(
+            &ServerProcessConfig {
+                common: Default::default(),
+                server: config,
+            },
+            &[],
+        )
         .expect("doctor should pass");
 
         assert!(report.contains("ok library_root"));
@@ -472,5 +557,6 @@ server_names = ["192.168.66.3"]
         assert!(report.contains("warn file_logging_disabled"));
         assert!(report.contains("ok tls_dir"));
         assert!(report.contains("ok canonical_store"));
+        assert!(report.contains("ok source_tree"));
     }
 }
