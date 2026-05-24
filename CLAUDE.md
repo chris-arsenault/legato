@@ -1,4 +1,4 @@
-# CLAUDE.md
+# Agent Guide
 
 This is a lightweight working index for agents operating in the Legato repository.
 
